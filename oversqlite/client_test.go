@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -121,7 +122,7 @@ func TestOpen_PersistsManagedSourceState(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)
@@ -154,7 +155,7 @@ func TestConnect_PersistsConfiguredSchemaIdentity(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)
@@ -211,17 +212,130 @@ func TestNewClient_RejectsUnsupportedIntegerSyncKeyColumn(t *testing.T) {
 	`}, "supports only TEXT keys and UUID-backed BLOB keys")
 }
 
+func TestNewClient_RejectsNullableVisibleSyncKey(t *testing.T) {
+	for _, declaredType := range []string{"TEXT", "BLOB"} {
+		t.Run(declaredType, func(t *testing.T) {
+			db, err := sql.Open("sqlite3", ":memory:")
+			require.NoError(t, err)
+			defer db.Close()
+			_, err = db.Exec("CREATE TABLE users (id " + declaredType + " PRIMARY KEY, name TEXT NOT NULL)")
+			require.NoError(t, err)
+			_, err = NewClient(db, "http://localhost", func(context.Context) (string, error) { return "token", nil }, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "users")
+			require.Contains(t, err.Error(), "id")
+			require.Contains(t, err.Error(), "NOT NULL")
+			require.Contains(t, err.Error(), "repair or recreate the local application database before sync initialization")
+		})
+	}
+}
+
+func TestNewClient_NullableVisibleSyncKeyLeavesNoFreshRuntimeResidue(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL)`)
+	require.NoError(t, err)
+	config := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	_, err = NewClient(db, "http://localhost", func(context.Context) (string, error) { return "token", nil }, config)
+	require.Error(t, err)
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '_sync_%'`).Scan(&count))
+	require.Zero(t, count)
+	_, err = NewClient(db, "http://localhost", func(context.Context) (string, error) { return "token", nil }, config)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "already has an active oversqlite client")
+}
+
+func TestNewClient_NullableVisibleSyncKeyRetryAfterMigration(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL)`)
+	require.NoError(t, err)
+	config := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	token := func(context.Context) (string, error) { return "token", nil }
+	_, err = NewClient(db, "http://localhost", token, config)
+	require.Error(t, err)
+
+	_, err = db.Exec(`
+		CREATE TABLE users_h3 (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);
+		INSERT INTO users_h3 SELECT id, name FROM users;
+		DROP TABLE users;
+		ALTER TABLE users_h3 RENAME TO users;
+	`)
+	require.NoError(t, err)
+	client, err := NewClient(db, "http://localhost", token, config)
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
+}
+
+func TestNewClient_NullableVisibleSyncKeyPreservesExistingRuntimeState(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "nullable-drift.sqlite")
+	db, err := sql.Open("sqlite3", databasePath)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL)`)
+	require.NoError(t, err)
+	config := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	token := func(context.Context) (string, error) { return "token", nil }
+	client, err := NewClient(db, "http://localhost", token, config)
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
+	_, err = db.Exec(`INSERT INTO users(id, name) VALUES ('keep', 'Ada')`)
+	require.NoError(t, err)
+	before := localSchemaAndStateDigest(t, db)
+	_, err = db.Exec(`PRAGMA writable_schema = ON`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE sqlite_schema SET sql = replace(sql, 'PRIMARY KEY NOT NULL', 'PRIMARY KEY') WHERE type = 'table' AND name = 'users'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`PRAGMA writable_schema = OFF`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	db, err = sql.Open("sqlite3", databasePath)
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = NewClient(db, "http://localhost", token, config)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "NOT NULL")
+	require.Equal(t, before, localSchemaAndStateDigest(t, db))
+}
+
+func localSchemaAndStateDigest(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	rows, err := db.Query(`SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema ORDER BY type, name`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var digest strings.Builder
+	for rows.Next() {
+		var objectType, name, tableName, sqlText string
+		require.NoError(t, rows.Scan(&objectType, &name, &tableName, &sqlText))
+		if objectType == "table" && name == "users" {
+			continue
+		}
+		fmt.Fprintf(&digest, "%s|%s|%s|%s\n", objectType, name, tableName, sqlText)
+	}
+	require.NoError(t, rows.Err())
+	var users, managed, dirty, sources int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_managed_tables`).Scan(&managed))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirty))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_attachment_state WHERE current_source_id <> ''`).Scan(&sources))
+	fmt.Fprintf(&digest, "rows=%d managed=%d dirty=%d sources=%d", users, managed, dirty, sources)
+	return digest.String()
+}
+
 func TestOpen_PreservesLocalRowsAndManagedSourceAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE legacy_docs (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)
@@ -325,13 +439,13 @@ func TestDetach_ClearsHistoricallyManagedTablesRemovedFromCurrentConfig(t *testi
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE legacy_docs (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)
@@ -372,7 +486,7 @@ func TestCreateTriggersForTable(t *testing.T) {
 	// Create a test table
 	_, err = db.Exec(`
 		CREATE TABLE test_table (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			value INTEGER
 		)
@@ -501,7 +615,7 @@ func TestNewClient_AttachRequiresOpenToEstablishSourceID(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)
@@ -528,7 +642,7 @@ func TestOpenAndAttachEstablishRuntimeIdentity(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)
@@ -574,7 +688,7 @@ func TestOperationsRequireAttachAfterOpen(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -635,7 +749,7 @@ func TestStartLoops_LogLifecycleMisuseWithoutTouchingNetwork(t *testing.T) {
 
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -671,12 +785,12 @@ func TestNewClient_FailsWhenManagedTablesAreNotFKClosed(t *testing.T) {
 		{TableName: "posts", SyncKeyColumns: []string{"id"}},
 	}, []string{`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE posts (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			author_id TEXT NOT NULL REFERENCES users(id),
 			title TEXT NOT NULL
 		)
@@ -692,7 +806,7 @@ func TestNewClient_RejectsSecondActiveClientForSameSQLiteDB(t *testing.T) {
 
 	_, err = db1.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)
@@ -726,7 +840,7 @@ func TestNewClient_AllowsSecondClientAfterClose(t *testing.T) {
 
 	_, err = db1.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)
@@ -772,7 +886,7 @@ func TestNewClient_FailsWhenExistingSyncStateUsesDifferentSchema(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)
@@ -794,7 +908,7 @@ func TestNewClient_AllowsSelfReferencingManagedTable(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE categories (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			parent_id TEXT REFERENCES categories(id),
 			name TEXT NOT NULL
 		)
@@ -815,7 +929,7 @@ func TestNewClient_FailsWhenTableNameIsSchemaQualified(t *testing.T) {
 		{TableName: "main.users", SyncKeyColumns: []string{"id"}},
 	}, []string{`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`}, "must not include a schema qualifier")
@@ -839,14 +953,14 @@ func TestNewClient_FailsWhenManagedTablesContainCompositeFK(t *testing.T) {
 		{TableName: "children", SyncKeyColumns: []string{"id"}},
 	}, []string{`
 		CREATE TABLE parents (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			code_a TEXT NOT NULL,
 			code_b TEXT NOT NULL,
 			UNIQUE (code_a, code_b)
 		)
 	`, `
 		CREATE TABLE children (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			parent_code_a TEXT NOT NULL,
 			parent_code_b TEXT NOT NULL,
 			FOREIGN KEY (parent_code_a, parent_code_b) REFERENCES parents(code_a, code_b)

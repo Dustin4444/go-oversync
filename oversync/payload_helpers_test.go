@@ -91,9 +91,9 @@ func TestPayloadExtractor_Int64Field(t *testing.T) {
 		t.Errorf("Expected 123, got %v", num)
 	}
 
-	// Test float (should truncate)
-	if num := extractor.Int64Field("float"); num == nil || *num != 42 {
-		t.Errorf("Expected 42, got %v", num)
+	// Fractional values are not exact integers and must be rejected.
+	if num := extractor.Int64Field("float"); num != nil {
+		t.Errorf("Expected nil for fractional value, got %v", num)
 	}
 
 	// Test empty string

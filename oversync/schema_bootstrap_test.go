@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -450,6 +451,19 @@ func (h *schemaBootstrapFailureHarness) requireUnsupportedBootstrap(
 ) {
 	t.Helper()
 
+	err := h.unsupportedBootstrapError(t, appName, registeredTables)
+	for _, expected := range expectedMessages {
+		require.Contains(t, err.Error(), expected)
+	}
+}
+
+func (h *schemaBootstrapFailureHarness) unsupportedBootstrapError(
+	t *testing.T,
+	appName string,
+	registeredTables []RegisteredTable,
+) error {
+	t.Helper()
+
 	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   appName,
@@ -461,9 +475,403 @@ func (h *schemaBootstrapFailureHarness) requireUnsupportedBootstrap(
 	require.Error(t, err)
 	var schemaErr *UnsupportedSchemaError
 	require.ErrorAs(t, err, &schemaErr)
-	for _, expected := range expectedMessages {
-		require.Contains(t, err.Error(), expected)
+	require.NoError(t, svc.Close(context.Background()))
+	return err
+}
+
+func requireNoSyncLayoutOrCaptureTriggers(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	schemaName string,
+) {
+	t.Helper()
+
+	var syncSchemaExists bool
+	require.NoError(t, pool.QueryRow(ctx, `SELECT to_regnamespace('sync') IS NOT NULL`).Scan(&syncSchemaExists))
+	require.False(t, syncSchemaExists)
+
+	var captureTriggerCount int64
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_trigger AS trigger
+		JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+		JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = $1
+		  AND trigger.tgname IN ($2, $3, $4)
+		  AND NOT trigger.tgisinternal
+	`, schemaName, registeredTableCaptureTriggerName, registeredTableOwnerGuardTrigger, registeredTableTruncateGuardTrigger).Scan(&captureTriggerCount))
+	require.Zero(t, captureTriggerCount)
+}
+
+func TestBootstrap_RejectsNullableRegisteredIdentityDeclarations(t *testing.T) {
+	tests := []struct {
+		name      string
+		ownerDecl string
+		idDecl    string
+		slugDecl  string
+		keyColumn string
+		role      string
+	}{
+		{name: "nullable scope", ownerDecl: "TEXT", idDecl: "UUID NOT NULL", slugDecl: "TEXT NOT NULL", keyColumn: "id", role: "scope"},
+		{name: "nullable uuid key", ownerDecl: "TEXT NOT NULL", idDecl: "UUID", slugDecl: "TEXT NOT NULL", keyColumn: "id", role: "sync key"},
+		{name: "nullable text key", ownerDecl: "TEXT NOT NULL", idDecl: "UUID NOT NULL", slugDecl: "TEXT", keyColumn: "slug", role: "sync key"},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSchemaBootstrapFailureHarness(t, "nullable_identity_")
+			h.execf(t, `
+				CREATE TABLE %s.records (
+					row_pk BIGSERIAL,
+					id %s,
+					slug %s,
+					_sync_scope_id %s,
+					payload TEXT NOT NULL,
+					CONSTRAINT records_owner_key UNIQUE (_sync_scope_id, %s)
+				)
+			`, h.schemaIdent, tt.idDecl, tt.slugDecl, tt.ownerDecl, tt.keyColumn)
+			err := h.unsupportedBootstrapError(t, "nullable-identity", []RegisteredTable{h.registeredTable("records", tt.keyColumn)})
+			require.Contains(t, err.Error(), "nullable identity")
+			require.Contains(t, err.Error(), h.schemaName+".records")
+			require.Contains(t, err.Error(), tt.role)
+			require.Contains(t, err.Error(), "NOT NULL")
+			requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
+		})
+	}
+}
+
+func TestBootstrap_RejectsPreexistingNullIdentityRowsAtomically(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		ownerValue string
+		keyValue   string
+	}{
+		{name: "null scope", ownerValue: "NULL", keyValue: "'11111111-1111-1111-1111-111111111111'"},
+		{name: "null key", ownerValue: "'owner-a'", keyValue: "NULL"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSchemaBootstrapFailureHarness(t, "nullable_rows_")
+			h.execf(t, `
+				CREATE TABLE %s.records (
+					id UUID,
+					_sync_scope_id TEXT,
+					payload TEXT NOT NULL,
+					CONSTRAINT records_owner_key UNIQUE (_sync_scope_id, id)
+				);
+				INSERT INTO %s.records(id, _sync_scope_id, payload) VALUES (%s, %s, 'keep');
+			`, h.schemaIdent, h.schemaIdent, tt.keyValue, tt.ownerValue)
+			h.requireUnsupportedBootstrap(t, "nullable-rows", []RegisteredTable{h.registeredTable("records", "id")}, "nullable identity", "NOT NULL")
+			var rows int
+			require.NoError(t, h.pool.QueryRow(h.ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.records WHERE payload = 'keep'`, h.schemaIdent)).Scan(&rows))
+			require.Equal(t, 1, rows)
+			requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
+		})
+	}
+}
+
+func TestBootstrap_ValidatesPartitionIdentityNullability(t *testing.T) {
+	h := newSchemaBootstrapFailureHarness(t, "nullable_partition_")
+	h.execf(t, `
+		CREATE TABLE %s.records (
+			id UUID NOT NULL,
+			_sync_scope_id TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
+		) PARTITION BY HASH (_sync_scope_id);
+		CREATE TABLE %s.records_p0 PARTITION OF %s.records
+			FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+		CREATE TABLE %s.records_p1 PARTITION OF %s.records
+			FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+	`, h.schemaIdent, h.schemaIdent, h.schemaIdent, h.schemaIdent, h.schemaIdent)
+	h.requireSuccessfulBootstrap(t, "valid-partition-identities", []RegisteredTable{h.registeredTable("records", "id")})
+}
+
+func TestBootstrap_NullableIdentityConcurrency(t *testing.T) {
+	h := newSchemaBootstrapFailureHarness(t, "nullable_concurrency_")
+	h.execf(t, `
+		CREATE TABLE %s.records (
+			id UUID NOT NULL,
+			_sync_scope_id TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			CONSTRAINT records_owner_key UNIQUE (_sync_scope_id, id)
+		)
+	`, h.schemaIdent)
+
+	gate, err := h.pool.Acquire(h.ctx)
+	require.NoError(t, err)
+	gateHeld := true
+	t.Cleanup(func() {
+		if gateHeld {
+			var unlocked bool
+			_ = gate.QueryRow(context.Background(), `SELECT pg_advisory_unlock($1)`, syncBootstrapLockKey).Scan(&unlocked)
+		}
+		gate.Release()
+	})
+	_, err = gate.Exec(h.ctx, `SELECT pg_advisory_lock($1)`, syncBootstrapLockKey)
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "nullable-concurrency",
+		RegisteredTables:          []RegisteredTable{h.registeredTable("records", "id")},
+	}, h.logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = svc.Close(context.Background()) })
+
+	bootstrapResult := make(chan error, 1)
+	go func() {
+		bootstrapResult <- svc.Bootstrap(h.ctx)
+	}()
+	require.Eventually(t, func() bool {
+		var waiters int
+		err := h.pool.QueryRow(h.ctx, `
+			SELECT COUNT(*)
+			FROM pg_locks
+			WHERE locktype = 'advisory'
+			  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND classid::bigint = ($1::bigint >> 32)
+			  AND objid::bigint = ($1::bigint & 4294967295::bigint)
+			  AND objsubid = 1
+			  AND NOT granted
+		`, syncBootstrapLockKey).Scan(&waiters)
+		return err == nil && waiters == 1
+	}, 10*time.Second, 10*time.Millisecond, "bootstrap never reached the advisory-lock wait")
+
+	// The pool preflight observed a valid declaration. The locked authoritative
+	// pass must reload the catalog after this concurrent DDL commits.
+	h.execf(t, `ALTER TABLE %s.records ALTER COLUMN id DROP NOT NULL`, h.schemaIdent)
+	var unlocked bool
+	require.NoError(t, gate.QueryRow(h.ctx, `SELECT pg_advisory_unlock($1)`, syncBootstrapLockKey).Scan(&unlocked))
+	require.True(t, unlocked)
+	gateHeld = false
+
+	select {
+	case err := <-bootstrapResult:
+		require.Error(t, err)
+		var schemaErr *UnsupportedSchemaError
+		require.ErrorAs(t, err, &schemaErr)
+		require.Contains(t, err.Error(), "nullable identity")
+		require.Contains(t, err.Error(), "sync key")
+	case <-time.After(10 * time.Second):
+		t.Fatal("bootstrap did not finish after releasing the advisory lock")
+	}
+	requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
+
+	h.execf(t, `ALTER TABLE %s.records ALTER COLUMN id SET NOT NULL`, h.schemaIdent)
+	require.NoError(t, svc.Bootstrap(h.ctx))
+}
+
+func TestBootstrap_NullableIdentityRollbackReadinessAndRetry(t *testing.T) {
+	h := newSchemaBootstrapFailureHarness(t, "nullable_retry_")
+	h.execf(t, `
+		CREATE TABLE %s.records (
+			id UUID,
+			_sync_scope_id TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			CONSTRAINT records_owner_key UNIQUE (_sync_scope_id, id)
+		)
+	`, h.schemaIdent)
+	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "nullable-retry",
+		RegisteredTables:          []RegisteredTable{h.registeredTable("records", "id")},
+	}, h.logger)
+	require.NoError(t, err)
+	err = svc.Bootstrap(h.ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	_, err = svc.Connect(h.ctx, Actor{UserID: "owner-a", SourceID: "reader"}, &ConnectRequest{})
+	require.ErrorIs(t, err, errServiceNotReady)
+	requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
+
+	h.execf(t, `ALTER TABLE %s.records ALTER COLUMN id SET NOT NULL`, h.schemaIdent)
+	require.NoError(t, svc.Bootstrap(h.ctx))
+	_, err = svc.Connect(h.ctx, Actor{UserID: "owner-a", SourceID: "reader"}, &ConnectRequest{})
+	require.NoError(t, err)
+	require.NoError(t, svc.Close(context.Background()))
+}
+
+func TestBootstrap_RejectsPreH3IdentityFunctionsForMarkedLayoutWithoutRepair(t *testing.T) {
+	h := newSchemaBootstrapFailureHarness(t, "nullable_upgrade_")
+	h.execf(t, `
+		CREATE TABLE %s.records (
+			id UUID NOT NULL,
+			_sync_scope_id TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			CONSTRAINT records_owner_key UNIQUE (_sync_scope_id, id)
+		)
+	`, h.schemaIdent)
+	registeredTables := []RegisteredTable{h.registeredTable("records", "id")}
+	h.requireSuccessfulBootstrap(t, "nullable-upgrade-initial", registeredTables)
+
+	// Model a marked layout whose managed functions still have pre-H3 bodies.
+	h.execf(t, `
+		CREATE OR REPLACE FUNCTION sync.enforce_registered_row_owner()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF TG_OP = 'DELETE' THEN
+				RETURN OLD;
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE OR REPLACE FUNCTION sync.capture_registered_row_change()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF TG_OP = 'DELETE' THEN
+				RETURN OLD;
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+	`)
+
+	before := make(map[string]string)
+	for _, functionName := range []string{"sync.enforce_registered_row_owner()", "sync.capture_registered_row_change()"} {
+		var body string
+		require.NoError(t, h.pool.QueryRow(h.ctx, `SELECT prosrc FROM pg_proc WHERE oid = $1::regprocedure`, functionName).Scan(&body))
+		before[functionName] = body
+	}
+	err := h.unsupportedBootstrapError(t, "nullable-upgrade-marked", registeredTables)
+	require.Contains(t, err.Error(), "managed sync layout mismatch")
+	require.Contains(t, err.Error(), "source.sha256")
+	for functionName, expectedBody := range before {
+		var actualBody string
+		require.NoError(t, h.pool.QueryRow(h.ctx, `SELECT prosrc FROM pg_proc WHERE oid = $1::regprocedure`, functionName).Scan(&actualBody))
+		require.Equal(t, expectedBody, actualBody, "marked-layout validation must not replace %s", functionName)
+	}
+}
+
+func TestBootstrap_RequiresPermanentRegisteredTables(t *testing.T) {
+	t.Run("permanent table accepted", func(t *testing.T) {
+		h := newSchemaBootstrapFailureHarness(t, "permanent_accept_")
+		h.execf(t, `
+			CREATE TABLE %s.records (
+				_sync_scope_id TEXT NOT NULL,
+				id UUID NOT NULL,
+				PRIMARY KEY (_sync_scope_id, id)
+			)`, h.schemaIdent)
+
+		h.requireSuccessfulBootstrap(t, "permanent-accepted", []RegisteredTable{h.registeredTable("records", "id")})
+	})
+
+	t.Run("unlogged table rejected atomically", func(t *testing.T) {
+		h := newSchemaBootstrapFailureHarness(t, "unlogged_reject_")
+		h.execf(t, `
+			CREATE UNLOGGED TABLE %s.records (
+				_sync_scope_id TEXT NOT NULL,
+				id UUID NOT NULL,
+				PRIMARY KEY (_sync_scope_id, id)
+			)`, h.schemaIdent)
+
+		h.requireUnsupportedBootstrap(
+			t,
+			"unlogged-rejected",
+			[]RegisteredTable{h.registeredTable("records", "id")},
+			h.schemaName+".records",
+			"UNLOGGED",
+			`relpersistence="u"`,
+			"recreate the database with permanent tables",
+		)
+		requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
+	})
+
+	t.Run("temporary table on another connection rejected atomically", func(t *testing.T) {
+		h := newSchemaBootstrapFailureHarness(t, "temporary_reject_")
+		tempConn, err := h.pool.Acquire(h.ctx)
+		require.NoError(t, err)
+		t.Cleanup(tempConn.Release)
+
+		_, err = tempConn.Exec(h.ctx, `
+			CREATE TEMP TABLE records (
+				_sync_scope_id TEXT NOT NULL,
+				id UUID NOT NULL,
+				PRIMARY KEY (_sync_scope_id, id)
+			)`)
+		require.NoError(t, err)
+
+		var tempSchema string
+		require.NoError(t, tempConn.QueryRow(h.ctx, `
+			SELECT nspname
+			FROM pg_namespace
+			WHERE oid = pg_my_temp_schema()
+		`).Scan(&tempSchema))
+
+		h.requireUnsupportedBootstrap(
+			t,
+			"temporary-rejected",
+			[]RegisteredTable{{Schema: tempSchema, Table: "records", SyncKeyColumns: []string{"id"}}},
+			tempSchema+".records",
+			"TEMPORARY",
+			`relpersistence="t"`,
+		)
+		requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, tempSchema)
+	})
+
+	t.Run("mixed registrations report every offender deterministically", func(t *testing.T) {
+		h := newSchemaBootstrapFailureHarness(t, "mixed_persistence_reject_")
+		for _, table := range []struct {
+			name     string
+			unlogged bool
+		}{
+			{name: "logged_records"},
+			{name: "z_unlogged", unlogged: true},
+			{name: "a_unlogged", unlogged: true},
+		} {
+			persistence := ""
+			if table.unlogged {
+				persistence = "UNLOGGED "
+			}
+			h.execf(t, `
+				CREATE %sTABLE %s.%s (
+					_sync_scope_id TEXT NOT NULL,
+					id UUID NOT NULL,
+					PRIMARY KEY (_sync_scope_id, id)
+				)`, persistence, h.schemaIdent, table.name)
+		}
+
+		err := h.unsupportedBootstrapError(t, "mixed-persistence-rejected", []RegisteredTable{
+			h.registeredTable("z_unlogged", "id"),
+			h.registeredTable("logged_records", "id"),
+			h.registeredTable("a_unlogged", "id"),
+		})
+		a := h.schemaName + ".a_unlogged"
+		z := h.schemaName + ".z_unlogged"
+		require.Contains(t, err.Error(), a)
+		require.Contains(t, err.Error(), z)
+		require.Less(t, strings.Index(err.Error(), a), strings.Index(err.Error(), z))
+		requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
+	})
+
+	t.Run("existing layout fast path still revalidates persistence", func(t *testing.T) {
+		h := newSchemaBootstrapFailureHarness(t, "repeat_persistence_reject_")
+		h.execf(t, `
+			CREATE TABLE %s.records (
+				_sync_scope_id TEXT NOT NULL,
+				id UUID NOT NULL,
+				PRIMARY KEY (_sync_scope_id, id)
+			)`, h.schemaIdent)
+		registered := []RegisteredTable{h.registeredTable("records", "id")}
+		h.requireSuccessfulBootstrap(t, "repeat-persistence-initial", registered)
+		h.execf(t, `ALTER TABLE %s.records SET UNLOGGED`, h.schemaIdent)
+
+		h.requireUnsupportedBootstrap(
+			t,
+			"repeat-persistence-rejected",
+			registered,
+			h.schemaName+".records",
+			"UNLOGGED",
+		)
+
+		var metaRows int64
+		require.NoError(t, h.pool.QueryRow(h.ctx, `SELECT COUNT(*) FROM sync.meta`).Scan(&metaRows))
+		require.Equal(t, int64(1), metaRows)
+	})
 }
 
 func TestBootstrap_FailsWhenRegisteredTablesAreNotFKClosed(t *testing.T) {

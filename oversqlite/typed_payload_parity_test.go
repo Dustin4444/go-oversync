@@ -13,7 +13,7 @@ func TestSerializeRowInTx_TypedRows_PreservesNullBlobAndTimestampText(t *testing
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "typed_rows", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE typed_rows (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			note TEXT NULL,
 			count_value INTEGER NULL,
@@ -56,7 +56,7 @@ func TestSerializeRowInTx_TypedRows_PreservesNullBlobAndTimestampText(t *testing
 func TestProcessPayloadForUpload_TypedRows_Base64EncodesBlobAndKeepsNulls(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "typed_rows", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE typed_rows (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			note TEXT NULL,
 			count_value INTEGER NULL,
@@ -95,7 +95,7 @@ func TestProcessPayloadForUpload_TypedRows_Base64EncodesBlobAndKeepsNulls(t *tes
 func TestDirtyRowCapture_TypedRows_NullBlobRemainsJsonNull(t *testing.T) {
 	_, db := newBundleClient(t, "main", []SyncTable{{TableName: "typed_rows", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE typed_rows (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			note TEXT NULL,
 			count_value INTEGER NULL,

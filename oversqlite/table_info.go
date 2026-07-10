@@ -29,6 +29,20 @@ func (c *ColumnInfo) IsBlob() bool {
 	return strings.Contains(strings.ToLower(c.DeclaredType), "blob")
 }
 
+func (c *ColumnInfo) IsInteger() bool {
+	return strings.Contains(strings.ToUpper(c.DeclaredType), "INT")
+}
+
+func (c *ColumnInfo) IsText() bool {
+	declared := strings.ToUpper(c.DeclaredType)
+	return strings.Contains(declared, "CHAR") || strings.Contains(declared, "CLOB") || strings.Contains(declared, "TEXT")
+}
+
+func (c *ColumnInfo) IsReal() bool {
+	declared := strings.ToUpper(c.DeclaredType)
+	return strings.Contains(declared, "REAL") || strings.Contains(declared, "FLOA") || strings.Contains(declared, "DOUB")
+}
+
 // IsBlobReferenceColumn reports whether the named column is treated as a UUID-backed BLOB reference.
 func (t *TableInfo) IsBlobReferenceColumn(columnName string) bool {
 	if t == nil {

@@ -401,6 +401,9 @@ func configuredPrimaryKeyColumn(tableInfo *TableInfo, syncTable SyncTable) (stri
 			if _, err := supportedLocalSyncKeyKind(tableInfo, col.Name, syncTable.TableName); err != nil {
 				return "", err
 			}
+			if !col.NotNull {
+				return "", fmt.Errorf("configured visible sync-key column %s for table %s must declare NOT NULL explicitly; repair or recreate the local application database before sync initialization", col.Name, syncTable.TableName)
+			}
 			return col.Name, nil
 		}
 	}

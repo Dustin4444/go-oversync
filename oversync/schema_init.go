@@ -6,6 +6,8 @@ package oversync
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -30,6 +32,108 @@ type expectedTableCatalogRow struct {
 	TableName     string
 	SyncKeyColumn string
 	SyncKeyKind   int16
+}
+
+type unsupportedRegisteredRelationPersistence struct {
+	tableKey    string
+	persistence string
+}
+
+func registeredRelationPersistenceName(persistence string) string {
+	switch persistence {
+	case "p":
+		return "PERMANENT"
+	case "u":
+		return "UNLOGGED"
+	case "t":
+		return "TEMPORARY"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func validateRegisteredTablePersistence(
+	ctx context.Context,
+	q syncCatalogQuerier,
+	registeredTables []RegisteredTable,
+) error {
+	if len(registeredTables) == 0 {
+		return nil
+	}
+
+	schemas := make([]string, 0, len(registeredTables))
+	tables := make([]string, 0, len(registeredTables))
+	for _, table := range registeredTables {
+		schemas = append(schemas, table.normalizedSchema())
+		tables = append(tables, table.normalizedTable())
+	}
+
+	rows, err := q.Query(ctx, `
+WITH registered AS (
+  SELECT DISTINCT schema_name, table_name
+  FROM unnest(@schemas::text[], @tables::text[]) AS requested(schema_name, table_name)
+)
+SELECT
+  namespace.nspname,
+  relation.relname,
+  relation.relpersistence::text
+FROM registered
+JOIN pg_namespace AS namespace
+  ON namespace.nspname = registered.schema_name
+JOIN pg_class AS relation
+  ON relation.relnamespace = namespace.oid
+ AND relation.relname = registered.table_name
+WHERE relation.relkind IN ('r', 'p')
+ORDER BY namespace.nspname, relation.relname
+`, pgx.NamedArgs{
+		"schemas": schemas,
+		"tables":  tables,
+	})
+	if err != nil {
+		return fmt.Errorf("inspect registered table persistence: %w", err)
+	}
+	defer rows.Close()
+
+	var unsupported []unsupportedRegisteredRelationPersistence
+	for rows.Next() {
+		var schemaName, tableName, persistence string
+		if err := rows.Scan(&schemaName, &tableName, &persistence); err != nil {
+			return fmt.Errorf("scan registered table persistence: %w", err)
+		}
+		if persistence == "p" {
+			continue
+		}
+		unsupported = append(unsupported, unsupportedRegisteredRelationPersistence{
+			tableKey:    Key(schemaName, tableName),
+			persistence: persistence,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate registered table persistence: %w", err)
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+
+	sort.Slice(unsupported, func(i, j int) bool {
+		if unsupported[i].tableKey == unsupported[j].tableKey {
+			return unsupported[i].persistence < unsupported[j].persistence
+		}
+		return unsupported[i].tableKey < unsupported[j].tableKey
+	})
+	details := make([]string, 0, len(unsupported))
+	for _, relation := range unsupported {
+		details = append(details, fmt.Sprintf(
+			"%s (%s, relpersistence=%q)",
+			relation.tableKey,
+			registeredRelationPersistenceName(relation.persistence),
+			relation.persistence,
+		))
+	}
+	return unsupportedSchemaf(
+		"registered tables must use permanent logged PostgreSQL storage (relpersistence=\"p\"); recreate the database with permanent tables; unsupported relations: %s",
+		strings.Join(details, "; "),
+	)
 }
 
 func syncKeyKindCode(syncKeyType string) (int16, error) {
@@ -93,7 +197,7 @@ func validateSyncMeta(ctx context.Context, q syncCatalogQuerier) error {
 		ORDER BY singleton_key DESC
 	`)
 	if err != nil {
-		return unsupportedSchemaf("existing sync.meta layout is unsupported: %v", err)
+		return fmt.Errorf("load sync.meta marker: %w", err)
 	}
 	defer rows.Close()
 
@@ -106,7 +210,7 @@ func validateSyncMeta(ctx context.Context, q syncCatalogQuerier) error {
 			layoutName   string
 		)
 		if err := rows.Scan(&singletonKey, &protocol, &layoutName); err != nil {
-			return unsupportedSchemaf("scan sync.meta row: %v", err)
+			return fmt.Errorf("scan sync.meta row: %w", err)
 		}
 		if !singletonKey {
 			return unsupportedSchemaf("sync.meta must contain singleton_key = true")
@@ -119,7 +223,7 @@ func validateSyncMeta(ctx context.Context, q syncCatalogQuerier) error {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return unsupportedSchemaf("iterate sync.meta rows: %v", err)
+		return fmt.Errorf("iterate sync.meta rows: %w", err)
 	}
 	if rowCount != 1 {
 		return unsupportedSchemaf("sync.meta must contain exactly one row, found %d", rowCount)
@@ -134,7 +238,7 @@ func validateSyncTableCatalog(ctx context.Context, q syncCatalogQuerier, expecte
 		ORDER BY table_id
 	`)
 	if err != nil {
-		return unsupportedSchemaf("existing sync.table_catalog layout is unsupported: %v", err)
+		return fmt.Errorf("load sync.table_catalog marker: %w", err)
 	}
 	defer rows.Close()
 
@@ -142,12 +246,12 @@ func validateSyncTableCatalog(ctx context.Context, q syncCatalogQuerier, expecte
 	for rows.Next() {
 		var row expectedTableCatalogRow
 		if err := rows.Scan(&row.TableID, &row.SchemaName, &row.TableName, &row.SyncKeyColumn, &row.SyncKeyKind); err != nil {
-			return unsupportedSchemaf("scan sync.table_catalog row: %v", err)
+			return fmt.Errorf("scan sync.table_catalog row: %w", err)
 		}
 		actual = append(actual, row)
 	}
 	if err := rows.Err(); err != nil {
-		return unsupportedSchemaf("iterate sync.table_catalog rows: %v", err)
+		return fmt.Errorf("iterate sync.table_catalog rows: %w", err)
 	}
 	if len(actual) != len(expected) {
 		return unsupportedSchemaf("sync.table_catalog row count = %d, expected %d", len(actual), len(expected))
@@ -235,25 +339,28 @@ func persistSyncLayoutMetadata(ctx context.Context, tx pgx.Tx, expectedCatalog [
 	return nil
 }
 
-// initializeSchemaInTx creates the required sync tables within an existing transaction
-func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error {
-	// Serialize sync DDL across concurrent service bootstraps sharing the same database.
-	// `CREATE INDEX IF NOT EXISTS` is not sufficient to avoid deadlocks when multiple test
-	// processes attempt the full migration list at the same time.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, syncBootstrapLockKey); err != nil {
-		return fmt.Errorf("acquire sync bootstrap lock: %w", err)
+// initializeSchemaInTx classifies the existing layout and creates the managed
+// schema objects for a fresh layout. It returns true only when fresh objects
+// were created; marker rows and registered-table triggers are deliberately
+// persisted by Bootstrap after semantic self-validation.
+func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) (bool, error) {
+	if err := validateRegisteredTablePersistence(ctx, tx, s.config.RegisteredTables); err != nil {
+		return false, err
+	}
+	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx, tx); err != nil {
+		return false, err
 	}
 	expectedCatalog, err := s.expectedTableCatalogRows()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	ready, err := validateExistingSyncLayout(ctx, tx, expectedCatalog)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if ready {
-		return nil
+		return false, nil
 	}
 
 	migrations := []string{
@@ -374,6 +481,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			row_count BIGINT NOT NULL,
 			byte_count BIGINT NOT NULL,
 			bundle_hash BYTEA NOT NULL,
+			canonical_request_hash TEXT NOT NULL,
 			committed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (user_pk, bundle_seq),
 			CONSTRAINT bundle_log_source_tuple_key UNIQUE (user_pk, source_id, source_bundle_id)
@@ -402,6 +510,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			source_id TEXT NOT NULL,
 			source_bundle_id BIGINT NOT NULL,
 			planned_row_count BIGINT NOT NULL,
+			canonical_request_hash TEXT NOT NULL,
 			next_expected_row_ordinal BIGINT NOT NULL DEFAULT 0,
 			initialization_id UUID,
 			expires_at TIMESTAMPTZ NOT NULL,
@@ -420,6 +529,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			op_code SMALLINT NOT NULL,
 			base_bundle_seq BIGINT NOT NULL,
 			payload_apply JSON,
+			payload_request JSON,
 			PRIMARY KEY (push_id, row_ordinal),
 			CONSTRAINT push_session_rows_op_code_chk CHECK (op_code IN (1, 2, 3)),
 			CONSTRAINT push_session_rows_payload_by_op_chk
@@ -449,6 +559,30 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 		`CREATE SEQUENCE IF NOT EXISTS sync.accepted_push_replay_seq`,
 		`CREATE SEQUENCE IF NOT EXISTS sync.rejected_registered_write_seq`,
 		`CREATE SEQUENCE IF NOT EXISTS sync.history_pruned_error_seq`,
+		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.reject_registered_table_truncate()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		DECLARE
+			registered_schema TEXT;
+			registered_table TEXT;
+		BEGIN
+			registered_schema := COALESCE(NULLIF(TG_ARGV[0], ''), TG_TABLE_SCHEMA);
+			registered_table := COALESCE(NULLIF(TG_ARGV[1], ''), TG_TABLE_NAME);
+			RAISE EXCEPTION USING
+				ERRCODE = '55000',
+				MESSAGE = format(
+					'TRUNCATE is not allowed on registered table %I.%I',
+					registered_schema,
+					registered_table
+				),
+				DETAIL = 'Oversync cannot capture TRUNCATE as row-level bundle events.',
+				HINT = 'Stop all server and client processes and recreate PostgreSQL and every client database for an administrative reset.';
+			RETURN NULL;
+		END;
+		$$`,
+	}
+	identityFunctionMigrations := []string{
 		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.enforce_registered_row_owner()
 		RETURNS TRIGGER
 		LANGUAGE plpgsql
@@ -486,6 +620,12 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			END IF;
 
 			IF TG_OP = 'UPDATE' THEN
+				IF OLD._sync_scope_id IS NULL THEN
+					RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+				END IF;
+				IF NEW._sync_scope_id IS NULL THEN
+					RAISE EXCEPTION 'nullable new scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+				END IF;
 				IF OLD._sync_scope_id <> bundle_user_id THEN
 					RAISE EXCEPTION USING
 						ERRCODE = 'P0001',
@@ -509,6 +649,9 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 				RETURN NEW;
 			END IF;
 
+			IF OLD._sync_scope_id IS NULL THEN
+				RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+			END IF;
 			IF OLD._sync_scope_id <> bundle_user_id THEN
 				RAISE EXCEPTION USING
 					ERRCODE = 'P0001',
@@ -572,10 +715,16 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 				key_kind := key_kind_text::smallint;
 	
 				IF TG_OP = 'DELETE' THEN
+					IF OLD._sync_scope_id IS NULL THEN
+						RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+					END IF;
 					IF OLD._sync_scope_id <> bundle_user_id THEN
 						RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 					END IF;
 					old_key_text := to_jsonb(OLD)->>key_column;
+					IF old_key_text IS NULL THEN
+						RAISE EXCEPTION 'nullable old sync key identity on registered table %.% column %', TG_TABLE_SCHEMA, TG_TABLE_NAME, key_column;
+					END IF;
 					IF key_kind = 1 THEN
 						old_key_bytes := uuid_send(old_key_text::uuid);
 					ELSE
@@ -595,20 +744,32 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 					RETURN OLD;
 			END IF;
 
+				IF NEW._sync_scope_id IS NULL THEN
+					RAISE EXCEPTION 'nullable new scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+				END IF;
 				IF NEW._sync_scope_id <> bundle_user_id THEN
 					RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 				END IF;
 				new_key_text := to_jsonb(NEW)->>key_column;
+				IF new_key_text IS NULL THEN
+					RAISE EXCEPTION 'nullable new sync key identity on registered table %.% column %', TG_TABLE_SCHEMA, TG_TABLE_NAME, key_column;
+				END IF;
 				IF key_kind = 1 THEN
 					new_key_bytes := uuid_send(new_key_text::uuid);
 				ELSE
 					new_key_bytes := convert_to(new_key_text, 'UTF8');
 				END IF;
 				IF TG_OP = 'UPDATE' THEN
+					IF OLD._sync_scope_id IS NULL THEN
+						RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+					END IF;
 					IF OLD._sync_scope_id <> bundle_user_id THEN
 						RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 					END IF;
 					old_key_text := to_jsonb(OLD)->>key_column;
+					IF old_key_text IS NULL THEN
+						RAISE EXCEPTION 'nullable old sync key identity on registered table %.% column %', TG_TABLE_SCHEMA, TG_TABLE_NAME, key_column;
+					END IF;
 					IF key_kind = 1 THEN
 						old_key_bytes := uuid_send(old_key_text::uuid);
 					ELSE
@@ -657,16 +818,14 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 		END;
 		$$`,
 	}
+	migrations = append(migrations, identityFunctionMigrations...)
 
 	// Run all migrations within the provided transaction
 	for i, migration := range migrations {
 		s.logger.Debug("Running sync migration", "step", i+1, "total", len(migrations))
 		if _, err := tx.Exec(ctx, migration); err != nil {
-			return fmt.Errorf("sync migration %d failed: %w", i+1, err)
+			return false, fmt.Errorf("sync migration %d failed: %w", i+1, err)
 		}
-	}
-	if err := persistSyncLayoutMetadata(ctx, tx, expectedCatalog); err != nil {
-		return err
 	}
 
 	bootstrapIndexes := []string{
@@ -678,12 +837,12 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 	}
 	for _, stmt := range bootstrapIndexes {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("bundle bootstrap index creation failed: %w", err)
+			return false, fmt.Errorf("bundle bootstrap index creation failed: %w", err)
 		}
 	}
 	s.logger.Info("Sync schema initialized successfully", "migrations", len(migrations))
 
-	return nil
+	return true, nil
 }
 
 // discoverSchemaRelationships analyzes registered tables and builds dependency graph

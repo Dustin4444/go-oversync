@@ -14,6 +14,29 @@ type HistoryPrunedError struct {
 	Message string
 }
 
+// CheckpointAheadError reports that the requested durable checkpoint or frozen target is ahead of server history.
+type CheckpointAheadError struct {
+	Status  int
+	Message string
+}
+
+type CheckpointRecoveryBlockedReason string
+
+const (
+	CheckpointRecoveryBlockedUploadPaused CheckpointRecoveryBlockedReason = "upload_paused"
+	CheckpointRecoveryBlockedPendingWork  CheckpointRecoveryBlockedReason = "pending_work"
+	CheckpointRecoveryBlockedPushFailed   CheckpointRecoveryBlockedReason = "push_failed"
+)
+
+// CheckpointRecoveryBlockedError reports preserved local work that must be reconciled before snapshot replacement.
+type CheckpointRecoveryBlockedError struct {
+	Reason        CheckpointRecoveryBlockedReason
+	DirtyCount    int
+	OutboundCount int
+	ReplayState   string
+	Cause         error
+}
+
 type SourceRecoveryCode string
 
 const (
@@ -50,7 +73,38 @@ type RebuildRequiredError struct{}
 
 // Error implements error.
 func (e *RebuildRequiredError) Error() string {
-	return "client rebuild is required; run Rebuild before syncing"
+	return "client checkpoint recovery is in progress"
+}
+
+func (e *CheckpointAheadError) Error() string {
+	if e != nil && strings.TrimSpace(e.Message) != "" {
+		return e.Message
+	}
+	return "client checkpoint is ahead of current server history"
+}
+
+func (e *CheckpointRecoveryBlockedError) Error() string {
+	if e == nil {
+		return "checkpoint recovery is blocked by pending local work"
+	}
+	message := fmt.Sprintf(
+		"checkpoint recovery is blocked (%s): dirty_rows=%d outbox_rows=%d replay_state=%q",
+		e.Reason,
+		e.DirtyCount,
+		e.OutboundCount,
+		e.ReplayState,
+	)
+	if e.Cause != nil {
+		return message + ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *CheckpointRecoveryBlockedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 // SyncOperationInProgressError reports that another sync operation is already active for the client.
@@ -222,6 +276,68 @@ func (c *Client) markSourceRecoveryRequiredLocked(ctx context.Context, code Sour
 		return fmt.Errorf("failed to commit source recovery state: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) markCheckpointRecoveryRequiredLocked(ctx context.Context, reason string) error {
+	tx, err := c.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin checkpoint recovery transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	attachment.RebuildRequired = true
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
+		return err
+	}
+	operation, err := loadOperationState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	switch operation.Kind {
+	case operationKindNone:
+		if !isCheckpointRecoveryReason(operation.Reason) {
+			operation.Reason = strings.TrimSpace(reason)
+		}
+	case operationKindSourceRecovery:
+		return nil
+	default:
+		return &DestructiveTransitionInProgressError{TransitionKind: operation.Kind}
+	}
+	if err := persistOperationState(ctx, tx, operation); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit checkpoint recovery state: %w", err)
+	}
+	return nil
+}
+
+func isCheckpointRecoveryReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "history_pruned", "checkpoint_ahead", "explicit_rebuild", "resume":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) checkpointRecoveryPendingState(ctx context.Context) (dirtyCount int, outboundCount int, replayState string, err error) {
+	dirtyCount, err = c.pendingChangeCount(ctx)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	outboundCount, err = c.pendingPushOutboundCount(ctx)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	if err := c.DB.QueryRowContext(ctx, `SELECT state FROM _sync_outbox_bundle WHERE singleton_key = 1`).Scan(&replayState); err != nil {
+		return 0, 0, "", fmt.Errorf("failed to load checkpoint recovery replay state: %w", err)
+	}
+	return dirtyCount, outboundCount, strings.TrimSpace(replayState), nil
 }
 
 func (c *Client) beginSourceRecoveryLocked(ctx context.Context, code SourceRecoveryCode, message string, replacementSourceID string) error {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -132,13 +133,13 @@ func TestPullToStable_AppliesMultipleBundlesToFrozenCeiling(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE legacy_docs (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)
@@ -227,13 +228,13 @@ func TestPullToStable_RetriesTransientFailureAndSucceeds(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE legacy_docs (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)
@@ -280,7 +281,7 @@ func TestPullToStable_RetryExhaustionReturnsTypedError(t *testing.T) {
 	ctx := context.Background()
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -308,7 +309,7 @@ func TestPullToStable_AppliesTextSyncKeyBundleRows(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "docs", SyncKeyColumnName: "doc_id"}}, `
 		CREATE TABLE docs (
-			doc_id TEXT PRIMARY KEY,
+			doc_id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)
@@ -356,7 +357,7 @@ func TestPullToStable_RejectsDirtyRows(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -405,7 +406,7 @@ func TestPullAndRebuild_RejectWhilePushOutboundReplayIsPending(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 				CREATE TABLE users (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL,
 					email TEXT NOT NULL
 				)
@@ -443,7 +444,7 @@ func TestApplyStagedSnapshot_FailsClosedWhenAttachedStateIsMissing(t *testing.T)
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -535,7 +536,7 @@ func TestPullToStable_HistoryPrunedFallsBackToSnapshot(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -596,11 +597,75 @@ func TestPullToStable_HistoryPrunedFallsBackToSnapshot(t *testing.T) {
 	require.Equal(t, int64(9), lastBundleSeq)
 }
 
+func TestPullToStable_CheckpointAheadFallsBackToSnapshot(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	_, err := db.ExecContext(ctx, `UPDATE _sync_attachment_state SET last_bundle_seq_seen = 99 WHERE singleton_key = 1`)
+	require.NoError(t, err)
+
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/pull":
+			return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{
+				Error:   "checkpoint_ahead",
+				Message: "requested checkpoint 99 is ahead of current committed bundle sequence 9",
+			}), nil
+		case "/sync/snapshot-sessions":
+			return jsonResponse(oversync.SnapshotSession{
+				SnapshotID:        "snapshot-ahead",
+				SnapshotBundleSeq: 9,
+				RowCount:          1,
+				ExpiresAt:         "2030-01-01T00:00:00Z",
+			}), nil
+		case "/sync/snapshot-sessions/snapshot-ahead":
+			switch r.Method {
+			case http.MethodGet:
+				return jsonResponse(oversync.SnapshotChunkResponse{
+					SnapshotID:        "snapshot-ahead",
+					SnapshotBundleSeq: 9,
+					Rows: []oversync.SnapshotRow{{
+						Schema:     "main",
+						Table:      "users",
+						Key:        mustBundleKey("user-1"),
+						RowVersion: 9,
+						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
+					}},
+					NextRowOrdinal: 1,
+					HasMore:        false,
+				}), nil
+			case http.MethodDelete:
+				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+			}
+		}
+		return nil, io.EOF
+	})}
+
+	report, err := client.PullToStable(ctx)
+	require.NoError(t, err)
+	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
+	require.Equal(t, int64(9), report.Status.LastBundleSeqSeen)
+	require.Equal(t, operationKindNone, requireOperationKind(t, db))
+
+	var rebuildRequired int
+	require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&rebuildRequired))
+	require.Zero(t, rebuildRequired)
+	name, email, exists := loadUserForKey(t, db, "user-1")
+	require.True(t, exists)
+	require.Equal(t, "Ada", name)
+	require.Equal(t, "ada@example.com", email)
+}
+
 func TestPullToStable_RejectsMalformedPullResponse(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -712,13 +777,13 @@ func TestRebuildKeepSource_RebuildsFromSnapshotWithDeferredFKs(t *testing.T) {
 		{TableName: "posts", SyncKeyColumnName: "id"},
 	}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE posts (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			title TEXT NOT NULL,
 			author_id TEXT NOT NULL,
 			FOREIGN KEY (author_id) REFERENCES users(id)
@@ -791,7 +856,7 @@ func TestRebuildKeepSource_RejectsMalformedSnapshotResponse(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -844,7 +909,7 @@ func TestRebuildKeepSource_RejectsSnapshotResponseMissingBundleSeq(t *testing.T)
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -890,13 +955,13 @@ func TestRebuild_KeepsManagedSourceAndBundleStateOutsideSourceRecovery(t *testin
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE legacy_docs (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)
@@ -1025,122 +1090,195 @@ func TestRebuild_KeepsManagedSourceAndBundleStateOutsideSourceRecovery(t *testin
 	require.Equal(t, 0, count)
 }
 
-func TestRebuildRequired_NormalSyncRejectsUntilRebuildClearsIt(t *testing.T) {
+func TestRebuildRequired_NormalSyncAutomaticallyResumesCheckpointRecovery(t *testing.T) {
 	ctx := context.Background()
-
-	cases := []struct {
-		name           string
-		rebuild        func(*Client, context.Context) error
-		expectRotation bool
-	}{
-		{
-			name: "rebuild keep_source clears rebuild_required",
-			rebuild: func(client *Client, ctx context.Context) error {
-				_, err := client.Rebuild(ctx)
-				return err
-			},
-		},
-		{
-			name: "rebuild rotate_source clears rebuild_required",
-			rebuild: func(client *Client, ctx context.Context) error {
-				_, err := client.Rebuild(ctx)
-				return err
-			},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 				CREATE TABLE users (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL,
 					email TEXT NOT NULL
 				)
 			`)
-			originalSourceID := client.sourceID
+	originalSourceID := client.sourceID
 
-			_, err := db.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID)
-			require.NoError(t, err)
+	_, err := db.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID)
+	require.NoError(t, err)
 
-			_, err = client.Sync(ctx)
-			var rebuildErr *RebuildRequiredError
-			require.ErrorAs(t, err, &rebuildErr)
-
-			snapshotRequests := 0
-			pullRequests := 0
-			client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				switch r.URL.Path {
-				case "/sync/snapshot-sessions":
-					require.Equal(t, http.MethodPost, r.Method)
-					snapshotRequests++
-					var rebuildRequired int
-					require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&rebuildRequired))
-					require.Equal(t, 1, rebuildRequired)
-					return jsonResponse(oversync.SnapshotSession{
-						SnapshotID:        "snapshot-rebuild-required",
-						SnapshotBundleSeq: 7,
-						RowCount:          1,
-						ExpiresAt:         "2030-01-01T00:00:00Z",
-					}), nil
-				case "/sync/snapshot-sessions/snapshot-rebuild-required":
-					switch r.Method {
-					case http.MethodGet:
-						return jsonResponse(oversync.SnapshotChunkResponse{
-							SnapshotID:        "snapshot-rebuild-required",
-							SnapshotBundleSeq: 7,
-							Rows: []oversync.SnapshotRow{{
-								Schema:     "main",
-								Table:      "users",
-								Key:        mustBundleKey("user-1"),
-								RowVersion: 7,
-								Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-							}},
-							NextRowOrdinal: 1,
-							HasMore:        false,
-						}), nil
-					case http.MethodDelete:
-						return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-					}
-				case "/sync/pull":
-					require.Equal(t, http.MethodGet, r.Method)
-					pullRequests++
-					require.Equal(t, "7", r.URL.Query().Get("after_bundle_seq"))
-					return jsonResponse(oversync.PullResponse{
-						StableBundleSeq: 7,
-						HasMore:         false,
-						Bundles:         nil,
-					}), nil
-				}
-				return nil, io.EOF
-			})}
-
-			require.NoError(t, tc.rebuild(client, ctx))
-			require.Equal(t, 1, snapshotRequests)
-
+	snapshotRequests := 0
+	pullRequests := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/snapshot-sessions":
+			require.Equal(t, http.MethodPost, r.Method)
+			snapshotRequests++
 			var rebuildRequired int
 			require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&rebuildRequired))
-			require.Equal(t, 0, rebuildRequired)
+			require.Equal(t, 1, rebuildRequired)
+			return jsonResponse(oversync.SnapshotSession{
+				SnapshotID:        "snapshot-rebuild-required",
+				SnapshotBundleSeq: 7,
+				RowCount:          1,
+				ExpiresAt:         "2030-01-01T00:00:00Z",
+			}), nil
+		case "/sync/snapshot-sessions/snapshot-rebuild-required":
+			switch r.Method {
+			case http.MethodGet:
+				return jsonResponse(oversync.SnapshotChunkResponse{
+					SnapshotID:        "snapshot-rebuild-required",
+					SnapshotBundleSeq: 7,
+					Rows: []oversync.SnapshotRow{{
+						Schema:     "main",
+						Table:      "users",
+						Key:        mustBundleKey("user-1"),
+						RowVersion: 7,
+						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
+					}},
+					NextRowOrdinal: 1,
+					HasMore:        false,
+				}), nil
+			case http.MethodDelete:
+				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+			}
+		case "/sync/pull":
+			require.Equal(t, http.MethodGet, r.Method)
+			pullRequests++
+			require.Equal(t, "7", r.URL.Query().Get("after_bundle_seq"))
+			return jsonResponse(oversync.PullResponse{
+				StableBundleSeq: 7,
+				HasMore:         false,
+				Bundles:         nil,
+			}), nil
+		}
+		return nil, io.EOF
+	})}
 
-			require.Equal(t, originalSourceID, client.sourceID)
+	report, err := client.Sync(ctx)
+	require.NoError(t, err)
+	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.RemoteOutcome)
+	require.Equal(t, 1, snapshotRequests)
+	require.Equal(t, 0, pullRequests)
 
-			_, err = client.Sync(ctx)
-			require.NoError(t, err)
-			require.Equal(t, 1, pullRequests)
+	var rebuildRequired int
+	require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&rebuildRequired))
+	require.Equal(t, 0, rebuildRequired)
+	require.Equal(t, operationKindNone, requireOperationKind(t, db))
+	require.Equal(t, originalSourceID, client.sourceID)
 
-			name, email, exists := loadUserForKey(t, db, "user-1")
-			require.True(t, exists)
-			require.Equal(t, "Ada", name)
-			require.Equal(t, "ada@example.com", email)
-		})
-	}
+	_, err = client.Sync(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, pullRequests)
+
+	name, email, exists := loadUserForKey(t, db, "user-1")
+	require.True(t, exists)
+	require.Equal(t, "Ada", name)
+	require.Equal(t, "ada@example.com", email)
+}
+
+func TestCheckpointRecovery_PausedPendingWorkReturnsActionableBlocker(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('local-1', 'Local', 'local@example.com')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE _sync_attachment_state SET last_bundle_seq_seen = 99, rebuild_required = 1 WHERE singleton_key = 1`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE _sync_operation_state SET kind = 'none', reason = 'checkpoint_ahead' WHERE singleton_key = 1`)
+	require.NoError(t, err)
+	client.PauseUploads()
+
+	_, err = client.Sync(ctx)
+	var blockedErr *CheckpointRecoveryBlockedError
+	require.ErrorAs(t, err, &blockedErr)
+	require.Equal(t, CheckpointRecoveryBlockedUploadPaused, blockedErr.Reason)
+	require.Equal(t, 1, blockedErr.DirtyCount)
+	require.Zero(t, blockedErr.OutboundCount)
+
+	var (
+		dirtyCount      int
+		lastBundleSeq   int64
+		rebuildRequired int
+	)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 1, dirtyCount)
+	require.NoError(t, db.QueryRow(`SELECT last_bundle_seq_seen, rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&lastBundleSeq, &rebuildRequired))
+	require.Equal(t, int64(99), lastBundleSeq)
+	require.Equal(t, 1, rebuildRequired)
+	require.Equal(t, "checkpoint_ahead", requireOperationReason(t, db))
+
+	name, email, exists := loadUserForKey(t, db, "local-1")
+	require.True(t, exists)
+	require.Equal(t, "Local", name)
+	require.Equal(t, "local@example.com", email)
+}
+
+func TestCheckpointRecovery_FailedPushReportsDurableFrozenState(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('local-1', 'Local', 'local@example.com')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE _sync_attachment_state SET last_bundle_seq_seen = 99, rebuild_required = 1 WHERE singleton_key = 1`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE _sync_operation_state SET kind = 'none', reason = 'checkpoint_ahead' WHERE singleton_key = 1`)
+	require.NoError(t, err)
+
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			return errorJSONResponse(http.StatusUnauthorized, oversync.ErrorResponse{
+				Error:   "unauthorized",
+				Message: "reconcile denied",
+			}), nil
+		}
+		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	})}
+
+	_, err = client.Sync(ctx)
+	var blockedErr *CheckpointRecoveryBlockedError
+	require.ErrorAs(t, err, &blockedErr)
+	require.Equal(t, CheckpointRecoveryBlockedPushFailed, blockedErr.Reason)
+	require.Zero(t, blockedErr.DirtyCount)
+	require.Equal(t, 1, blockedErr.OutboundCount)
+	require.Equal(t, "prepared", blockedErr.ReplayState)
+
+	var (
+		dirtyCount      int
+		outboundCount   int
+		lastBundleSeq   int64
+		rebuildRequired int
+		replayState     string
+	)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT state FROM _sync_outbox_bundle WHERE singleton_key = 1`).Scan(&replayState))
+	require.NoError(t, db.QueryRow(`SELECT last_bundle_seq_seen, rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&lastBundleSeq, &rebuildRequired))
+	require.Zero(t, dirtyCount)
+	require.Equal(t, 1, outboundCount)
+	require.Equal(t, "prepared", replayState)
+	require.Equal(t, int64(99), lastBundleSeq)
+	require.Equal(t, 1, rebuildRequired)
+	require.Equal(t, "checkpoint_ahead", requireOperationReason(t, db))
+
+	name, email, exists := loadUserForKey(t, db, "local-1")
+	require.True(t, exists)
+	require.Equal(t, "Local", name)
+	require.Equal(t, "local@example.com", email)
 }
 
 func TestRebuildKeepSource_MultiChunkDownloadStagesRowsBeforeFinalApply(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1226,7 +1364,7 @@ func TestRebuildKeepSource_OneChunkStillStagesBeforeFinalApply(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1268,7 +1406,7 @@ func TestRebuildKeepSource_ClearsStaleSnapshotStageBeforeNewAttempt(t *testing.T
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1324,7 +1462,7 @@ func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t 
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1432,7 +1570,7 @@ func runSnapshotSessionRetryRestoresData(t *testing.T, tc snapshotSessionRetryCa
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1625,7 +1763,7 @@ func TestRebuildKeepSource_CheckpointUnchangedOnFailedFinalApply(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1679,7 +1817,7 @@ func TestRebuildRotateSource_ReusesDurableReplacementSourceAcrossRetry(t *testin
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1775,7 +1913,7 @@ func TestRebuildRotateSource_SourceIDDoesNotRotateOnFailedFinalApply(t *testing.
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1845,7 +1983,7 @@ func TestRebuildKeepSource_DeferredFKRowsApplyAcrossChunkBoundaries(t *testing.T
 			bundleSeq:  3,
 			ddl: []string{`
 				CREATE TABLE categories (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					parent_id TEXT,
 					name TEXT NOT NULL,
 					FOREIGN KEY (parent_id) REFERENCES categories(id) DEFERRABLE INITIALLY DEFERRED
@@ -1887,14 +2025,14 @@ func TestRebuildKeepSource_DeferredFKRowsApplyAcrossChunkBoundaries(t *testing.T
 			bundleSeq:  5,
 			ddl: []string{`
 				CREATE TABLE teams (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL,
 					captain_member_id TEXT,
 					FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY DEFERRED
 				)
 			`, `
 				CREATE TABLE team_members (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					team_id TEXT NOT NULL,
 					name TEXT NOT NULL,
 					FOREIGN KEY (team_id) REFERENCES teams(id) DEFERRABLE INITIALLY DEFERRED
@@ -1993,7 +2131,7 @@ func TestSnapshotStageRows_AreIsolatedBySnapshotID(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)

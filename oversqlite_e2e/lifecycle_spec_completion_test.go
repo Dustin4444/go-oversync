@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
+	"github.com/mobiletoly/go-oversync/internal/protocolhash"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
@@ -181,15 +182,17 @@ func TestEndToEnd_RawInitializerCrashBeforeCommitDoesNotLeakAuthoritativeRowsAnd
 	require.Equal(t, "initialize_local", firstConnect.Resolution)
 
 	crashedRowID := uuid.NewString()
+	crashedRows := []oversync.PushRequestRow{rawUserInsertRow(schema, crashedRowID, "Crashed Seed")}
 	createResp := rawCreatePushSession(t, server, userID, "device-a", http.StatusOK, oversync.PushSessionCreateRequest{
-		SourceBundleID:   1,
-		PlannedRowCount:  1,
-		InitializationID: firstConnect.InitializationID,
+		SourceBundleID:       1,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: rawCanonicalRequestHash(t, crashedRows),
+		InitializationID:     firstConnect.InitializationID,
 	})
 	require.Equal(t, "staging", createResp.Status)
 	rawUploadPushChunk(t, server, userID, "device-a", createResp.PushID, http.StatusOK, oversync.PushSessionChunkRequest{
 		StartRowOrdinal: 0,
-		Rows:            []oversync.PushRequestRow{rawUserInsertRow(schema, crashedRowID, "Crashed Seed")},
+		Rows:            crashedRows,
 	})
 
 	var (
@@ -210,15 +213,17 @@ func TestEndToEnd_RawInitializerCrashBeforeCommitDoesNotLeakAuthoritativeRowsAnd
 	require.NotEqual(t, firstConnect.InitializationID, recoveryConnect.InitializationID)
 
 	recoveredRowID := uuid.NewString()
+	recoveredRows := []oversync.PushRequestRow{rawUserInsertRow(schema, recoveredRowID, "Recovered Seed")}
 	recoverySession := rawCreatePushSession(t, server, userID, "device-b", http.StatusOK, oversync.PushSessionCreateRequest{
-		SourceBundleID:   1,
-		PlannedRowCount:  1,
-		InitializationID: recoveryConnect.InitializationID,
+		SourceBundleID:       1,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: rawCanonicalRequestHash(t, recoveredRows),
+		InitializationID:     recoveryConnect.InitializationID,
 	})
 	require.Equal(t, "staging", recoverySession.Status)
 	rawUploadPushChunk(t, server, userID, "device-b", recoverySession.PushID, http.StatusOK, oversync.PushSessionChunkRequest{
 		StartRowOrdinal: 0,
-		Rows:            []oversync.PushRequestRow{rawUserInsertRow(schema, recoveredRowID, "Recovered Seed")},
+		Rows:            recoveredRows,
 	})
 	rawCommitPushSession(t, server, userID, "device-b", recoverySession.PushID, http.StatusOK)
 
@@ -263,6 +268,9 @@ func rawCreatePushSession(
 	reqBody oversync.PushSessionCreateRequest,
 ) oversync.PushSessionCreateResponse {
 	t.Helper()
+	if reqBody.CanonicalRequestHash == "" {
+		reqBody.CanonicalRequestHash = strings.Repeat("0", 64)
+	}
 	var resp oversync.PushSessionCreateResponse
 	rawDoSyncJSON(t, server, http.MethodPost, "/sync/push-sessions", userID, sourceID, expectedStatus, reqBody, &resp)
 	return resp
@@ -276,9 +284,30 @@ func rawCreatePushSessionError(
 	reqBody oversync.PushSessionCreateRequest,
 ) oversync.ErrorResponse {
 	t.Helper()
+	if reqBody.CanonicalRequestHash == "" {
+		reqBody.CanonicalRequestHash = strings.Repeat("0", 64)
+	}
 	var resp oversync.ErrorResponse
 	rawDoSyncJSON(t, server, http.MethodPost, "/sync/push-sessions", userID, sourceID, expectedStatus, reqBody, &resp)
 	return resp
+}
+
+func rawCanonicalRequestHash(t *testing.T, rows []oversync.PushRequestRow) string {
+	t.Helper()
+	logical := make([]protocolhash.PushRow, 0, len(rows))
+	for _, row := range rows {
+		logical = append(logical, protocolhash.PushRow{
+			Schema:         strings.ToLower(strings.TrimSpace(row.Schema)),
+			Table:          strings.ToLower(strings.TrimSpace(row.Table)),
+			Key:            row.Key,
+			Op:             strings.ToUpper(strings.TrimSpace(row.Op)),
+			BaseRowVersion: row.BaseRowVersion,
+			Payload:        row.Payload,
+		})
+	}
+	hash, _, err := protocolhash.PushRequest(logical)
+	require.NoError(t, err)
+	return hash
 }
 
 func rawUploadPushChunk(

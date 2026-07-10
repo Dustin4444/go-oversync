@@ -94,24 +94,23 @@ func TestConnect_InitializeLocalSameSourceReconnectAndCommit(t *testing.T) {
 	require.Equal(t, firstResp.InitializationID, secondResp.InitializationID)
 
 	rowID := uuid.NewString()
+	pushRows := []PushRequestRow{{
+		Schema: schemaName, Table: "users", Key: SyncKey{"id": rowID}, Op: OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alpha","email":"alpha@example.com"}`, rowID)),
+	}}
 	createResp, err := svc.CreatePushSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, &PushSessionCreateRequest{
-		SourceBundleID:   1,
-		PlannedRowCount:  1,
-		InitializationID: firstResp.InitializationID,
+		SourceBundleID:       1,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: mustCanonicalPushRequestHash(t, pushRows),
+		InitializationID:     firstResp.InitializationID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "staging", createResp.Status)
 
 	_, err = svc.UploadPushChunk(ctx, Actor{UserID: userID, SourceID: "device-a"}, createResp.PushID, &PushSessionChunkRequest{
 		StartRowOrdinal: 0,
-		Rows: []PushRequestRow{{
-			Schema:         schemaName,
-			Table:          "users",
-			Key:            SyncKey{"id": rowID},
-			Op:             OpInsert,
-			BaseRowVersion: 0,
-			Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alpha","email":"alpha@example.com"}`, rowID)),
-		}},
+		Rows:            pushRows,
 	})
 	require.NoError(t, err)
 
@@ -176,9 +175,10 @@ func TestConnect_ExpiredInitializerCannotUpload(t *testing.T) {
 	require.Equal(t, "initialize_local", resp.Resolution)
 
 	createResp, err := svc.CreatePushSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, &PushSessionCreateRequest{
-		SourceBundleID:   1,
-		PlannedRowCount:  1,
-		InitializationID: resp.InitializationID,
+		SourceBundleID:       1,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: strings.Repeat("0", 64),
+		InitializationID:     resp.InitializationID,
 	})
 	require.NoError(t, err)
 

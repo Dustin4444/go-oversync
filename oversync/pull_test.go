@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -139,6 +141,133 @@ func TestProcessPull_RejectsCheckpointBelowRetainedBundleFloor(t *testing.T) {
 	require.ErrorAs(t, err, &prunedErr)
 	require.Equal(t, int64(1), prunedErr.ProvidedSeq)
 	require.Equal(t, int64(2), prunedErr.RetainedFloor)
+}
+
+func TestProcessPull_CheckpointAndTargetBoundaryMatrix(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "pull_boundaries_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "pull-boundaries-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "pull-boundaries-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	for sourceBundleID := int64(1); sourceBundleID <= 3; sourceBundleID++ {
+		mustPushUserBundle(t, ctx, svc, writer, schemaName, sourceBundleID, uuid.New(), fmt.Sprintf("User%d", sourceBundleID))
+	}
+	_, err := pool.Exec(ctx, `UPDATE sync.user_state SET retained_bundle_floor = 2 WHERE user_id = $1`, userID)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		after      int64
+		target     int64
+		stable     int64
+		bundleSeqs []int64
+		errType    any
+	}{
+		{name: "zero is pruned", after: 0, errType: (*HistoryPrunedError)(nil)},
+		{name: "floor minus one is pruned", after: 1, errType: (*HistoryPrunedError)(nil)},
+		{name: "floor succeeds", after: 2, stable: 3, bundleSeqs: []int64{3}},
+		{name: "current succeeds empty", after: 3, stable: 3},
+		{name: "future checkpoint is ahead", after: 4, errType: (*CheckpointAheadError)(nil)},
+		{name: "target below floor is pruned", after: 2, target: 1, errType: (*HistoryPrunedError)(nil)},
+		{name: "target at floor succeeds empty", after: 2, target: 2, stable: 2},
+		{name: "target current succeeds", after: 2, target: 3, stable: 3, bundleSeqs: []int64{3}},
+		{name: "future target is ahead", after: 3, target: 4, errType: (*CheckpointAheadError)(nil)},
+		{name: "target below checkpoint is invalid", after: 3, target: 2, errType: (*InvalidPullRequestError)(nil)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response, err := svc.ProcessPull(ctx, reader, test.after, 10, test.target)
+			if test.errType != nil {
+				require.Error(t, err)
+				switch test.errType.(type) {
+				case *HistoryPrunedError:
+					var target *HistoryPrunedError
+					require.ErrorAs(t, err, &target)
+				case *CheckpointAheadError:
+					var target *CheckpointAheadError
+					require.ErrorAs(t, err, &target)
+				case *InvalidPullRequestError:
+					var target *InvalidPullRequestError
+					require.ErrorAs(t, err, &target)
+				}
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, test.stable, response.StableBundleSeq)
+			var actualSeqs []int64
+			for _, bundle := range response.Bundles {
+				actualSeqs = append(actualSeqs, bundle.BundleSeq)
+			}
+			require.Equal(t, test.bundleSeqs, actualSeqs)
+		})
+	}
+}
+
+func TestHTTPSyncHandlers_HandlePullMapsCheckpointBoundaryErrors(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	logger := integrationTestLogger(slog.LevelWarn)
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "pull_http_boundaries_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "pull-http-boundaries-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	actor := Actor{UserID: "pull-http-user-" + suffix, SourceID: "reader"}
+	writer := Actor{UserID: actor.UserID, SourceID: "writer"}
+	for sourceBundleID := int64(1); sourceBundleID <= 3; sourceBundleID++ {
+		mustPushUserBundle(t, ctx, svc, writer, schemaName, sourceBundleID, uuid.New(), fmt.Sprintf("HTTPUser%d", sourceBundleID))
+	}
+	handlers := NewHTTPSyncHandlers(svc, logger)
+
+	tests := []struct {
+		name       string
+		query      string
+		statusCode int
+		errorCode  string
+	}{
+		{name: "future checkpoint", query: "after_bundle_seq=4", statusCode: http.StatusConflict, errorCode: "checkpoint_ahead"},
+		{name: "future target", query: "after_bundle_seq=3&target_bundle_seq=4", statusCode: http.StatusConflict, errorCode: "checkpoint_ahead"},
+		{name: "target below checkpoint", query: "after_bundle_seq=3&target_bundle_seq=2", statusCode: http.StatusBadRequest, errorCode: "invalid_request"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/sync/pull?"+test.query, nil)
+			request = request.WithContext(ContextWithActor(request.Context(), actor))
+			recorder := httptest.NewRecorder()
+			handlers.HandlePull(recorder, request)
+			require.Equal(t, test.statusCode, recorder.Code)
+			if test.errorCode == "" {
+				return
+			}
+			var response ErrorResponse
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+			require.Equal(t, test.errorCode, response.Error)
+		})
+	}
 }
 
 func TestGetStatus_ReportsRetentionAndHistoryPrunedVisibility(t *testing.T) {

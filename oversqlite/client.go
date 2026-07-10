@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,24 +25,27 @@ import (
 
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mobiletoly/go-oversync/internal/jcs"
+	"github.com/mobiletoly/go-oversync/internal/wirevalue"
 )
 
 // Client manages SQLite database and two-way sync operations
 type Client struct {
-	DB         *sql.DB
-	BaseURL    string
-	Token      func(context.Context) (string, error) // returns JWT
-	UserID     string
-	Resolver   Resolver
-	HTTP       *http.Client
-	config     *Config
-	logger     *slog.Logger
-	writeMu    sync.Mutex // Serialize write operations to prevent SQLite locking issues
-	pkByTable  map[string]string
-	keyByTable map[string][]string
-	tableOrder map[string]int
-	tableInfo  *TableInfoProvider
-	closed     uint32
+	DB                 *sql.DB
+	BaseURL            string
+	Token              func(context.Context) (string, error) // returns JWT
+	UserID             string
+	Resolver           Resolver
+	HTTP               *http.Client
+	config             *Config
+	logger             *slog.Logger
+	writeMu            sync.Mutex // Serialize write operations to prevent SQLite locking issues
+	pkByTable          map[string]string
+	keyByTable         map[string][]string
+	numericKindByTable map[string]map[string]wirevalue.NumericKind
+	tableOrder         map[string]int
+	tableInfo          *TableInfoProvider
+	closed             uint32
 
 	// Pause switches (atomic): allow callers to suspend sync activity deterministically
 	uploadPaused            int32
@@ -251,7 +255,21 @@ type SyncTable struct {
 	TableName         string   // Table name (e.g., "users", "posts")
 	SyncKeyColumnName string   // Single-column convenience field for the current supported envelope
 	SyncKeyColumns    []string // Ordered sync key columns for the bundle-based runtime
+	// NumericColumns declares columns whose wire representation differs from
+	// ordinary JSON values. ExactInt64 and ExactDecimal are JSON strings;
+	// Approximate is a JCS binary64 number.
+	NumericColumns map[string]NumericColumnKind
 }
+
+// NumericColumnKind defines the Oversqlite wire and SQLite binding contract for
+// one numeric business column.
+type NumericColumnKind string
+
+const (
+	NumericColumnExactInt64   NumericColumnKind = "exact_int64"
+	NumericColumnExactDecimal NumericColumnKind = "exact_decimal"
+	NumericColumnApproximate  NumericColumnKind = "approximate"
+)
 
 type BundleChangeWatchMode string
 
@@ -392,7 +410,13 @@ func NewClient(db *sql.DB, baseURL string, tok func(ctx context.Context) (string
 		}
 	}()
 
-	// Initialize database first (create sync tables and reset apply_mode)
+	tableInfoProvider := NewTableInfoProvider()
+	validatedTables, err := validateSyncTables(db, tableInfoProvider, config.Tables)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate the application-owned schema before creating or changing any local runtime state.
 	if err := initializeDatabase(db); err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
@@ -400,27 +424,22 @@ func NewClient(db *sql.DB, baseURL string, tok func(ctx context.Context) (string
 		return nil, err
 	}
 
-	tableInfoProvider := NewTableInfoProvider()
-	validatedTables, err := validateSyncTables(db, tableInfoProvider, config.Tables)
-	if err != nil {
-		return nil, err
-	}
-
 	client = &Client{
-		DB:             db,
-		BaseURL:        baseURL,
-		Token:          tok,
-		UserID:         "",
-		Resolver:       &ServerWinsResolver{},
-		HTTP:           &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
-		config:         config,
-		logger:         slog.Default(),
-		pkByTable:      validatedTables.pkByTable,
-		keyByTable:     validatedTables.keyByTable,
-		tableOrder:     validatedTables.tableOrder,
-		tableInfo:      tableInfoProvider,
-		dbOwnershipKey: identity.Key,
-		sourceID:       "",
+		DB:                 db,
+		BaseURL:            baseURL,
+		Token:              tok,
+		UserID:             "",
+		Resolver:           &ServerWinsResolver{},
+		HTTP:               &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
+		config:             config,
+		logger:             slog.Default(),
+		pkByTable:          validatedTables.pkByTable,
+		keyByTable:         validatedTables.keyByTable,
+		numericKindByTable: validatedTables.numericKindByTable,
+		tableOrder:         validatedTables.tableOrder,
+		tableInfo:          tableInfoProvider,
+		dbOwnershipKey:     identity.Key,
+		sourceID:           "",
 		sourceIDGenerator: func() string {
 			return uuid.NewString()
 		},
@@ -495,10 +514,11 @@ func (c *Client) getTableInfoTx(tx *sql.Tx, tableName string) (*TableInfo, error
 }
 
 type validatedSyncTables struct {
-	pkByTable      map[string]string
-	keyByTable     map[string][]string
-	tableOrder     map[string]int
-	tableInfoByKey map[string]*TableInfo
+	pkByTable          map[string]string
+	keyByTable         map[string][]string
+	numericKindByTable map[string]map[string]wirevalue.NumericKind
+	tableOrder         map[string]int
+	tableInfoByKey     map[string]*TableInfo
 }
 
 func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTable) (*validatedSyncTables, error) {
@@ -507,6 +527,7 @@ func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTa
 	}
 	pkByTable := make(map[string]string, len(tables))
 	keyByTable := make(map[string][]string, len(tables))
+	numericKindByTable := make(map[string]map[string]wirevalue.NumericKind, len(tables))
 	tableInfoByKey := make(map[string]*TableInfo, len(tables))
 	managedTables := make(map[string]struct{}, len(tables))
 	for _, syncTable := range tables {
@@ -542,6 +563,11 @@ func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTa
 
 		pkByTable[tableName] = resolvedPK
 		keyByTable[tableName] = append([]string(nil), keyColumns...)
+		numericKinds, err := validateNumericColumnKinds(syncTable, tableInfo)
+		if err != nil {
+			return nil, err
+		}
+		numericKindByTable[tableName] = numericKinds
 		tableInfoByKey[tableName] = tableInfo
 	}
 	if err := validateManagedForeignKeyClosure(managedTables, tableInfoByKey); err != nil {
@@ -552,11 +578,64 @@ func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTa
 		return nil, err
 	}
 	return &validatedSyncTables{
-		pkByTable:      pkByTable,
-		keyByTable:     keyByTable,
-		tableOrder:     tableOrder,
-		tableInfoByKey: tableInfoByKey,
+		pkByTable:          pkByTable,
+		keyByTable:         keyByTable,
+		numericKindByTable: numericKindByTable,
+		tableOrder:         tableOrder,
+		tableInfoByKey:     tableInfoByKey,
 	}, nil
+}
+
+func validateNumericColumnKinds(syncTable SyncTable, tableInfo *TableInfo) (map[string]wirevalue.NumericKind, error) {
+	result := make(map[string]wirevalue.NumericKind, len(syncTable.NumericColumns))
+	columns := make(map[string]ColumnInfo, len(tableInfo.Columns))
+	for _, column := range tableInfo.Columns {
+		columns[strings.ToLower(column.Name)] = column
+	}
+	for configuredName, configuredKind := range syncTable.NumericColumns {
+		name := strings.ToLower(strings.TrimSpace(configuredName))
+		if name == "" {
+			return nil, fmt.Errorf("table %s numeric column name must not be empty", syncTable.TableName)
+		}
+		column, ok := columns[name]
+		if !ok {
+			return nil, fmt.Errorf("table %s numeric column %s does not exist", syncTable.TableName, configuredName)
+		}
+		if _, exists := result[name]; exists {
+			return nil, fmt.Errorf("table %s numeric column %s is configured more than once", syncTable.TableName, configuredName)
+		}
+		var kind wirevalue.NumericKind
+		switch configuredKind {
+		case NumericColumnExactInt64:
+			kind = wirevalue.NumericKindExactInt64
+			if !column.IsInteger() {
+				return nil, fmt.Errorf("table %s exact-int64 column %s must have SQLite INTEGER affinity", syncTable.TableName, configuredName)
+			}
+		case NumericColumnExactDecimal:
+			kind = wirevalue.NumericKindExactDecimal
+			if !column.IsText() {
+				return nil, fmt.Errorf("table %s exact-decimal column %s must have SQLite TEXT affinity", syncTable.TableName, configuredName)
+			}
+		case NumericColumnApproximate:
+			kind = wirevalue.NumericKindApproximate
+			if !column.IsReal() {
+				return nil, fmt.Errorf("table %s approximate column %s must have SQLite REAL affinity", syncTable.TableName, configuredName)
+			}
+		default:
+			return nil, fmt.Errorf("table %s numeric column %s has unsupported kind %q", syncTable.TableName, configuredName, configuredKind)
+		}
+		result[name] = kind
+	}
+	return result, nil
+}
+
+func (c *Client) numericKindForColumn(tableName, columnName string) (wirevalue.NumericKind, bool) {
+	if c == nil {
+		return "", false
+	}
+	byColumn := c.numericKindByTable[strings.ToLower(strings.TrimSpace(tableName))]
+	kind, ok := byColumn[strings.ToLower(strings.TrimSpace(columnName))]
+	return kind, ok
 }
 
 func validateClientSchemaScope(db *sql.DB, schemaName string) error {
@@ -871,6 +950,7 @@ func initializeDatabase(db *sql.DB) error {
 
 		`CREATE TABLE IF NOT EXISTS _sync_outbox_bundle (
 				singleton_key           INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
+				canonical_json_contract TEXT NOT NULL CHECK (canonical_json_contract = 'jcs_typed_numeric_strings_v0'),
 				state                   TEXT NOT NULL DEFAULT 'none' CHECK (state IN ('none', 'prepared', 'committed_remote')),
 				source_id               TEXT NOT NULL DEFAULT '',
 				source_bundle_id        INTEGER NOT NULL DEFAULT 0,
@@ -946,8 +1026,8 @@ func initializeDatabase(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`
 			INSERT INTO _sync_outbox_bundle (
-				singleton_key, state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id, remote_bundle_hash, remote_bundle_seq
-			) VALUES (1, 'none', '', 0, '', 0, '', '', 0)
+				singleton_key, canonical_json_contract, state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id, remote_bundle_hash, remote_bundle_seq
+			) VALUES (1, 'jcs_typed_numeric_strings_v0', 'none', '', 0, '', 0, '', '', 0)
 			ON CONFLICT(singleton_key) DO NOTHING
 		`); err != nil {
 		return fmt.Errorf("failed to initialize outbox bundle row: %w", err)
@@ -996,6 +1076,17 @@ func (c *Client) Sync(ctx context.Context) (SyncReport, error) {
 	defer c.writeMu.Unlock()
 	if err := c.ensureConnectedSessionLocked(ctx, "Sync()"); err != nil {
 		return SyncReport{}, err
+	}
+	if remoteReport, resumed, err := c.resumeRequiredRecoveryLocked(ctx); resumed || err != nil {
+		if err != nil {
+			return SyncReport{}, err
+		}
+		return SyncReport{
+			PushOutcome:   PushOutcomeNoChange,
+			RemoteOutcome: remoteReport.Outcome,
+			Status:        remoteReport.Status,
+			Restore:       remoteReport.Restore,
+		}, nil
 	}
 	pushOutcome := PushOutcomeSkippedPaused
 	if atomic.LoadInt32(&c.uploadPaused) == 0 {
@@ -1128,8 +1219,10 @@ func (c *Client) SerializeRow(ctx context.Context, table, pk string) (json.RawMe
 		}
 	}
 
-	// Convert to JSON
-	jsonData, err := json.Marshal(row)
+	if err := c.prepareLocalRowForWire(tableLc, row, tableInfo); err != nil {
+		return nil, err
+	}
+	jsonData, err := jcs.Marshal(row)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal row to JSON: %w", err)
 	}
@@ -1208,10 +1301,70 @@ func (c *Client) serializeRowInTx(ctx context.Context, tx *sql.Tx, table, pk str
 		}
 	}
 
-	jsonData, err := json.Marshal(row)
+	if err := c.prepareLocalRowForWire(tableLc, row, tableInfo); err != nil {
+		return nil, err
+	}
+	jsonData, err := jcs.Marshal(row)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal row to JSON: %w", err)
 	}
 
 	return json.RawMessage(jsonData), nil
+}
+
+func (c *Client) prepareLocalRowForWire(tableName string, row map[string]interface{}, tableInfo *TableInfo) error {
+	for _, col := range tableInfo.Columns {
+		key := strings.ToLower(col.Name)
+		value := row[key]
+		if value == nil {
+			continue
+		}
+		kind, configured := c.numericKindForColumn(tableName, col.Name)
+		if !configured {
+			if col.IsInteger() {
+				if integer, ok := value.(int64); ok && (integer > 9007199254740991 || integer < -9007199254740991) {
+					return fmt.Errorf("column %s contains an integer outside the JCS exact range; configure it as exact_int64", col.Name)
+				}
+			}
+			continue
+		}
+		switch kind {
+		case wirevalue.NumericKindExactInt64:
+			var raw string
+			switch typed := value.(type) {
+			case int64:
+				raw = strconv.FormatInt(typed, 10)
+			case int:
+				raw = strconv.FormatInt(int64(typed), 10)
+			case string:
+				raw = typed
+			case []byte:
+				raw = string(typed)
+			default:
+				return fmt.Errorf("exact-int64 column %s must be stored as SQLite INTEGER", col.Name)
+			}
+			if _, err := wirevalue.ParseInt64(raw); err != nil {
+				return fmt.Errorf("invalid exact int64 in column %s: %w", col.Name, err)
+			}
+			row[key] = raw
+		case wirevalue.NumericKindExactDecimal:
+			raw, ok := value.(string)
+			if !ok {
+				if bytes, bytesOK := value.([]byte); bytesOK {
+					raw, ok = string(bytes), true
+				}
+			}
+			if !ok {
+				return fmt.Errorf("exact-decimal column %s must be stored as SQLite TEXT", col.Name)
+			}
+			if err := wirevalue.ValidateDecimal(raw); err != nil {
+				return fmt.Errorf("invalid exact decimal in column %s: %w", col.Name, err)
+			}
+			row[key] = raw
+		case wirevalue.NumericKindApproximate:
+			// SQLite REAL values are already returned as float64. JCS performs
+			// their standard finite binary64 serialization.
+		}
+	}
+	return nil
 }

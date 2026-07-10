@@ -6,7 +6,6 @@ package oversync
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,17 +14,25 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/mobiletoly/go-oversync/internal/protocolhash"
 )
 
 const (
-	registeredTableCaptureTriggerName = "oversync_bundle_capture_row"
-	registeredTableOwnerGuardTrigger  = "oversync_bundle_owner_guard"
+	registeredTableCaptureTriggerName   = "oversync_bundle_capture_row"
+	registeredTableOwnerGuardTrigger    = "oversync_bundle_owner_guard"
+	registeredTableTruncateGuardTrigger = "oversync_registered_truncate_guard"
 )
+
+type registeredTableTriggerTarget struct {
+	schemaName string
+	tableName  string
+}
 
 // BundleSource identifies one server-side committed bundle source.
 type BundleSource struct {
-	SourceID       string
-	SourceBundleID int64
+	SourceID             string
+	SourceBundleID       int64
+	CanonicalRequestHash string
 }
 
 type capturedBundleEvent struct {
@@ -63,58 +70,121 @@ func quoteSQLLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context) error {
-	if s == nil || s.pool == nil || s.config == nil || len(s.config.RegisteredTables) == 0 {
+func (s *SyncService) installRegisteredTableCaptureTriggersInTx(ctx context.Context, tx pgx.Tx) error {
+	if s == nil || s.config == nil || len(s.config.RegisteredTables) == 0 {
 		return nil
 	}
 
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, syncBootstrapLockKey); err != nil {
-			return fmt.Errorf("acquire sync bootstrap lock for capture triggers: %w", err)
+	for _, table := range s.config.RegisteredTables {
+		keyColumns := table.normalizedSyncKeyColumns()
+		if len(keyColumns) != 1 {
+			return fmt.Errorf("registered table %s requires exactly one sync key column to install capture trigger", table.normalizedKey())
 		}
-		for _, table := range s.config.RegisteredTables {
-			keyColumns := table.normalizedSyncKeyColumns()
-			if len(keyColumns) != 1 {
-				return fmt.Errorf("registered table %s requires exactly one sync key column to install capture trigger", table.normalizedKey())
-			}
-			info, ok := s.registeredTableInfo[table.normalizedKey()]
-			if !ok {
-				return fmt.Errorf("registered table %s is missing runtime metadata for trigger installation", table.normalizedKey())
-			}
+		info, ok := s.registeredTableInfo[table.normalizedKey()]
+		if !ok {
+			return fmt.Errorf("registered table %s is missing runtime metadata for trigger installation", table.normalizedKey())
+		}
 
-			tableIdent := pgx.Identifier{table.normalizedSchema(), table.normalizedTable()}.Sanitize()
-			stmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableCaptureTriggerName, tableIdent)
+		tableIdent := pgx.Identifier{table.normalizedSchema(), table.normalizedTable()}.Sanitize()
+		truncateTargets, err := loadRegisteredTableTriggerTargets(ctx, tx, table)
+		if err != nil {
+			return err
+		}
+		for _, target := range truncateTargets {
+			targetIdent := pgx.Identifier{target.schemaName, target.tableName}.Sanitize()
+			stmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableTruncateGuardTrigger, targetIdent)
 			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("drop capture trigger for %s: %w", table.normalizedKey(), err)
-			}
-			stmt = fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableOwnerGuardTrigger, tableIdent)
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("drop owner guard trigger for %s: %w", table.normalizedKey(), err)
-			}
-
-			stmt = fmt.Sprintf(
-				`CREATE TRIGGER %s BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.enforce_registered_row_owner()`,
-				registeredTableOwnerGuardTrigger,
-				tableIdent,
-			)
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("create owner guard trigger for %s: %w", table.normalizedKey(), err)
-			}
-
-			stmt = fmt.Sprintf(
-				`CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s, %s, %s)`,
-				registeredTableCaptureTriggerName,
-				tableIdent,
-				quoteSQLLiteral(keyColumns[0]),
-				quoteSQLLiteral(strconv.Itoa(int(info.syncKeyKind))),
-				quoteSQLLiteral(strconv.Itoa(int(info.tableID))),
-			)
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("create capture trigger for %s: %w", table.normalizedKey(), err)
+				return fmt.Errorf("drop truncate guard trigger for %s on %s.%s: %w", table.normalizedKey(), target.schemaName, target.tableName, err)
 			}
 		}
-		return nil
-	})
+		for _, target := range truncateTargets {
+			targetIdent := pgx.Identifier{target.schemaName, target.tableName}.Sanitize()
+			stmt := fmt.Sprintf(
+				`CREATE TRIGGER %s BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION sync.reject_registered_table_truncate(%s, %s)`,
+				registeredTableTruncateGuardTrigger,
+				targetIdent,
+				quoteSQLLiteral(table.normalizedSchema()),
+				quoteSQLLiteral(table.normalizedTable()),
+			)
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("create truncate guard trigger for %s on %s.%s: %w", table.normalizedKey(), target.schemaName, target.tableName, err)
+			}
+		}
+
+		stmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableCaptureTriggerName, tableIdent)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("drop capture trigger for %s: %w", table.normalizedKey(), err)
+		}
+		stmt = fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableOwnerGuardTrigger, tableIdent)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("drop owner guard trigger for %s: %w", table.normalizedKey(), err)
+		}
+
+		stmt = fmt.Sprintf(
+			`CREATE TRIGGER %s BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.enforce_registered_row_owner()`,
+			registeredTableOwnerGuardTrigger,
+			tableIdent,
+		)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("create owner guard trigger for %s: %w", table.normalizedKey(), err)
+		}
+
+		stmt = fmt.Sprintf(
+			`CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s, %s, %s)`,
+			registeredTableCaptureTriggerName,
+			tableIdent,
+			quoteSQLLiteral(keyColumns[0]),
+			quoteSQLLiteral(strconv.Itoa(int(info.syncKeyKind))),
+			quoteSQLLiteral(strconv.Itoa(int(info.tableID))),
+		)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("create capture trigger for %s: %w", table.normalizedKey(), err)
+		}
+	}
+	return nil
+}
+
+func loadRegisteredTableTriggerTargets(ctx context.Context, tx pgx.Tx, table RegisteredTable) ([]registeredTableTriggerTarget, error) {
+	rows, err := tx.Query(ctx, `
+		WITH RECURSIVE relation_tree AS (
+			SELECT relation.oid
+			FROM pg_class AS relation
+			JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+			WHERE namespace.nspname = $1
+			  AND relation.relname = $2
+
+			UNION ALL
+
+			SELECT inheritance.inhrelid
+			FROM pg_inherits AS inheritance
+			JOIN relation_tree AS parent ON parent.oid = inheritance.inhparent
+		)
+		SELECT namespace.nspname, relation.relname
+		FROM relation_tree AS tree
+		JOIN pg_class AS relation ON relation.oid = tree.oid
+		JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		ORDER BY namespace.nspname, relation.relname
+	`, table.normalizedSchema(), table.normalizedTable())
+	if err != nil {
+		return nil, fmt.Errorf("discover truncate guard targets for %s: %w", table.normalizedKey(), err)
+	}
+	defer rows.Close()
+
+	targets := make([]registeredTableTriggerTarget, 0, 1)
+	for rows.Next() {
+		var target registeredTableTriggerTarget
+		if err := rows.Scan(&target.schemaName, &target.tableName); err != nil {
+			return nil, fmt.Errorf("scan truncate guard target for %s: %w", table.normalizedKey(), err)
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate truncate guard targets for %s: %w", table.normalizedKey(), err)
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("registered table %s is missing while installing truncate guard", table.normalizedKey())
+	}
+	return targets, nil
 }
 
 func reserveUserBundleSeq(ctx context.Context, tx pgx.Tx, userPK int64) (int64, error) {
@@ -318,10 +388,10 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO sync.bundle_log (
-			user_pk, bundle_seq, source_id, source_bundle_id, row_count, byte_count, bundle_hash, committed_at
+			user_pk, bundle_seq, source_id, source_bundle_id, row_count, byte_count, bundle_hash, canonical_request_hash, committed_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-	`, userPK, bundleSeq, source.SourceID, source.SourceBundleID, len(bundleRows), byteCount, bundleHash); err != nil {
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+	`, userPK, bundleSeq, source.SourceID, source.SourceBundleID, len(bundleRows), byteCount, bundleHash, source.CanonicalRequestHash); err != nil {
 		return nil, fmt.Errorf("insert bundle_log row: %w", err)
 	}
 	if err := s.emitBundleChangeNotify(ctx, tx, userPK, BundleChangeEvent{
@@ -340,12 +410,13 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 		return nil, fmt.Errorf("delete captured bundle stage rows: %w", err)
 	}
 	return &Bundle{
-		BundleSeq:      bundleSeq,
-		SourceID:       source.SourceID,
-		SourceBundleID: source.SourceBundleID,
-		RowCount:       int64(len(bundleRows)),
-		BundleHash:     renderBundleHash(bundleHash),
-		Rows:           bundleRows,
+		BundleSeq:            bundleSeq,
+		SourceID:             source.SourceID,
+		SourceBundleID:       source.SourceBundleID,
+		RowCount:             int64(len(bundleRows)),
+		BundleHash:           renderBundleHash(bundleHash),
+		CanonicalRequestHash: source.CanonicalRequestHash,
+		Rows:                 bundleRows,
 	}, nil
 }
 
@@ -354,34 +425,22 @@ func renderBundleHash(bundleHash []byte) string {
 }
 
 func computeCommittedBundleHash(rows []BundleRow) ([]byte, int64, error) {
-	logicalRows := make([]map[string]any, 0, len(rows))
-	for i, row := range rows {
-		payloadValue := any(nil)
-		if row.Op != OpDelete && len(row.Payload) > 0 {
-			if err := json.Unmarshal(row.Payload, &payloadValue); err != nil {
-				return nil, 0, fmt.Errorf("decode payload for %s.%s row %d: %w", row.Schema, row.Table, i, err)
-			}
-		}
-		logicalRows = append(logicalRows, map[string]any{
-			"row_ordinal": i,
-			"schema":      row.Schema,
-			"table":       row.Table,
-			"key":         row.Key,
-			"op":          row.Op,
-			"row_version": row.RowVersion,
-			"payload":     payloadValue,
+	logicalRows := make([]protocolhash.BundleRow, 0, len(rows))
+	for _, row := range rows {
+		logicalRows = append(logicalRows, protocolhash.BundleRow{
+			Schema: row.Schema, Table: row.Table, Key: row.Key, Op: row.Op,
+			RowVersion: row.RowVersion, Payload: row.Payload,
 		})
 	}
-	raw, err := json.Marshal(logicalRows)
+	hash, byteCount, err := protocolhash.CommittedBundle(logicalRows)
 	if err != nil {
-		return nil, 0, fmt.Errorf("marshal logical bundle rows: %w", err)
+		return nil, 0, err
 	}
-	canonical, err := canonicalJSON(raw)
+	decoded, err := hex.DecodeString(hash)
 	if err != nil {
-		return nil, 0, fmt.Errorf("canonicalize logical bundle rows: %w", err)
+		return nil, 0, fmt.Errorf("decode committed bundle hash: %w", err)
 	}
-	sum := sha256.Sum256(canonical)
-	return sum[:], int64(len(canonical)), nil
+	return decoded, byteCount, nil
 }
 
 func loadCapturedBundleEvents(ctx context.Context, tx pgx.Tx, txid int64, userPK int64) ([]capturedBundleEvent, error) {
@@ -405,11 +464,9 @@ func loadCapturedBundleEvents(ctx context.Context, tx pgx.Tx, txid int64, userPK
 			return nil, fmt.Errorf("scan captured bundle stage row: %w", err)
 		}
 		if payload != nil {
-			canonicalPayload, err := canonicalJSON(payload)
-			if err != nil {
-				return nil, fmt.Errorf("canonicalize captured payload for table_id %d: %w", event.tableID, err)
-			}
-			event.payload = append([]byte(nil), canonicalPayload...)
+			// Preserve PostgreSQL's exact number tokens until schema-typed BIGINT
+			// and NUMERIC fields have been converted to wire strings.
+			event.payload = append([]byte(nil), payload...)
 		}
 		event.keyBytes = append([]byte(nil), event.keyBytes...)
 		events = append(events, event)

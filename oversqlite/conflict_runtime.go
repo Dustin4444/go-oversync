@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -405,8 +406,8 @@ func (c *Client) applyConflictResolutionPlan(ctx context.Context, snapshot *push
 }
 
 func (c *Client) validateMergedPayloadOrError(conflict ConflictContext, result KeepMerged) (map[string]any, error) {
-	var payload map[string]any
-	if err := json.Unmarshal(result.MergedPayload, &payload); err != nil {
+	payload, err := jcs.DecodeObject(result.MergedPayload)
+	if err != nil {
 		return nil, fmt.Errorf("KeepMerged for %s.%s must provide a JSON object payload", conflict.Schema, conflict.Table)
 	}
 	if payload == nil {
@@ -527,8 +528,8 @@ func parseStoredPayloadObject(payload sql.NullString, schemaName, tableName, op 
 	if !payload.Valid {
 		return nil, fmt.Errorf("local %s conflict is missing payload for %s.%s", op, schemaName, tableName)
 	}
-	var value map[string]any
-	if err := json.Unmarshal([]byte(payload.String), &value); err != nil {
+	value, err := jcs.DecodeObject([]byte(payload.String))
+	if err != nil {
 		return nil, fmt.Errorf("local %s conflict payload for %s.%s must be a JSON object: %w", op, schemaName, tableName, err)
 	}
 	if value == nil {

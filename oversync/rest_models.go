@@ -23,12 +23,13 @@ type BundleRow struct {
 
 // Bundle represents one committed durable sync unit in the target bundle-based contract.
 type Bundle struct {
-	BundleSeq      int64       `json:"bundle_seq"`
-	SourceID       string      `json:"source_id"`
-	SourceBundleID int64       `json:"source_bundle_id"`
-	RowCount       int64       `json:"row_count,omitempty"`
-	BundleHash     string      `json:"bundle_hash,omitempty"`
-	Rows           []BundleRow `json:"rows"`
+	BundleSeq            int64       `json:"bundle_seq"`
+	SourceID             string      `json:"source_id"`
+	SourceBundleID       int64       `json:"source_bundle_id"`
+	RowCount             int64       `json:"row_count,omitempty"`
+	BundleHash           string      `json:"bundle_hash,omitempty"`
+	CanonicalRequestHash string      `json:"canonical_request_hash,omitempty"`
+	Rows                 []BundleRow `json:"rows"`
 }
 
 // PushRequestRow is one locally dirty row intent sent by the client.
@@ -42,9 +43,10 @@ type PushRequestRow struct {
 }
 
 type PushSessionCreateRequest struct {
-	SourceBundleID   int64  `json:"source_bundle_id"`
-	PlannedRowCount  int64  `json:"planned_row_count"`
-	InitializationID string `json:"initialization_id,omitempty"`
+	SourceBundleID       int64  `json:"source_bundle_id"`
+	PlannedRowCount      int64  `json:"planned_row_count"`
+	CanonicalRequestHash string `json:"canonical_request_hash"`
+	InitializationID     string `json:"initialization_id,omitempty"`
 }
 
 type PushSessionCreateResponse struct {
@@ -57,6 +59,7 @@ type PushSessionCreateResponse struct {
 	SourceBundleID         int64  `json:"source_bundle_id,omitempty"`
 	RowCount               int64  `json:"row_count,omitempty"`
 	BundleHash             string `json:"bundle_hash,omitempty"`
+	CanonicalRequestHash   string `json:"canonical_request_hash,omitempty"`
 }
 
 type ConnectRequest struct {
@@ -81,22 +84,24 @@ type PushSessionChunkResponse struct {
 }
 
 type PushSessionCommitResponse struct {
-	BundleSeq      int64  `json:"bundle_seq"`
-	SourceID       string `json:"source_id"`
-	SourceBundleID int64  `json:"source_bundle_id"`
-	RowCount       int64  `json:"row_count"`
-	BundleHash     string `json:"bundle_hash"`
+	BundleSeq            int64  `json:"bundle_seq"`
+	SourceID             string `json:"source_id"`
+	SourceBundleID       int64  `json:"source_bundle_id"`
+	RowCount             int64  `json:"row_count"`
+	BundleHash           string `json:"bundle_hash"`
+	CanonicalRequestHash string `json:"canonical_request_hash"`
 }
 
 type CommittedBundleRowsResponse struct {
-	BundleSeq      int64       `json:"bundle_seq"`
-	SourceID       string      `json:"source_id"`
-	SourceBundleID int64       `json:"source_bundle_id"`
-	RowCount       int64       `json:"row_count"`
-	BundleHash     string      `json:"bundle_hash"`
-	Rows           []BundleRow `json:"rows"`
-	NextRowOrdinal int64       `json:"next_row_ordinal"`
-	HasMore        bool        `json:"has_more"`
+	BundleSeq            int64       `json:"bundle_seq"`
+	SourceID             string      `json:"source_id"`
+	SourceBundleID       int64       `json:"source_bundle_id"`
+	RowCount             int64       `json:"row_count"`
+	BundleHash           string      `json:"bundle_hash"`
+	CanonicalRequestHash string      `json:"canonical_request_hash"`
+	Rows                 []BundleRow `json:"rows"`
+	NextRowOrdinal       int64       `json:"next_row_ordinal"`
+	HasMore              bool        `json:"has_more"`
 }
 
 // PullResponse returns one or more complete committed bundles.

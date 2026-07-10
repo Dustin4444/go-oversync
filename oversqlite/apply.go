@@ -8,7 +8,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
+
+	"github.com/mobiletoly/go-oversync/internal/wirevalue"
 )
 
 func (c *Client) upsertRowInTx(ctx context.Context, tx *sql.Tx, table string, payload map[string]interface{}) error {
@@ -66,6 +70,11 @@ func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, t
 				}
 			}
 			val = decoded
+		} else if val != nil {
+			val, err = c.sqliteValueForWireJSON(table, col, val)
+			if err != nil {
+				return fmt.Errorf("payload for %s column %s: %w", table, col.Name, err)
+			}
 		}
 
 		columns = append(columns, quoteIdent(col.Name))
@@ -100,6 +109,79 @@ func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, t
 		return fmt.Errorf("failed to execute upsert: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) sqliteValueForWireJSON(table string, col ColumnInfo, value any) (any, error) {
+	number, isNumber := value.(json.Number)
+	if kind, configured := c.numericKindForColumn(table, col.Name); configured {
+		switch kind {
+		case wirevalue.NumericKindExactInt64:
+			raw, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("exact-int64 requires a JSON string")
+			}
+			parsed, err := wirevalue.ParseInt64(raw)
+			if err != nil {
+				return nil, fmt.Errorf("invalid exact int64: %w", err)
+			}
+			return parsed, nil
+		case wirevalue.NumericKindExactDecimal:
+			raw, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("exact-decimal requires a JSON string")
+			}
+			if err := wirevalue.ValidateDecimal(raw); err != nil {
+				return nil, fmt.Errorf("invalid exact decimal: %w", err)
+			}
+			return raw, nil
+		case wirevalue.NumericKindApproximate:
+			if !isNumber {
+				return nil, fmt.Errorf("approximate numeric column requires a JSON number")
+			}
+			parsed, err := strconv.ParseFloat(number.String(), 64)
+			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+				return nil, fmt.Errorf("approximate numeric column requires a finite binary64 value")
+			}
+			return parsed, nil
+		}
+	}
+	if col.IsInteger() {
+		switch typed := value.(type) {
+		case json.Number:
+			parsed, err := strconv.ParseInt(typed.String(), 10, 64)
+			if err != nil || parsed > 9007199254740991 || parsed < -9007199254740991 {
+				return nil, fmt.Errorf("INTEGER outside the JCS exact range requires exact_int64 metadata and a JSON string")
+			}
+			return parsed, nil
+		case int64:
+			return typed, nil
+		case int:
+			return int64(typed), nil
+		default:
+			return nil, fmt.Errorf("INTEGER requires an exact signed 64-bit integer")
+		}
+	}
+	if col.IsReal() {
+		switch typed := value.(type) {
+		case json.Number:
+			parsed, err := strconv.ParseFloat(typed.String(), 64)
+			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+				return nil, fmt.Errorf("REAL requires a finite representable value")
+			}
+			return parsed, nil
+		case float64:
+			if math.IsInf(typed, 0) || math.IsNaN(typed) {
+				return nil, fmt.Errorf("REAL requires a finite representable value")
+			}
+			return typed, nil
+		default:
+			return nil, fmt.Errorf("REAL requires a finite numeric value")
+		}
+	}
+	if isNumber {
+		return nil, fmt.Errorf("JSON number requires a compatible INTEGER or REAL destination")
+	}
+	return value, nil
 }
 
 func (c *Client) updateRowMeta(ctx context.Context, pk, tableName string, serverVersion int64, deleted bool) error {

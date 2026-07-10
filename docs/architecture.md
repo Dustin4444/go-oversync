@@ -7,7 +7,7 @@ permalink: /architecture/
 # Multi-Device Synchronization Architecture
 
 go-oversync implements a bundle-based replication model for SQLite clients and PostgreSQL servers.
-This page describes the current architecture in this repository, not earlier protocol iterations.
+This page describes the architecture implemented by the current repository.
 
 ## Overview
 

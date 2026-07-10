@@ -19,28 +19,35 @@ import (
 )
 
 type serviceLifecycleState string
+type bootstrapReadinessState string
 
 const (
-	serviceLifecycleRunning               serviceLifecycleState = "running"
-	serviceLifecycleShuttingDown          serviceLifecycleState = "shutting_down"
-	serviceLifecycleClosed                serviceLifecycleState = "closed"
-	defaultMaxBundlesPerPull              int                   = 5000
-	defaultPullBundlesPerRequest          int                   = 1000
-	defaultRowsPerPushChunk               int                   = 1000
-	defaultMaxRowsPerPushChunk            int                   = 5000
-	defaultPushSessionTTL                 time.Duration         = 15 * time.Minute
-	defaultRowsPerCommittedBundleChunk    int                   = 1000
-	defaultMaxRowsPerCommittedBundleChunk int                   = 5000
-	defaultMaxRowsPerSnapshotChunk        int                   = 5000
-	defaultRowsPerSnapshotChunk           int                   = 1000
-	defaultSnapshotSessionTTL             time.Duration         = 15 * time.Minute
-	defaultRetainedBundlesPerUser         int64                 = 10000
-	defaultRetentionPruneBatchSize        int64                 = 1000
-	defaultBundleChangeNotifyChannel      string                = "oversync_bundle_change_v1"
-	defaultBundleChangeHeartbeatInterval  time.Duration         = 25 * time.Second
+	serviceLifecycleRunning               serviceLifecycleState   = "running"
+	serviceLifecycleShuttingDown          serviceLifecycleState   = "shutting_down"
+	serviceLifecycleClosed                serviceLifecycleState   = "closed"
+	bootstrapReadinessNotReady            bootstrapReadinessState = "not_ready"
+	bootstrapReadinessBootstrapping       bootstrapReadinessState = "bootstrapping"
+	bootstrapReadinessReady               bootstrapReadinessState = "ready"
+	defaultMaxBundlesPerPull              int                     = 5000
+	defaultPullBundlesPerRequest          int                     = 1000
+	defaultRowsPerPushChunk               int                     = 1000
+	defaultMaxRowsPerPushChunk            int                     = 5000
+	defaultPushSessionTTL                 time.Duration           = 15 * time.Minute
+	defaultRowsPerCommittedBundleChunk    int                     = 1000
+	defaultMaxRowsPerCommittedBundleChunk int                     = 5000
+	defaultMaxRowsPerSnapshotChunk        int                     = 5000
+	defaultRowsPerSnapshotChunk           int                     = 1000
+	defaultSnapshotSessionTTL             time.Duration           = 15 * time.Minute
+	defaultRetainedBundlesPerUser         int64                   = 10000
+	defaultRetentionPruneBatchSize        int64                   = 1000
+	defaultBundleChangeNotifyChannel      string                  = "oversync_bundle_change_v1"
+	defaultBundleChangeHeartbeatInterval  time.Duration           = 25 * time.Second
 )
 
-var errServiceShuttingDown = errors.New("sync service is shutting down")
+var (
+	errServiceShuttingDown = errors.New("sync service is shutting down")
+	errServiceNotReady     = errors.New("sync service bootstrap is incomplete")
+)
 
 const (
 	syncScopeColumnName = "_sync_scope_id"
@@ -135,12 +142,15 @@ type SyncService struct {
 	discoveredSchema *DiscoveredSchema
 
 	// Runtime lifecycle tracking.
-	mu          sync.RWMutex
-	lifecycle   serviceLifecycleState
-	inFlightOps int
-	drainedCh   chan struct{}
-	closedCh    chan struct{}
-	closeOnce   sync.Once
+	bootstrapMu        sync.Mutex
+	mu                 sync.RWMutex
+	lifecycle          serviceLifecycleState
+	bootstrapReadiness bootstrapReadinessState
+	inFlightOps        int
+	drainedCh          chan struct{}
+	bootstrapDrainedCh chan struct{}
+	closedCh           chan struct{}
+	closeOnce          sync.Once
 }
 
 // ServiceConfig holds configuration for the sync service
@@ -332,6 +342,7 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 		registeredTableByID: make(map[int32]registeredTableRuntimeInfo),
 		columnTypesByTable:  make(map[string]map[string]string),
 		lifecycle:           serviceLifecycleRunning,
+		bootstrapReadiness:  bootstrapReadinessNotReady,
 		closedCh:            make(chan struct{}),
 	}
 
@@ -348,39 +359,263 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 // Bootstrap initializes sync metadata and the runtime topology snapshot.
 // Topology is prepared at bootstrap time and is restart-only for now; runtime schema changes are
 // not re-discovered automatically by SyncService.
-func (s *SyncService) Bootstrap(ctx context.Context) error {
+func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if s.pool == nil {
 		return fmt.Errorf("bootstrap requires a database pool")
 	}
-	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx); err != nil {
+	startedAt := time.Now()
+	s.logger.Info("Sync bootstrap started", "registered_table_count", len(s.config.RegisteredTables))
+	s.bootstrapMu.Lock()
+	defer s.bootstrapMu.Unlock()
+
+	started, err := s.beginBootstrap(ctx)
+	if !started {
 		return err
 	}
+	succeeded := false
+	defer func() {
+		s.finishBootstrap(succeeded)
+		if succeeded {
+			s.logger.Info("Sync bootstrap completed", "duration", time.Since(startedAt), "registered_table_count", len(s.config.RegisteredTables))
+			return
+		}
+		s.logger.Warn("Sync bootstrap rejected or rolled back", "duration", time.Since(startedAt), "error", err)
+	}()
+	if err != nil {
+		return err
+	}
+
+	if err := validateRegisteredTablePersistence(ctx, s.pool, s.config.RegisteredTables); err != nil {
+		return err
+	}
+	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx, s.pool); err != nil {
+		return err
+	}
+	if err := s.validateRegisteredIdentityNullability(ctx, s.pool); err != nil {
+		return err
+	}
+	if err := s.discoverSchemaRelationships(ctx); err != nil {
+		return fmt.Errorf("failed to discover schema relationships: %w", err)
+	}
+
 	if err := runRetryableTx(ctx, 3, 50*time.Millisecond, func() error {
 		return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			if err := s.initializeSchemaInTx(ctx, tx); err != nil {
+			lockStartedAt := time.Now()
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, syncBootstrapLockKey); err != nil {
+				return fmt.Errorf("acquire sync bootstrap lock: %w", err)
+			}
+			s.logger.Debug("Sync bootstrap advisory lock acquired", "wait_duration", time.Since(lockStartedAt))
+			if err := validateRegisteredTablePersistence(ctx, tx, s.config.RegisteredTables); err != nil {
+				return err
+			}
+			if err := s.lockRegisteredTablesForAdoption(ctx, tx); err != nil {
+				return err
+			}
+			if err := lockExistingManagedLayoutRelations(ctx, tx); err != nil {
+				return err
+			}
+			if err := s.validateRegisteredIdentityNullability(ctx, tx); err != nil {
+				return err
+			}
+			freshLayout, err := s.initializeSchemaInTx(ctx, tx)
+			if err != nil {
 				s.logger.Error("Failed to initialize database schema", "error", err)
 				return err
 			}
-			s.logger.Debug("Database schema initialized successfully")
+			if freshLayout {
+				if err := s.installRegisteredTableCaptureTriggersInTx(ctx, tx); err != nil {
+					return fmt.Errorf("failed to install registered table capture triggers: %w", err)
+				}
+			}
+			if err := s.validateManagedLayout(ctx, tx); err != nil {
+				return err
+			}
+			if freshLayout {
+				expectedCatalog, err := s.expectedTableCatalogRows()
+				if err != nil {
+					return err
+				}
+				if err := persistSyncLayoutMetadata(ctx, tx, expectedCatalog); err != nil {
+					return err
+				}
+			}
+			if err := s.adoptPopulatedRegisteredTables(ctx, tx); err != nil {
+				return fmt.Errorf("adopt populated registered tables: %w", err)
+			}
+			if err := s.validateManagedLayoutVolatileFacts(ctx, tx); err != nil {
+				return err
+			}
 			return nil
 		})
 	}); err != nil {
 		return err
 	}
+	succeeded = true
+	return nil
+}
 
-	if err := s.discoverSchemaRelationships(ctx); err != nil {
-		return fmt.Errorf("failed to discover schema relationships: %w", err)
+func (s *SyncService) validateRegisteredIdentityNullability(ctx context.Context, q syncCatalogQuerier) error {
+	if s == nil || s.config == nil || len(s.config.RegisteredTables) == 0 {
+		return nil
 	}
-	if err := s.installRegisteredTableCaptureTriggers(ctx); err != nil {
-		return fmt.Errorf("failed to install registered table capture triggers: %w", err)
+
+	schemas := make([]string, 0, len(s.config.RegisteredTables))
+	tables := make([]string, 0, len(s.config.RegisteredTables))
+	syncKeys := make([]string, 0, len(s.config.RegisteredTables))
+	for _, table := range s.config.RegisteredTables {
+		keyColumns := table.normalizedSyncKeyColumns()
+		if len(keyColumns) != 1 {
+			return unsupportedSchemaf("registered table %s must resolve to exactly one sync key column for nullable identity validation", table.normalizedKey())
+		}
+		schemas = append(schemas, table.normalizedSchema())
+		tables = append(tables, table.normalizedTable())
+		syncKeys = append(syncKeys, keyColumns[0])
+	}
+
+	rows, err := q.Query(ctx, `
+WITH RECURSIVE registered_roots AS (
+  SELECT schema_name, table_name, sync_key_column
+  FROM unnest(@schemas::text[], @tables::text[], @sync_keys::text[])
+    AS configured(schema_name, table_name, sync_key_column)
+), roots AS (
+  SELECT configured.*, relation.oid AS root_oid
+  FROM registered_roots AS configured
+  JOIN pg_namespace AS namespace ON namespace.nspname = configured.schema_name
+  JOIN pg_class AS relation
+    ON relation.relnamespace = namespace.oid
+   AND relation.relname = configured.table_name
+), relation_tree AS (
+  SELECT schema_name, table_name, sync_key_column, root_oid, root_oid AS target_oid
+  FROM roots
+
+  UNION ALL
+
+  SELECT tree.schema_name, tree.table_name, tree.sync_key_column, tree.root_oid, inheritance.inhrelid
+  FROM relation_tree AS tree
+  JOIN pg_inherits AS inheritance ON inheritance.inhparent = tree.target_oid
+)
+SELECT
+  tree.schema_name AS root_schema,
+  tree.table_name AS root_table,
+  target_namespace.nspname AS target_schema,
+  target.relname AS target_table,
+  required.role,
+  required.column_name,
+  type.typname AS udt_name,
+  attribute.attnotnull
+FROM relation_tree AS tree
+JOIN pg_class AS target ON target.oid = tree.target_oid
+JOIN pg_namespace AS target_namespace ON target_namespace.oid = target.relnamespace
+CROSS JOIN LATERAL (
+  VALUES
+    ('scope'::text, @scope_column::text),
+    ('sync key'::text, tree.sync_key_column)
+) AS required(role, column_name)
+LEFT JOIN pg_attribute AS attribute
+  ON attribute.attrelid = tree.target_oid
+ AND lower(attribute.attname) = lower(required.column_name)
+ AND attribute.attnum > 0
+ AND NOT attribute.attisdropped
+LEFT JOIN pg_type AS type ON type.oid = attribute.atttypid
+ORDER BY
+  tree.schema_name,
+  tree.table_name,
+  target_namespace.nspname,
+  target.relname,
+  required.role,
+  required.column_name
+`, pgx.NamedArgs{
+		"scope_column": syncScopeColumnName,
+		"schemas":      schemas,
+		"tables":       tables,
+		"sync_keys":    syncKeys,
+	})
+	if err != nil {
+		return fmt.Errorf("load registered identity nullability: %w", err)
+	}
+	defer rows.Close()
+
+	offenders := make([]string, 0)
+	for rows.Next() {
+		var rootSchema, rootTable, targetSchema, targetTable, role, columnName string
+		var udtName *string
+		var notNull *bool
+		if err := rows.Scan(&rootSchema, &rootTable, &targetSchema, &targetTable, &role, &columnName, &udtName, &notNull); err != nil {
+			return fmt.Errorf("scan registered identity nullability: %w", err)
+		}
+		root := Key(rootSchema, rootTable)
+		target := Key(targetSchema, targetTable)
+		if notNull == nil {
+			offenders = append(offenders, fmt.Sprintf("logical root %s, physical relation %s, %s column %s is missing", root, target, role, columnName))
+			continue
+		}
+		if !*notNull {
+			offenders = append(offenders, fmt.Sprintf("logical root %s, physical relation %s, %s column %s is nullable", root, target, role, columnName))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate registered identity nullability: %w", err)
+	}
+	if len(offenders) > 0 {
+		return unsupportedSchemaf(
+			"nullable identity declarations are unsupported: %s; resolve existing NULL values according to application policy, add explicit NOT NULL constraints to every reported root/descendant column, and retry bootstrap",
+			strings.Join(offenders, "; "),
+		)
 	}
 	return nil
 }
 
-func (s *SyncService) normalizeAndValidateRegisteredSyncKeys(ctx context.Context) error {
+func (s *SyncService) beginBootstrap(ctx context.Context) (bool, error) {
+	s.mu.Lock()
+	if s.lifecycle != serviceLifecycleRunning {
+		s.mu.Unlock()
+		return false, errServiceShuttingDown
+	}
+	s.bootstrapReadiness = bootstrapReadinessBootstrapping
+	s.inFlightOps++
+	if s.inFlightOps == 1 {
+		s.mu.Unlock()
+		return true, nil
+	}
+	if s.bootstrapDrainedCh == nil {
+		s.bootstrapDrainedCh = make(chan struct{})
+	}
+	drainedCh := s.bootstrapDrainedCh
+	s.mu.Unlock()
+
+	select {
+	case <-drainedCh:
+		s.mu.RLock()
+		running := s.lifecycle == serviceLifecycleRunning
+		s.mu.RUnlock()
+		if !running {
+			return true, errServiceShuttingDown
+		}
+		return true, nil
+	case <-ctx.Done():
+		return true, fmt.Errorf("wait for in-flight operations before bootstrap: %w", ctx.Err())
+	}
+}
+
+func (s *SyncService) finishBootstrap(succeeded bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bootstrapDrainedCh != nil {
+		close(s.bootstrapDrainedCh)
+		s.bootstrapDrainedCh = nil
+	}
+	if succeeded && s.lifecycle == serviceLifecycleRunning {
+		s.bootstrapReadiness = bootstrapReadinessReady
+	} else {
+		s.bootstrapReadiness = bootstrapReadinessNotReady
+	}
+	s.finishOperationLocked()
+}
+
+func (s *SyncService) normalizeAndValidateRegisteredSyncKeys(ctx context.Context, q syncCatalogQuerier) error {
 	if s == nil || s.pool == nil || s.config == nil || len(s.config.RegisteredTables) == 0 {
 		return nil
 	}
@@ -392,7 +627,7 @@ func (s *SyncService) normalizeAndValidateRegisteredSyncKeys(ctx context.Context
 		tables = append(tables, tbl.normalizedTable())
 	}
 
-	colRows, err := s.pool.Query(ctx, `
+	colRows, err := q.Query(ctx, `
 WITH t AS (
   SELECT * FROM unnest(@schemas::text[], @tables::text[]) AS x(schema_name, table_name)
 )
@@ -439,7 +674,7 @@ JOIN t
 		hasExpressions bool
 	}
 
-	uniqueRows, err := s.pool.Query(ctx, `
+	uniqueRows, err := q.Query(ctx, `
 WITH t AS (
   SELECT * FROM unnest(@schemas::text[], @tables::text[]) AS x(schema_name, table_name)
 )
@@ -516,7 +751,7 @@ ORDER BY n.nspname, c.relname, i.relname, ord.ordinality
 	registeredInfo := make(map[string]registeredTableRuntimeInfo, len(s.config.RegisteredTables))
 	normalizedTableKeys := make([]string, 0, len(s.config.RegisteredTables))
 	for i := range s.config.RegisteredTables {
-		tbl := &s.config.RegisteredTables[i]
+		tbl := s.config.RegisteredTables[i]
 		tableKey := tbl.normalizedKey()
 		keyColumns := tbl.normalizedSyncKeyColumns()
 		if len(keyColumns) != 1 {
@@ -561,7 +796,6 @@ ORDER BY n.nspname, c.relname, i.relname, ord.ordinality
 			return unsupportedSchemaf("registered table %s must provide unique identity (%s, %s)", tableKey, syncScopeColumnName, keyColumns[0])
 		}
 
-		tbl.SyncKeyColumns = []string{keyColumns[0]}
 		syncKeyKind, err := syncKeyKindCode(keyType)
 		if err != nil {
 			return err
@@ -585,16 +819,20 @@ ORDER BY n.nspname, c.relname, i.relname, ord.ordinality
 		registeredByID[info.tableID] = info
 	}
 
-	s.registeredTableInfo = registeredInfo
-	s.registeredTableByID = registeredByID
-	s.columnTypesByTable = make(map[string]map[string]string, len(columnTypes))
+	clonedColumnTypes := make(map[string]map[string]string, len(columnTypes))
 	for tableKey, cols := range columnTypes {
 		cloned := make(map[string]string, len(cols))
 		for columnName, udtName := range cols {
 			cloned[columnName] = udtName
 		}
-		s.columnTypesByTable[tableKey] = cloned
+		clonedColumnTypes[tableKey] = cloned
 	}
+
+	s.mu.Lock()
+	s.registeredTableInfo = registeredInfo
+	s.registeredTableByID = registeredByID
+	s.columnTypesByTable = clonedColumnTypes
+	s.mu.Unlock()
 
 	return nil
 }
@@ -673,6 +911,9 @@ func (s *SyncService) beginOperation() (func(), error) {
 	case serviceLifecycleClosed:
 		return nil, errors.New("sync service has been closed")
 	}
+	if s.pool != nil && s.bootstrapReadiness != bootstrapReadinessReady {
+		return nil, errServiceNotReady
+	}
 
 	s.inFlightOps++
 
@@ -687,9 +928,16 @@ func (s *SyncService) beginOperation() (func(), error) {
 func (s *SyncService) finishOperation() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.finishOperationLocked()
+}
 
+func (s *SyncService) finishOperationLocked() {
 	if s.inFlightOps > 0 {
 		s.inFlightOps--
+	}
+	if s.inFlightOps == 1 && s.bootstrapReadiness == bootstrapReadinessBootstrapping && s.bootstrapDrainedCh != nil {
+		close(s.bootstrapDrainedCh)
+		s.bootstrapDrainedCh = nil
 	}
 	if s.inFlightOps == 0 && s.lifecycle == serviceLifecycleShuttingDown {
 		s.lifecycle = serviceLifecycleClosed
@@ -731,7 +979,9 @@ func (s *SyncService) serviceClosedChannel() <-chan struct{} {
 func (s *SyncService) lifecycleSnapshot() (serviceLifecycleState, int, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.lifecycle, s.inFlightOps, s.lifecycle == serviceLifecycleRunning
+	accepting := s.lifecycle == serviceLifecycleRunning &&
+		(s.pool == nil || s.bootstrapReadiness == bootstrapReadinessReady)
+	return s.lifecycle, s.inFlightOps, accepting
 }
 
 type operationalInvariantSnapshot struct {
@@ -835,6 +1085,19 @@ func (s *SyncService) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	}
 
 	lifecycle, inFlightOps, accepting := s.lifecycleSnapshot()
+	if !accepting && lifecycle == serviceLifecycleRunning {
+		caps := s.GetCapabilities()
+		return &StatusResponse{
+			Status:              "unhealthy",
+			Version:             caps.ProtocolVersion,
+			AppName:             caps.AppName,
+			Lifecycle:           string(lifecycle),
+			AcceptingOperations: false,
+			InFlightOperations:  inFlightOps,
+			RegisteredTables:    caps.RegisteredTables,
+			Features:            caps.Features,
+		}, nil
+	}
 	invariantStats, err := s.operationalInvariantStats(ctx)
 	if err != nil {
 		return nil, err
@@ -881,6 +1144,9 @@ func (s *SyncService) GetSchemaVersion() int {
 
 // GetCapabilities returns the currently supported sync protocol surface.
 func (s *SyncService) GetCapabilities() CapabilitiesResponse {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	features := map[string]bool{
 		"bundle_pull":                         true,
 		"push_session_chunking":               true,

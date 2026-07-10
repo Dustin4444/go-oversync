@@ -5,7 +5,6 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 ## Endpoints
 
 - `POST /dummy-signin`
-- `POST /test/reset`
 - `POST /test/retention-floor`
 - `POST /sync/connect`
 - `POST /sync/push-sessions`
@@ -101,12 +100,13 @@ Possible `resolution` values:
 
 ## Reset local example database
 
-```bash
-curl -X POST http://localhost:8080/test/reset
-```
+The running server has no reset endpoint. `TRUNCATE` is rejected on every registered table with
+SQLSTATE `55000`, including inside bundle context and when reached through `CASCADE`.
 
-This drops and recreates the example business schema plus the local `sync` schema used by
-`nethttp_server`.
+To reset the example, stop every server and client process, delete and recreate PostgreSQL, create
+the permanent business tables, recreate every client database, and then start compatible server
+and client versions together. All rows, bundles, checkpoints, outboxes, and offline work
+are discarded. Do not disable the managed triggers or use schema drops while the server is running.
 
 ## Force prune recovery for one user
 

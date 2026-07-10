@@ -50,6 +50,23 @@ resolver code.
 - use parsed time comparison in custom merge logic such as `updated_at` conflict policies
 - do not treat legacy formats such as `yyyy:mm:dd hh:mm:ss` as the canonical synced form
 
+## Canonical JSON and numeric columns
+
+Canonical protocol bytes use RFC 8785 JCS. Oversync does not extend JCS with arbitrary-precision
+JSON numbers. Instead, schema discovery and client `numericColumns` metadata define the wire type:
+
+- PostgreSQL `BIGINT` / SQLite `INTEGER` exact values use canonical signed-64-bit JSON strings.
+- PostgreSQL `NUMERIC` / SQLite `TEXT` exact decimals use validated JSON strings and preserve the
+  authoritative PostgreSQL spelling.
+- Explicit approximate float/REAL columns use finite binary64 JSON numbers.
+- Native JSON/JSONB numbers are supported only inside that binary64/JCS domain; exact nested values
+  must be modeled as strings by the application schema.
+
+Exact strings are rejected before business or SQLite mutation if their grammar, range, or declared
+affinity is unsupported. `bundle_hash` authenticates server-committed rows. The separately stored
+`canonical_request_hash` proves that an ambiguous `already_committed` response belongs to the
+client's frozen original request even when legitimate server mutation changed committed payloads.
+
 ## Push
 
 Push is all-or-nothing at bundle level.
@@ -79,6 +96,27 @@ The supported client/runtime contract includes structured `push_conflict` recove
   only after a successful committed replay
 - The retry budget is bounded to `2` automatic retries inside one `PushPending()`
 
+## Administrative reset and TRUNCATE protection
+
+Oversync does not provide an in-place migration, canonicalization fallback, hash-version
+negotiation, compatibility alias, or mixed-version mode for incompatible database state. To reset
+a deployment, stop all server and client processes, recreate PostgreSQL and every Oversqlite client
+database, deploy compatible versions together, and reinitialize from authoritative business data.
+This procedure discards bundle history, staged sessions, outboxes, checkpoints, hashes, retry
+state, and offline work.
+
+`TRUNCATE` fails closed on registered tables and current partitions. A rejection uses SQLSTATE
+`55000` and preserves business rows, row state, bundles, hashes, source watermarks, pull, and
+snapshots. Normal runtime has no reset endpoint. Privileged trigger disabling and later
+managed-table DDL remain unsupported administrative risks.
+
+The `sync` schema is reserved for Oversync, and startup validates its complete semantic layout
+instead of trusting marker rows alone. A healthy restart performs no managed DDL. Drift returns a
+typed `managed sync layout mismatch` and is never repaired silently. Keep all server instances
+stopped while restoring the exact object, then retry; if exact repair is unsafe, use the coordinated
+server/client recreation procedure above. Do not mix versions during diagnosis or repair. These
+startup checks do not change wire messages, checkpoints, snapshots, bundles, or client local state.
+
 ## Pull
 
 Pull is frozen to a stable ceiling.
@@ -86,9 +124,12 @@ Pull is frozen to a stable ceiling.
 - The first `GET /sync/pull` response returns `stable_bundle_seq`.
 - Follow-up requests must keep using that ceiling until it is reached.
 - Clients advance `last_bundle_seq_seen` only after durable local bundle apply.
-- Bundle history is retained only above the user's `retained_bundle_floor`.
-- Pull or accepted-push replay at or below the retained floor returns `history_pruned`; snapshot
-  rebuild is the recovery path.
+- `retained_bundle_floor` is the highest discarded bundle. Pull from the floor is valid and returns
+  only bundles strictly above it; lower checkpoints return `history_pruned`.
+- Accepted-push replay remains stricter: replay at or below the floor returns `history_pruned`
+  because the committed bundle itself is no longer available.
+- A pull checkpoint or positive target above current committed history returns
+  `checkpoint_ahead`, never a clamped stable checkpoint.
 
 ## Snapshot rebuilds
 
@@ -99,6 +140,13 @@ Use it for:
 - first hydration
 - destructive recovery
 - rebuild after `history_pruned`
+- rebuild after `checkpoint_ahead`
+
+Clients durably set the rebuild gate before authoritative checkpoint recovery. Normal sync resumes
+that recovery automatically after restart. Pending local work is frozen and uploaded first when it
+can be reconciled safely; otherwise recovery returns an actionable blocker and preserves the app
+row, outbox, checkpoint, and rebuild gate. The checkpoint changes only in the final atomic snapshot
+apply. `Rebuild` remains an optional explicit control, not a required resume step.
 
 When rebuild requires source rotation:
 

@@ -7,18 +7,12 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
-
-func integrationTestDatabaseURL() string {
-	if dbURL := os.Getenv("TEST_DATABASE_URL"); dbURL != "" {
-		return dbURL
-	}
-	return "postgres://postgres:password@localhost:5432/clisync_test?sslmode=disable"
-}
 
 func integrationTestLogger(level slog.Level) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
@@ -27,13 +21,24 @@ func integrationTestLogger(level slog.Level) *slog.Logger {
 func newIntegrationTestPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	t.Helper()
 
-	pool, err := pgxpool.New(ctx, integrationTestDatabaseURL())
+	databaseURL, managed := provisionIntegrationTestDatabase(t, ctx)
+	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		t.Fatalf("create integration test pool: %v", err)
 	}
-	require.NoError(t, resetTestSyncSchema(ctx, pool))
-	t.Cleanup(func() { _ = resetTestSyncSchema(context.Background(), pool) })
 	t.Cleanup(pool.Close)
+	require.NoError(t, pool.Ping(ctx))
+
+	if !managed {
+		require.NoError(t, resetTestSyncSchema(ctx, pool))
+		t.Cleanup(func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := resetTestSyncSchema(cleanupCtx, pool); err != nil {
+				t.Errorf("reset caller-managed integration test database: %v", err)
+			}
+		})
+	}
 	return pool
 }
 
@@ -211,6 +216,13 @@ func mustInitializeEmptyScope(t *testing.T, ctx context.Context, svc *SyncServic
 	require.Contains(t, []string{"initialize_empty", "remote_authoritative"}, resp.Resolution)
 }
 
+func mustCanonicalPushRequestHash(t *testing.T, rows []PushRequestRow) string {
+	t.Helper()
+	hash, err := computeCanonicalPushRequestHash(rows)
+	require.NoError(t, err)
+	return hash
+}
+
 func pushRowsViaSession(
 	t *testing.T,
 	ctx context.Context,
@@ -222,10 +234,15 @@ func pushRowsViaSession(
 	t.Helper()
 
 	initializationID := resolveConnectForPushSession(t, ctx, svc, actor, len(rows) > 0)
+	canonicalRequestHash, hashErr := computeCanonicalPushRequestHash(rows)
+	if hashErr != nil {
+		return nil, hashErr
+	}
 	createResp, err := svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
-		SourceBundleID:   sourceBundleID,
-		PlannedRowCount:  int64(len(rows)),
-		InitializationID: initializationID,
+		SourceBundleID:       sourceBundleID,
+		PlannedRowCount:      int64(len(rows)),
+		CanonicalRequestHash: canonicalRequestHash,
+		InitializationID:     initializationID,
 	})
 	if err != nil {
 		return nil, err

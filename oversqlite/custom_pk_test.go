@@ -22,7 +22,7 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 	// Create test tables with custom primary key columns
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			user_uuid TEXT PRIMARY KEY,
+			user_uuid TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT
 		)
@@ -33,7 +33,7 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 
 	_, err = db.Exec(`
 		CREATE TABLE products (
-			product_code TEXT PRIMARY KEY,
+			product_code TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			price REAL
 		)
@@ -45,7 +45,7 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 	// Create test table with default "id" column
 	_, err = db.Exec(`
 		CREATE TABLE posts (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			title TEXT NOT NULL,
 			content TEXT
 		)
@@ -130,7 +130,7 @@ func TestNewClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
 	// Create test table with default "id" column
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT
 		)
@@ -182,7 +182,7 @@ func TestNewClient_RejectsInvalidSyncKeyColumnDefinitions(t *testing.T) {
 			syncKeyColumnName: "missing_pk",
 			ddl: `
 				CREATE TABLE users (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL
 				)
 			`,
@@ -235,7 +235,7 @@ func TestTriggerGenerationWithCustomPK(t *testing.T) {
 	// Create test table with custom primary key
 	_, err = db.Exec(`
 		CREATE TABLE test_table (
-			custom_id TEXT PRIMARY KEY,
+			custom_id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			value INTEGER
 		)
@@ -312,7 +312,7 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 	// Create test table with custom primary key
 	_, err = db.Exec(`
 		CREATE TABLE test_items (
-			item_code TEXT PRIMARY KEY,
+			item_code TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			quantity INTEGER DEFAULT 0
 		)
@@ -429,7 +429,7 @@ func TestTemplateBasedTriggerGeneration(t *testing.T) {
 	// Create test table with custom primary key
 	_, err = db.Exec(`
 		CREATE TABLE test_products (
-			product_code TEXT PRIMARY KEY,
+			product_code TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			price REAL
 		)

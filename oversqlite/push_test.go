@@ -2,9 +2,7 @@ package oversqlite
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mobiletoly/go-oversync/internal/protocolhash"
 	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
@@ -175,39 +174,43 @@ func newFixedVersionCommitHook(t *testing.T, server *mockPushSessionServer, rowV
 			})
 		}
 		committed := &mockCommittedBundle{
-			BundleSeq:      server.nextBundleSeq,
-			SourceID:       session.SourceID,
-			SourceBundleID: session.SourceBundleID,
-			Rows:           rows,
-			BundleHash:     mustBundleHash(t, rows),
+			BundleSeq:            server.nextBundleSeq,
+			SourceID:             session.SourceID,
+			SourceBundleID:       session.SourceBundleID,
+			Rows:                 rows,
+			BundleHash:           mustBundleHash(t, rows),
+			CanonicalRequestHash: session.CanonicalRequestHash,
 		}
 		server.nextBundleSeq++
 		server.committedBySource[session.SourceBundleID] = committed
 		server.committedBySeq[committed.BundleSeq] = committed
 		return jsonResponse(oversync.PushSessionCommitResponse{
-			BundleSeq:      committed.BundleSeq,
-			SourceID:       committed.SourceID,
-			SourceBundleID: committed.SourceBundleID,
-			RowCount:       int64(len(committed.Rows)),
-			BundleHash:     committed.BundleHash,
+			BundleSeq:            committed.BundleSeq,
+			SourceID:             committed.SourceID,
+			SourceBundleID:       committed.SourceBundleID,
+			RowCount:             int64(len(committed.Rows)),
+			BundleHash:           committed.BundleHash,
+			CanonicalRequestHash: committed.CanonicalRequestHash,
 		})
 	}
 }
 
 type mockPushSession struct {
-	PushID          string
-	SourceID        string
-	SourceBundleID  int64
-	PlannedRowCount int64
-	Rows            []oversync.PushRequestRow
+	PushID               string
+	SourceID             string
+	SourceBundleID       int64
+	PlannedRowCount      int64
+	CanonicalRequestHash string
+	Rows                 []oversync.PushRequestRow
 }
 
 type mockCommittedBundle struct {
-	BundleSeq      int64
-	SourceID       string
-	SourceBundleID int64
-	Rows           []oversync.BundleRow
-	BundleHash     string
+	BundleSeq            int64
+	SourceID             string
+	SourceBundleID       int64
+	Rows                 []oversync.BundleRow
+	BundleHash           string
+	CanonicalRequestHash string
 }
 
 type mockPushSessionServer struct {
@@ -243,21 +246,23 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
 		if committed := s.committedBySource[req.SourceBundleID]; committed != nil {
 			return jsonResponse(oversync.PushSessionCreateResponse{
-				Status:         "already_committed",
-				BundleSeq:      committed.BundleSeq,
-				SourceID:       committed.SourceID,
-				SourceBundleID: committed.SourceBundleID,
-				RowCount:       int64(len(committed.Rows)),
-				BundleHash:     committed.BundleHash,
+				Status:               "already_committed",
+				BundleSeq:            committed.BundleSeq,
+				SourceID:             committed.SourceID,
+				SourceBundleID:       committed.SourceBundleID,
+				RowCount:             int64(len(committed.Rows)),
+				BundleHash:           committed.BundleHash,
+				CanonicalRequestHash: committed.CanonicalRequestHash,
 			}), nil
 		}
 		s.nextPushID++
 		pushID := "push-" + strconv.Itoa(s.nextPushID)
 		s.sessions[pushID] = &mockPushSession{
-			PushID:          pushID,
-			SourceID:        r.Header.Get(oversync.SourceIDHeader),
-			SourceBundleID:  req.SourceBundleID,
-			PlannedRowCount: req.PlannedRowCount,
+			PushID:               pushID,
+			SourceID:             r.Header.Get(oversync.SourceIDHeader),
+			SourceBundleID:       req.SourceBundleID,
+			PlannedRowCount:      req.PlannedRowCount,
+			CanonicalRequestHash: req.CanonicalRequestHash,
 		}
 		return jsonResponse(oversync.PushSessionCreateResponse{
 			PushID:                 pushID,
@@ -322,14 +327,15 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 			nextRowOrdinal = logicalAfter + int64(len(chunkRows))
 		}
 		return jsonResponse(oversync.CommittedBundleRowsResponse{
-			BundleSeq:      committed.BundleSeq,
-			SourceID:       committed.SourceID,
-			SourceBundleID: committed.SourceBundleID,
-			RowCount:       int64(len(committed.Rows)),
-			BundleHash:     committed.BundleHash,
-			Rows:           chunkRows,
-			NextRowOrdinal: nextRowOrdinal,
-			HasMore:        end < len(committed.Rows),
+			BundleSeq:            committed.BundleSeq,
+			SourceID:             committed.SourceID,
+			SourceBundleID:       committed.SourceBundleID,
+			RowCount:             int64(len(committed.Rows)),
+			BundleHash:           committed.BundleHash,
+			CanonicalRequestHash: committed.CanonicalRequestHash,
+			Rows:                 chunkRows,
+			NextRowOrdinal:       nextRowOrdinal,
+			HasMore:              end < len(committed.Rows),
 		}), nil
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/"):
@@ -355,56 +361,42 @@ func (s *mockPushSessionServer) defaultCommitResponse(session *mockPushSession) 
 		})
 	}
 	committed := &mockCommittedBundle{
-		BundleSeq:      s.nextBundleSeq,
-		SourceID:       session.SourceID,
-		SourceBundleID: session.SourceBundleID,
-		Rows:           rows,
-		BundleHash:     mustBundleHash(s.t, rows),
+		BundleSeq:            s.nextBundleSeq,
+		SourceID:             session.SourceID,
+		SourceBundleID:       session.SourceBundleID,
+		Rows:                 rows,
+		BundleHash:           mustBundleHash(s.t, rows),
+		CanonicalRequestHash: session.CanonicalRequestHash,
 	}
 	s.nextBundleSeq++
 	s.committedBySource[session.SourceBundleID] = committed
 	s.committedBySeq[committed.BundleSeq] = committed
 	return jsonResponse(oversync.PushSessionCommitResponse{
-		BundleSeq:      committed.BundleSeq,
-		SourceID:       committed.SourceID,
-		SourceBundleID: committed.SourceBundleID,
-		RowCount:       int64(len(committed.Rows)),
-		BundleHash:     committed.BundleHash,
+		BundleSeq:            committed.BundleSeq,
+		SourceID:             committed.SourceID,
+		SourceBundleID:       committed.SourceBundleID,
+		RowCount:             int64(len(committed.Rows)),
+		BundleHash:           committed.BundleHash,
+		CanonicalRequestHash: committed.CanonicalRequestHash,
 	})
 }
 
 func mustBundleHash(t *testing.T, rows []oversync.BundleRow) string {
 	t.Helper()
-
-	logicalRows := make([]map[string]any, 0, len(rows))
-	for idx, row := range rows {
-		payloadValue := any(nil)
-		if row.Op != oversync.OpDelete && len(row.Payload) > 0 {
-			require.NoError(t, json.Unmarshal(row.Payload, &payloadValue))
-		}
-		logicalRows = append(logicalRows, map[string]any{
-			"row_ordinal": idx,
-			"schema":      row.Schema,
-			"table":       row.Table,
-			"key":         row.Key,
-			"op":          row.Op,
-			"row_version": row.RowVersion,
-			"payload":     payloadValue,
-		})
+	logicalRows := make([]protocolhash.BundleRow, 0, len(rows))
+	for _, row := range rows {
+		logicalRows = append(logicalRows, protocolhash.BundleRow{Schema: row.Schema, Table: row.Table, Key: row.Key, Op: row.Op, RowVersion: row.RowVersion, Payload: row.Payload})
 	}
-	raw, err := json.Marshal(logicalRows)
+	hash, _, err := protocolhash.CommittedBundle(logicalRows)
 	require.NoError(t, err)
-	canonical, err := canonicalizeJSONBytes(raw)
-	require.NoError(t, err)
-	sum := sha256.Sum256(canonical)
-	return hex.EncodeToString(sum[:])
+	return hash
 }
 
 func TestPushPending_RepeatedLocalEditsCollapseIntoOneDirtyRowAndAdvanceBundleState(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -460,7 +452,7 @@ func TestPushPending_SuccessfulCommitDoesNotDeleteCommittedSession(t *testing.T)
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -480,7 +472,7 @@ func TestPushPending_RetriesTransientCreateSessionFailureAndSucceeds(t *testing.
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -513,7 +505,7 @@ func TestPushPending_DoesNotRetryUnauthorized(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -543,7 +535,7 @@ func TestPushPending_CreateHistoryPrunedRequiresSourceRecoveryAndRotatePreserves
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -653,7 +645,7 @@ func TestPushPending_CreateSourceSequenceOutOfOrderPersistsSourceRecoveryAcrossR
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -747,7 +739,7 @@ func TestPushPending_CommitSourceSequenceChangedRequiresSourceRecovery(t *testin
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -785,7 +777,7 @@ func TestPushPending_CreateSourceRetiredEntersSourceRecoveryAndAdoptsReplacement
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -819,7 +811,7 @@ func TestPushPending_CommitSourceRetiredEntersSourceRecoveryAndAdoptsReplacement
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -854,7 +846,7 @@ func TestPushPending_CreateSourceRetiredReplacementDivergenceFailsClosed(t *test
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -892,7 +884,7 @@ func TestPushPending_CommittedRemoteReplayPrunedFallsBackToKeepSourceRebuild(t *
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -962,7 +954,7 @@ func TestPushPending_RetryExhaustionReturnsTypedError(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -995,7 +987,7 @@ func TestPushPending_TextSyncKeyRoundTripsThroughPush(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "docs", SyncKeyColumnName: "doc_id"}}, `
 		CREATE TABLE docs (
-			doc_id TEXT PRIMARY KEY,
+			doc_id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)
@@ -1054,7 +1046,7 @@ func TestCollectDirtyRowsForPushInTx_LocalInsertBuildsInsertFromDirtyPayload(t *
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1084,7 +1076,7 @@ func TestCollectDirtyRowsForPushInTx_SyncedUpdateBuildsUpdateFromDirtyPayload(t 
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1113,7 +1105,7 @@ func TestCollectDirtyRowsForPushInTx_UnsyncedInsertDeleteBecomesNoOp(t *testing.
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1139,7 +1131,7 @@ func TestCollectDirtyRowsForPushInTx_SyncedDeleteBuildsDeleteWithoutPayload(t *t
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1168,7 +1160,7 @@ func TestPushPending_EmptyDirtyQueueIsNoOpBeforeOutboundStateIsCreated(t *testin
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1200,7 +1192,7 @@ func TestPushPending_DirtySetLargerThanOneChunkSucceeds(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1244,7 +1236,7 @@ func TestPushPending_RealColumnReplayDoesNotRequeueEquivalentValue(t *testing.T)
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			score REAL NOT NULL
 		)
@@ -1275,13 +1267,13 @@ func TestPushPending_OrdersUpsertsParentFirstAndDeletesChildFirst(t *testing.T) 
 		{TableName: "posts", SyncKeyColumnName: "id"},
 	}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE posts (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			title TEXT NOT NULL,
 			author_id TEXT NOT NULL,
 			FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
@@ -1318,7 +1310,7 @@ func TestPushPending_ConflictLeavesDirtyRowsIntact(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1356,7 +1348,7 @@ func TestPushPending_RejectsInvalidCommitResponse(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1420,7 +1412,7 @@ func TestPushPending_FailsClosedOnCommittedReplayMetadataMismatch(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 				CREATE TABLE users (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL,
 					email TEXT NOT NULL
 				)
@@ -1444,22 +1436,24 @@ func TestPushPending_FailsClosedOnCommittedReplayMetadataMismatch(t *testing.T) 
 					})
 				}
 				committed := &mockCommittedBundle{
-					BundleSeq:      server.nextBundleSeq,
-					SourceID:       session.SourceID,
-					SourceBundleID: session.SourceBundleID,
-					Rows:           rows,
-					BundleHash:     mustBundleHash(t, rows),
+					BundleSeq:            server.nextBundleSeq,
+					SourceID:             session.SourceID,
+					SourceBundleID:       session.SourceBundleID,
+					Rows:                 rows,
+					BundleHash:           mustBundleHash(t, rows),
+					CanonicalRequestHash: session.CanonicalRequestHash,
 				}
 				server.nextBundleSeq++
 				server.committedBySource[session.SourceBundleID] = committed
 				server.committedBySeq[committed.BundleSeq] = committed
 
 				resp := &oversync.PushSessionCommitResponse{
-					BundleSeq:      committed.BundleSeq,
-					SourceID:       committed.SourceID,
-					SourceBundleID: committed.SourceBundleID,
-					RowCount:       int64(len(committed.Rows)),
-					BundleHash:     committed.BundleHash,
+					BundleSeq:            committed.BundleSeq,
+					SourceID:             committed.SourceID,
+					SourceBundleID:       committed.SourceBundleID,
+					RowCount:             int64(len(committed.Rows)),
+					BundleHash:           committed.BundleHash,
+					CanonicalRequestHash: committed.CanonicalRequestHash,
 				}
 				tc.mutate(resp)
 				return jsonResponse(resp)
@@ -1489,7 +1483,7 @@ func TestPushPending_ReplaysAcceptedBundleAfterCrashBeforeDurableApply(t *testin
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1547,7 +1541,7 @@ func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *te
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1617,7 +1611,7 @@ func TestPushPending_MovesFrozenRowsIntoOutboundAtomically(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1659,7 +1653,7 @@ func TestPushPending_NewLocalWritesDuringUploadSurviveInDirtyRows(t *testing.T) 
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1698,7 +1692,7 @@ func TestPushPending_KeepsOnlyOneFrozenOutboxBundleDurably(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1739,7 +1733,7 @@ func TestPushPending_NewLocalWritesDuringReplaySurviveInDirtyRows(t *testing.T) 
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1776,7 +1770,7 @@ func TestPushPending_AuthoritativeReplayDoesNotGenerateDirtyRowsAndCapturesLater
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1830,7 +1824,7 @@ func TestPushPending_AuthoritativeReplayRollbackDoesNotLeakApplyMode(t *testing.
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1879,7 +1873,7 @@ func TestCompareCommittedBundleToCanonicalOutbox_IgnoresEquivalentRowOrder(t *te
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -1942,7 +1936,7 @@ func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T
 	t.Run("self referential child before parent", func(t *testing.T) {
 		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "categories", SyncKeyColumnName: "id"}}, `
 			CREATE TABLE categories (
-				id TEXT PRIMARY KEY,
+				id TEXT PRIMARY KEY NOT NULL,
 				name TEXT NOT NULL,
 				parent_id TEXT,
 				FOREIGN KEY (parent_id) REFERENCES categories(id) DEFERRABLE INITIALLY IMMEDIATE
@@ -1998,14 +1992,14 @@ func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T
 			{TableName: "team_members", SyncKeyColumnName: "id"},
 		}, `
 			CREATE TABLE teams (
-				id TEXT PRIMARY KEY,
+				id TEXT PRIMARY KEY NOT NULL,
 				name TEXT NOT NULL,
 				captain_member_id TEXT,
 				FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY IMMEDIATE
 			)
 		`, `
 			CREATE TABLE team_members (
-				id TEXT PRIMARY KEY,
+				id TEXT PRIMARY KEY NOT NULL,
 				name TEXT NOT NULL,
 				team_id TEXT NOT NULL,
 				FOREIGN KEY (team_id) REFERENCES teams(id) DEFERRABLE INITIALLY IMMEDIATE
@@ -2067,7 +2061,7 @@ func TestClient_RejectsOverlappingSyncOperations(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -2267,7 +2261,7 @@ func TestPushPending_RebasesSameKeyLocalIntentDuringAuthoritativeReplay(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 				CREATE TABLE users (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL,
 					email TEXT NOT NULL
 				)
@@ -2410,7 +2404,7 @@ func TestPushPending_RebasesSameKeyLocalIntentMutatedDuringUpload(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 				CREATE TABLE users (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL,
 					email TEXT NOT NULL
 				)
@@ -2554,7 +2548,7 @@ func TestPushPending_RebasesSameKeyLocalIntentAfterRestartBeforeReplay(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 				CREATE TABLE users (
-					id TEXT PRIMARY KEY,
+					id TEXT PRIMARY KEY NOT NULL,
 					name TEXT NOT NULL,
 					email TEXT NOT NULL
 				)
@@ -2650,13 +2644,13 @@ func TestDirtyRowCapture_CapturesLocalCascadeDeletes(t *testing.T) {
 		{TableName: "posts", SyncKeyColumnName: "id"},
 	}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE posts (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			title TEXT NOT NULL,
 			author_id TEXT NOT NULL,
 			FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
@@ -2692,13 +2686,13 @@ func TestDirtyRowCapture_CapturesLocalTriggerGeneratedWrites(t *testing.T) {
 		{TableName: "audit_logs", SyncKeyColumnName: "id"},
 	}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
 	`, `
 		CREATE TABLE audit_logs (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			user_id TEXT NOT NULL,
 			action TEXT NOT NULL
 		)
@@ -2723,7 +2717,7 @@ func TestDirtyRowCapture_CapturesLocalTriggerGeneratedWrites(t *testing.T) {
 func TestDirtyRowCapture_KeyChangingUpdateCreatesDeleteAndUpsert(t *testing.T) {
 	_, db := newBundleClient(t, "main", []SyncTable{{TableName: "widgets", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE widgets (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL
 		)
 	`)

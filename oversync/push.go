@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/mobiletoly/go-oversync/internal/jcs"
+	"github.com/mobiletoly/go-oversync/internal/protocolhash"
 )
 
 type PushValidationError struct {
@@ -44,6 +46,7 @@ type pushPreparedRow struct {
 	keyBytes       []byte
 	baseRowVersion int64
 	payload        []byte
+	requestPayload []byte
 	payloadColumns []string
 	inputOrder     int
 }
@@ -56,6 +59,22 @@ type rowStateSnapshot struct {
 type indexedRowStateSnapshot struct {
 	rowStateSnapshot
 	found bool
+}
+
+func computeCanonicalPushRequestHash(rows []PushRequestRow) (string, error) {
+	logicalRows := make([]protocolhash.PushRow, 0, len(rows))
+	for _, row := range rows {
+		logicalRows = append(logicalRows, protocolhash.PushRow{
+			Schema:         strings.ToLower(strings.TrimSpace(row.Schema)),
+			Table:          strings.ToLower(strings.TrimSpace(row.Table)),
+			Key:            row.Key,
+			Op:             strings.ToUpper(strings.TrimSpace(row.Op)),
+			BaseRowVersion: row.BaseRowVersion,
+			Payload:        row.Payload,
+		})
+	}
+	hash, _, err := protocolhash.PushRequest(logicalRows)
+	return hash, err
 }
 
 func (s *SyncService) preparePushRows(rows []PushRequestRow) ([]pushPreparedRow, error) {
@@ -109,6 +128,7 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 		seenTargets[targetKey] = struct{}{}
 
 		var payload []byte
+		var requestPayload []byte
 		var payloadColumns []string
 		if op == OpDelete {
 			if len(row.Payload) != 0 {
@@ -119,12 +139,16 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 				return nil, &PushValidationError{Message: fmt.Sprintf("%s for %s.%s requires payload", op, schemaName, tableName)}
 			}
 
-			var payloadObj map[string]any
-			if err := json.Unmarshal(row.Payload, &payloadObj); err != nil || payloadObj == nil {
+			payloadObj, err := jcs.DecodeObject(row.Payload)
+			if err != nil {
 				return nil, &PushValidationError{Message: fmt.Sprintf("payload for %s.%s must be a JSON object", schemaName, tableName)}
 			}
 			if _, ok := payloadObj[syncScopeColumnName]; ok {
 				return nil, &PushValidationError{Message: fmt.Sprintf("payload for %s.%s must not include hidden scope column %q", schemaName, tableName, syncScopeColumnName)}
+			}
+			requestPayload, err = jcs.Canonicalize(row.Payload)
+			if err != nil {
+				return nil, &PushValidationError{Message: fmt.Sprintf("canonicalize request payload for %s.%s: %v", schemaName, tableName, err)}
 			}
 			if err := normalizePayloadVisibleSyncKey(payloadObj, normalizedKey, schemaName, tableName); err != nil {
 				return nil, err
@@ -136,12 +160,12 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 				}
 				payloadColumns = append(payloadColumns, strings.ToLower(col))
 			}
-			if err := s.normalizePushPayloadBinaryFields(schemaName, tableName, payloadObj); err != nil {
+			if err := s.normalizePushPayloadFields(schemaName, tableName, payloadObj); err != nil {
 				return nil, err
 			}
 			sort.Strings(payloadColumns)
 
-			payloadRaw, err := json.Marshal(payloadObj)
+			payloadRaw, err := jcs.Marshal(payloadObj)
 			if err != nil {
 				return nil, &PushValidationError{Message: fmt.Sprintf("marshal payload for %s.%s: %v", schemaName, tableName, err)}
 			}
@@ -163,6 +187,7 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 			keyBytes:       append([]byte(nil), normalizedKey.keyBytes...),
 			baseRowVersion: row.BaseRowVersion,
 			payload:        payload,
+			requestPayload: requestPayload,
 			payloadColumns: payloadColumns,
 			inputOrder:     i,
 		})
@@ -576,11 +601,11 @@ func (s *SyncService) loadCommittedBundle(ctx context.Context, tx pgx.Tx, userID
 	}
 	var bundleHash []byte
 	if err := tx.QueryRow(ctx, `
-		SELECT bundle_seq, source_id, source_bundle_id, row_count, bundle_hash
+		SELECT bundle_seq, source_id, source_bundle_id, row_count, bundle_hash, canonical_request_hash
 		FROM sync.bundle_log
 		WHERE user_pk = $1
 		  AND bundle_seq = $2
-	`, userPK, bundleSeq).Scan(&bundle.BundleSeq, &bundle.SourceID, &bundle.SourceBundleID, &bundle.RowCount, &bundleHash); err != nil {
+	`, userPK, bundleSeq).Scan(&bundle.BundleSeq, &bundle.SourceID, &bundle.SourceBundleID, &bundle.RowCount, &bundleHash, &bundle.CanonicalRequestHash); err != nil {
 		return nil, fmt.Errorf("load bundle_log %d: %w", bundleSeq, err)
 	}
 	bundle.BundleHash = renderBundleHash(bundleHash)

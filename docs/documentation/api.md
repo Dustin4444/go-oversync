@@ -19,8 +19,17 @@ Wire-facing `row_version` and `base_row_version` fields are bundle sequence valu
 stores the current version internally as `sync.row_state.bundle_seq` and returns it through the
 existing wire field names.
 
-`bundle_hash` is rendered as lowercase hex SHA-256 text on the wire. The hash and `byte_count` are
-computed from the canonical wire JSON produced by the server encoder.
+Oversync uses RFC 8785 JSON Canonicalization Scheme (JCS) for canonical bytes. Exact `BIGINT`
+and arbitrary-precision decimal columns are schema-typed JSON strings; approximate floating-point
+columns remain finite binary64 JSON numbers. `bundle_hash` authenticates the committed logical row
+stream, while `canonical_request_hash` associates that commit with the immutable original upload.
+Hash-only protocol counters are decimal strings inside the logical hash model. `byte_count` is the
+length of those canonical logical bytes. This is standard JCS plus a typed wire schema, not an
+arbitrary-precision extension to JCS.
+
+Oversync does not migrate incompatible stored hashes, server history, staged sessions, or durable
+client state. To adopt this contract, deploy compatible server and client versions together and
+recreate the affected server and client databases. Mixed-version operation is unsupported.
 
 All authenticated `/sync/*` requests must send:
 
@@ -75,7 +84,8 @@ Request:
 ```json
 {
   "source_bundle_id": 7,
-  "planned_row_count": 1
+  "planned_row_count": 1,
+  "canonical_request_hash": "f9952b89b7b7ce1f4a2b9a3ea31ee7e8ca05d19bb6cb2cd400c8d18a1043fc83"
 }
 ```
 
@@ -86,7 +96,8 @@ Response:
   "push_id": "6df0d8dd-a84b-43b6-bbca-8de70432922a",
   "status": "staging",
   "planned_row_count": 1,
-  "next_expected_row_ordinal": 0
+  "next_expected_row_ordinal": 0,
+  "canonical_request_hash": "f9952b89b7b7ce1f4a2b9a3ea31ee7e8ca05d19bb6cb2cd400c8d18a1043fc83"
 }
 ```
 
@@ -96,6 +107,8 @@ Notes:
   older uncommitted staging session for that tuple
 - repeating the same tuple after the server has already committed returns
   `status = "already_committed"` plus the committed bundle metadata
+- the server recomputes `canonical_request_hash` from separately staged original rows before any
+  server-side payload mutation; a different hash for an existing source tuple is a sequence error
 - session creation is serialized by `(user_id, source_id, source_bundle_id)`
 - source bundle ids must be contiguous per source
 - if the exact tuple is no longer retained but the server can prove it was already committed,
@@ -169,7 +182,8 @@ Response:
   "source_id": "source-1",
   "source_bundle_id": 7,
   "row_count": 1,
-  "bundle_hash": "4c8d2d5f5d2c5a41d9aa6f4d2f3ac5d0d1d5d8bbf1d7a8c39f3b3a970f6af21a"
+  "bundle_hash": "4c8d2d5f5d2c5a41d9aa6f4d2f3ac5d0d1d5d8bbf1d7a8c39f3b3a970f6af21a",
+  "canonical_request_hash": "f9952b89b7b7ce1f4a2b9a3ea31ee7e8ca05d19bb6cb2cd400c8d18a1043fc83"
 }
 ```
 
@@ -226,6 +240,7 @@ Response:
   "source_bundle_id": 7,
   "row_count": 1,
   "bundle_hash": "4c8d2d5f5d2c5a41d9aa6f4d2f3ac5d0d1d5d8bbf1d7a8c39f3b3a970f6af21a",
+  "canonical_request_hash": "f9952b89b7b7ce1f4a2b9a3ea31ee7e8ca05d19bb6cb2cd400c8d18a1043fc83",
   "rows": [
     {
       "schema": "business",
@@ -297,15 +312,20 @@ Notes:
 
 - the first response freezes `stable_bundle_seq`
 - follow-up requests in the same pull session must pass that value back as `target_bundle_seq`
-- if the provided checkpoint is older than the retained bundle floor, the server returns HTTP `409`
-  with `error=history_pruned`
-- rows at or below the retained floor are outside the retained-history contract even if physical
-  pruning has not deleted them yet
+- `retained_bundle_floor` is the highest discarded bundle; a checkpoint equal to the floor is
+  valid and returns bundles strictly above it
+- when the floor is positive, lower checkpoints (including zero) return HTTP `409` with
+  `error=history_pruned`
+- a checkpoint or positive target above current committed history returns HTTP `409` with
+  `error=checkpoint_ahead`; the server does not clamp it into a durable stable checkpoint
+- target zero captures current committed history; a positive target below `after_bundle_seq`
+  returns HTTP `400` with `error=invalid_request`
 
 Failure contract:
 
-- `400 pull_invalid`
+- `400 invalid_request`
 - `409 history_pruned`
+- `409 checkpoint_ahead`
 - `409 scope_uninitialized`
 - `409 scope_initializing`
 
@@ -481,9 +501,12 @@ Important bundle limit fields:
 ## GET `/syncx/health`
 
 Readiness-oriented health response. Returns HTTP `200` when the service is `healthy`, and HTTP
-`503` when the service is `unhealthy`.
+`503` when the service is `unhealthy`. A newly constructed runtime remains unhealthy and reports
+`accepting_operations=false` until `Bootstrap()` has committed schema validation, trigger
+installation, and any populated-table adoption.
 
 ## GET `/syncx/status`
 
 Returns a lifecycle and operability snapshot including lifecycle, registered tables, feature flags,
-bundle visibility, retained-floor visibility, and error counters.
+bundle visibility, retained-floor visibility, and error counters. Unlike sync operations, status is
+available while bootstrap is incomplete so operators can observe the readiness gate.

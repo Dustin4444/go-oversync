@@ -3,6 +3,7 @@ module github.com/mobiletoly/go-oversync
 go 1.25.0
 
 require (
+	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.1

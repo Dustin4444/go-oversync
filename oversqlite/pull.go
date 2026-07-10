@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -38,6 +39,9 @@ func (e *DirtyStateRejectedError) Error() string {
 func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "PullToStable()"); err != nil {
 		return RemoteSyncReport{}, err
+	}
+	if report, resumed, err := c.resumeRequiredRecoveryLocked(ctx); resumed || err != nil {
+		return report, err
 	}
 	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
 	if err != nil {
@@ -100,7 +104,18 @@ func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, erro
 			var prunedErr *HistoryPrunedError
 			if errors.As(err, &prunedErr) {
 				c.logger.Info("pull history pruned; rebuilding from chunked snapshot", "message", prunedErr.Message)
-				return c.rebuildKeepSourceLocked(ctx)
+				if err := c.markCheckpointRecoveryRequiredLocked(ctx, "history_pruned"); err != nil {
+					return RemoteSyncReport{}, err
+				}
+				return c.resumeCheckpointRecoveryLocked(ctx)
+			}
+			var aheadErr *CheckpointAheadError
+			if errors.As(err, &aheadErr) {
+				c.logger.Info("pull checkpoint ahead; rebuilding from chunked snapshot", "message", aheadErr.Message)
+				if err := c.markCheckpointRecoveryRequiredLocked(ctx, "checkpoint_ahead"); err != nil {
+					return RemoteSyncReport{}, err
+				}
+				return c.resumeCheckpointRecoveryLocked(ctx)
 			}
 			return RemoteSyncReport{}, err
 		}
@@ -154,10 +169,18 @@ func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxB
 	if statusCode != http.StatusOK {
 		if statusCode == http.StatusConflict {
 			var errorResp oversync.ErrorResponse
-			if json.Unmarshal(body, &errorResp) == nil && errorResp.Error == "history_pruned" {
-				return nil, &HistoryPrunedError{
-					Status:  statusCode,
-					Message: errorResp.Message,
+			if json.Unmarshal(body, &errorResp) == nil {
+				switch errorResp.Error {
+				case "history_pruned":
+					return nil, &HistoryPrunedError{
+						Status:  statusCode,
+						Message: errorResp.Message,
+					}
+				case "checkpoint_ahead":
+					return nil, &CheckpointAheadError{
+						Status:  statusCode,
+						Message: errorResp.Message,
+					}
 				}
 			}
 		}
@@ -279,6 +302,84 @@ func (c *Client) rebuildKeepSourceLocked(ctx context.Context) (RemoteSyncReport,
 	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{})
 }
 
+func (c *Client) resumeRequiredRecoveryLocked(ctx context.Context) (RemoteSyncReport, bool, error) {
+	rebuildRequired, err := c.rebuildRequired(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, false, err
+	}
+	if !rebuildRequired {
+		return RemoteSyncReport{}, false, nil
+	}
+	operation, err := loadOperationState(ctx, c.DB)
+	if err != nil {
+		return RemoteSyncReport{}, true, err
+	}
+	if operation.Kind == operationKindSourceRecovery {
+		sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
+		if err != nil {
+			return RemoteSyncReport{}, true, err
+		}
+		return RemoteSyncReport{}, true, sourceRecoveryErr
+	}
+	if operation.Kind != operationKindNone {
+		return RemoteSyncReport{}, true, &DestructiveTransitionInProgressError{TransitionKind: operation.Kind}
+	}
+	if !isCheckpointRecoveryReason(operation.Reason) {
+		if err := c.markCheckpointRecoveryRequiredLocked(ctx, "resume"); err != nil {
+			return RemoteSyncReport{}, true, err
+		}
+	}
+	report, err := c.resumeCheckpointRecoveryLocked(ctx)
+	return report, true, err
+}
+
+func (c *Client) resumeCheckpointRecoveryLocked(ctx context.Context) (RemoteSyncReport, error) {
+	dirtyCount, outboundCount, replayState, err := c.checkpointRecoveryPendingState(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if dirtyCount > 0 || outboundCount > 0 {
+		if atomic.LoadInt32(&c.uploadPaused) == 1 {
+			return RemoteSyncReport{}, &CheckpointRecoveryBlockedError{
+				Reason:        CheckpointRecoveryBlockedUploadPaused,
+				DirtyCount:    dirtyCount,
+				OutboundCount: outboundCount,
+				ReplayState:   replayState,
+			}
+		}
+		if _, err := c.pushPendingLockedWithRecovery(ctx, 0, true); err != nil {
+			var sourceRecoveryErr *SourceRecoveryRequiredError
+			if errors.As(err, &sourceRecoveryErr) {
+				return RemoteSyncReport{}, sourceRecoveryErr
+			}
+			dirtyCount, outboundCount, replayState, stateErr := c.checkpointRecoveryPendingState(ctx)
+			if stateErr != nil {
+				return RemoteSyncReport{}, stateErr
+			}
+			return RemoteSyncReport{}, &CheckpointRecoveryBlockedError{
+				Reason:        CheckpointRecoveryBlockedPushFailed,
+				DirtyCount:    dirtyCount,
+				OutboundCount: outboundCount,
+				ReplayState:   replayState,
+				Cause:         err,
+			}
+		}
+		dirtyCount, outboundCount, replayState, err = c.checkpointRecoveryPendingState(ctx)
+		if err != nil {
+			return RemoteSyncReport{}, err
+		}
+		if dirtyCount > 0 || outboundCount > 0 {
+			return RemoteSyncReport{}, &CheckpointRecoveryBlockedError{
+				Reason:        CheckpointRecoveryBlockedPendingWork,
+				DirtyCount:    dirtyCount,
+				OutboundCount: outboundCount,
+				ReplayState:   replayState,
+			}
+		}
+	}
+	return c.rebuildKeepSourceLocked(ctx)
+}
+
 func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context) (RemoteSyncReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
 		return RemoteSyncReport{}, err
@@ -369,7 +470,11 @@ func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
 }
 
 func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, options snapshotApplyOptions) (RemoteSyncReport, error) {
-	if err := c.setRebuildRequired(ctx, true); err != nil {
+	if !options.RotateSource && !options.ClearSourceRecovery {
+		if err := c.markCheckpointRecoveryRequiredLocked(ctx, "explicit_rebuild"); err != nil {
+			return RemoteSyncReport{}, err
+		}
+	} else if err := c.setRebuildRequired(ctx, true); err != nil {
 		return RemoteSyncReport{}, err
 	}
 	if err := c.clearSnapshotStage(ctx); err != nil {
@@ -644,8 +749,8 @@ func (c *Client) reapplyPreparedOutboxIntentLocallyInTx(ctx context.Context, stm
 			if !localPayload.Valid {
 				return fmt.Errorf("preserved outbox row for %s is missing local_payload", tableName)
 			}
-			var payload map[string]any
-			if err := json.Unmarshal([]byte(localPayload.String), &payload); err != nil {
+			payload, err := jcs.DecodeObject([]byte(localPayload.String))
+			if err != nil {
 				return fmt.Errorf("failed to decode preserved outbox payload for %s: %w", tableName, err)
 			}
 			if err := c.upsertRowInTxUsing(ctx, stmtCache, tx, tableName, payload); err != nil {
@@ -775,6 +880,16 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if options.ClearSourceRecovery {
 		if err := c.clearSourceRecoveryRequiredInTx(ctx, tx); err != nil {
 			return err
+		}
+	} else {
+		operation, err := loadOperationState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if operation.Kind == operationKindNone && isCheckpointRecoveryReason(operation.Reason) {
+			if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
+				return err
+			}
 		}
 	}
 

@@ -27,7 +27,7 @@ func TestBlobPrimaryKeySupport(t *testing.T) {
 	// Create test table with BLOB primary key
 	_, err = db.Exec(`
 		CREATE TABLE blob_files (
-			id BLOB PRIMARY KEY,
+			id BLOB PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			data BLOB NOT NULL
 		)
@@ -147,7 +147,7 @@ func TestBlobSerializeRow(t *testing.T) {
 	// Create test table with BLOB columns
 	_, err = db.Exec(`
 		CREATE TABLE blob_documents (
-			id BLOB PRIMARY KEY,
+			id BLOB PRIMARY KEY NOT NULL,
 			title TEXT NOT NULL,
 			content BLOB NOT NULL,
 			metadata TEXT

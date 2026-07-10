@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/mobiletoly/go-oversync/internal/protocolhash"
 )
 
 func nullableUUIDString(value string) any {
@@ -139,11 +140,12 @@ func (e *SourceSequenceChangedError) Error() string {
 }
 
 type committedBundleMeta struct {
-	BundleSeq      int64
-	SourceID       string
-	SourceBundleID int64
-	RowCount       int64
-	BundleHash     string
+	BundleSeq            int64
+	SourceID             string
+	SourceBundleID       int64
+	RowCount             int64
+	BundleHash           string
+	CanonicalRequestHash string
 }
 
 type pushSessionState struct {
@@ -153,6 +155,7 @@ type pushSessionState struct {
 	SourceID               string
 	SourceBundleID         int64
 	PlannedRowCount        int64
+	CanonicalRequestHash   string
 	NextExpectedRowOrdinal int64
 	InitializationID       string
 	ExpiresAt              time.Time
@@ -175,6 +178,9 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 	}
 	if req.PlannedRowCount <= 0 {
 		return nil, &PushSessionInvalidError{Message: "planned_row_count must be > 0"}
+	}
+	if !isCanonicalSHA256(req.CanonicalRequestHash) {
+		return nil, &PushSessionInvalidError{Message: "canonical_request_hash must be 64 lowercase hexadecimal characters"}
 	}
 	req.InitializationID = strings.TrimSpace(req.InitializationID)
 
@@ -236,13 +242,17 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				return err
 			}
 			if meta != nil {
+				if meta.CanonicalRequestHash != req.CanonicalRequestHash {
+					return &PushSessionInvalidError{Message: "canonical_request_hash does not match the committed source tuple"}
+				}
 				resp = &PushSessionCreateResponse{
-					Status:         "already_committed",
-					BundleSeq:      meta.BundleSeq,
-					SourceID:       meta.SourceID,
-					SourceBundleID: meta.SourceBundleID,
-					RowCount:       meta.RowCount,
-					BundleHash:     meta.BundleHash,
+					Status:               "already_committed",
+					BundleSeq:            meta.BundleSeq,
+					SourceID:             meta.SourceID,
+					SourceBundleID:       meta.SourceBundleID,
+					RowCount:             meta.RowCount,
+					BundleHash:           meta.BundleHash,
+					CanonicalRequestHash: meta.CanonicalRequestHash,
 				}
 				return nil
 			}
@@ -281,9 +291,9 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 			expiresAt := time.Now().UTC().Add(s.pushSessionTTL())
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO sync.push_sessions (
-					push_id, user_pk, source_id, source_bundle_id, planned_row_count, next_expected_row_ordinal, initialization_id, expires_at
-				) VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::uuid, $7)
-			`, pushID, scopeState.UserPK, actor.SourceID, req.SourceBundleID, req.PlannedRowCount, nullableUUIDString(initializationID), expiresAt); err != nil {
+					push_id, user_pk, source_id, source_bundle_id, planned_row_count, canonical_request_hash, next_expected_row_ordinal, initialization_id, expires_at
+				) VALUES ($1::uuid, $2, $3, $4, $5, $6, 0, $7::uuid, $8)
+			`, pushID, scopeState.UserPK, actor.SourceID, req.SourceBundleID, req.PlannedRowCount, req.CanonicalRequestHash, nullableUUIDString(initializationID), expiresAt); err != nil {
 				return fmt.Errorf("insert push session: %w", err)
 			}
 
@@ -292,6 +302,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				Status:                 "staging",
 				PlannedRowCount:        req.PlannedRowCount,
 				NextExpectedRowOrdinal: 0,
+				CanonicalRequestHash:   req.CanonicalRequestHash,
 			}
 			return nil
 		})
@@ -389,11 +400,17 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 					opCode,
 					row.baseRowVersion,
 					payload,
+					func() any {
+						if opCode == opCodeDelete {
+							return nil
+						}
+						return string(row.requestPayload)
+					}(),
 				})
 			}
 			if _, err := tx.CopyFrom(ctx,
 				pgx.Identifier{"sync", "push_session_rows"},
-				[]string{"push_id", "row_ordinal", "table_id", "key_bytes", "op_code", "base_bundle_seq", "payload_apply"},
+				[]string{"push_id", "row_ordinal", "table_id", "key_bytes", "op_code", "base_bundle_seq", "payload_apply", "payload_request"},
 				pgx.CopyFromRows(rowsData),
 			); err != nil {
 				return fmt.Errorf("insert push session rows: %w", err)
@@ -460,7 +477,6 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			if session.NextExpectedRowOrdinal != session.PlannedRowCount || int64(len(rows)) != session.PlannedRowCount {
 				return &PushCommitInvalidError{Message: fmt.Sprintf("staged row count %d does not match planned_row_count %d", len(rows), session.PlannedRowCount)}
 			}
-
 			seenTargets := make(map[string]struct{}, len(rows))
 			for idx, row := range rows {
 				if row.inputOrder != idx {
@@ -471,6 +487,13 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 					return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyString)}
 				}
 				seenTargets[targetKey] = struct{}{}
+			}
+			recomputedRequestHash, err := computePreparedPushRequestHash(rows)
+			if err != nil {
+				return err
+			}
+			if recomputedRequestHash != session.CanonicalRequestHash {
+				return &PushCommitInvalidError{Message: "canonical_request_hash does not match staged push rows"}
 			}
 
 			if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
@@ -533,8 +556,9 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			}
 
 			bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, session.UserPK, BundleSource{
-				SourceID:       session.SourceID,
-				SourceBundleID: session.SourceBundleID,
+				SourceID:             session.SourceID,
+				SourceBundleID:       session.SourceBundleID,
+				CanonicalRequestHash: session.CanonicalRequestHash,
 			})
 			if err != nil {
 				return err
@@ -563,11 +587,12 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			}
 
 			resp = &PushSessionCommitResponse{
-				BundleSeq:      bundle.BundleSeq,
-				SourceID:       bundle.SourceID,
-				SourceBundleID: bundle.SourceBundleID,
-				RowCount:       bundle.RowCount,
-				BundleHash:     bundle.BundleHash,
+				BundleSeq:            bundle.BundleSeq,
+				SourceID:             bundle.SourceID,
+				SourceBundleID:       bundle.SourceBundleID,
+				RowCount:             bundle.RowCount,
+				BundleHash:           bundle.BundleHash,
+				CanonicalRequestHash: bundle.CanonicalRequestHash,
 			}
 			return nil
 		})
@@ -681,14 +706,15 @@ func (s *SyncService) GetCommittedBundleRows(ctx context.Context, actor Actor, b
 		}
 
 		resp = &CommittedBundleRowsResponse{
-			BundleSeq:      meta.BundleSeq,
-			SourceID:       meta.SourceID,
-			SourceBundleID: meta.SourceBundleID,
-			RowCount:       meta.RowCount,
-			BundleHash:     meta.BundleHash,
-			Rows:           rows,
-			NextRowOrdinal: nextRowOrdinal,
-			HasMore:        hasMore,
+			BundleSeq:            meta.BundleSeq,
+			SourceID:             meta.SourceID,
+			SourceBundleID:       meta.SourceBundleID,
+			RowCount:             meta.RowCount,
+			BundleHash:           meta.BundleHash,
+			CanonicalRequestHash: meta.CanonicalRequestHash,
+			Rows:                 rows,
+			NextRowOrdinal:       nextRowOrdinal,
+			HasMore:              hasMore,
 		}
 		return nil
 	})
@@ -740,6 +766,7 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 			ps.source_id,
 			ps.source_bundle_id,
 			ps.planned_row_count,
+			ps.canonical_request_hash,
 			ps.next_expected_row_ordinal,
 			COALESCE(ps.initialization_id::text, ''),
 			ps.expires_at
@@ -754,6 +781,7 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 		&session.SourceID,
 		&session.SourceBundleID,
 		&session.PlannedRowCount,
+		&session.CanonicalRequestHash,
 		&session.NextExpectedRowOrdinal,
 		&session.InitializationID,
 		&session.ExpiresAt,
@@ -770,14 +798,14 @@ func loadCommittedPushMetadataBySourceTuple(ctx context.Context, tx pgx.Tx, user
 	var meta committedBundleMeta
 	var bundleHash []byte
 	if err := tx.QueryRow(ctx, `
-		SELECT bl.bundle_seq, bl.source_id, bl.source_bundle_id, bl.row_count, bl.bundle_hash
+		SELECT bl.bundle_seq, bl.source_id, bl.source_bundle_id, bl.row_count, bl.bundle_hash, bl.canonical_request_hash
 		FROM sync.bundle_log AS bl
 		JOIN sync.user_state AS us ON us.user_pk = bl.user_pk
 		WHERE bl.user_pk = $1
 		  AND bl.source_id = $2
 		  AND bl.source_bundle_id = $3
 		  AND bl.bundle_seq > us.retained_bundle_floor
-	`, userPK, sourceID, sourceBundleID).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &bundleHash); err != nil {
+	`, userPK, sourceID, sourceBundleID).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &bundleHash, &meta.CanonicalRequestHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -823,18 +851,18 @@ func loadCommittedBundleMeta(ctx context.Context, tx pgx.Tx, userID string, bund
 		return nil, err
 	}
 	if retainedState != nil {
-		if err := enforceRetainedBundleFloor(userID, bundleSeq, retainedState.RetainedFloor); err != nil {
+		if err := enforceCommittedBundleRetention(userID, bundleSeq, retainedState.RetainedFloor); err != nil {
 			return nil, err
 		}
 	}
 	var meta committedBundleMeta
 	var bundleHash []byte
 	if err := tx.QueryRow(ctx, `
-		SELECT bundle_seq, source_id, source_bundle_id, row_count, bundle_hash
+		SELECT bundle_seq, source_id, source_bundle_id, row_count, bundle_hash, canonical_request_hash
 		FROM sync.bundle_log
 		WHERE user_pk = $1
 		  AND bundle_seq = $2
-	`, userPK, bundleSeq).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &bundleHash); err != nil {
+	`, userPK, bundleSeq).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &bundleHash, &meta.CanonicalRequestHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, &CommittedBundleNotFoundError{BundleSeq: bundleSeq}
 		}
@@ -846,7 +874,7 @@ func loadCommittedBundleMeta(ctx context.Context, tx pgx.Tx, userID string, bund
 
 func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx, pushID string) ([]pushPreparedRow, error) {
 	queryRows, err := tx.Query(ctx, `
-		SELECT row_ordinal, table_id, key_bytes, op_code, base_bundle_seq, payload_apply
+		SELECT row_ordinal, table_id, key_bytes, op_code, base_bundle_seq, payload_apply, payload_request
 		FROM sync.push_session_rows
 		WHERE push_id = $1::uuid
 		ORDER BY row_ordinal
@@ -859,12 +887,13 @@ func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx
 	rows := make([]pushPreparedRow, 0)
 	for queryRows.Next() {
 		var (
-			rowOrdinal int64
-			row        pushPreparedRow
-			payload    []byte
-			opCode     int16
+			rowOrdinal     int64
+			row            pushPreparedRow
+			payload        []byte
+			requestPayload []byte
+			opCode         int16
 		)
-		if err := queryRows.Scan(&rowOrdinal, &row.tableID, &row.keyBytes, &opCode, &row.baseRowVersion, &payload); err != nil {
+		if err := queryRows.Scan(&rowOrdinal, &row.tableID, &row.keyBytes, &opCode, &row.baseRowVersion, &payload, &requestPayload); err != nil {
 			return nil, fmt.Errorf("scan push session row: %w", err)
 		}
 		info, err := s.tableInfoForID(row.tableID)
@@ -887,6 +916,7 @@ func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx
 		row.keyValue = normalizedKey.dbValue
 		row.keyBytes = normalizedKey.keyBytes
 		row.payload = payload
+		row.requestPayload = requestPayload
 		if row.op != OpDelete {
 			var payloadObj map[string]any
 			if err := json.Unmarshal(payload, &payloadObj); err != nil {
@@ -904,6 +934,29 @@ func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx
 		return nil, fmt.Errorf("iterate push session rows: %w", err)
 	}
 	return rows, nil
+}
+
+func isCanonicalSHA256(value string) bool {
+	return protocolhash.IsCanonicalHash(value)
+}
+
+func computePreparedPushRequestHash(rows []pushPreparedRow) (string, error) {
+	logicalRows := make([]protocolhash.PushRow, 0, len(rows))
+	for _, row := range rows {
+		logicalRows = append(logicalRows, protocolhash.PushRow{
+			Schema:         row.schema,
+			Table:          row.table,
+			Key:            map[string]any{row.keyColumn: row.keyString},
+			Op:             row.op,
+			BaseRowVersion: row.baseRowVersion,
+			Payload:        row.requestPayload,
+		})
+	}
+	hash, _, err := protocolhash.PushRequest(logicalRows)
+	if err != nil {
+		return "", fmt.Errorf("compute canonical request hash from staged rows: %w", err)
+	}
+	return hash, nil
 }
 
 func cleanupExpiredPushSessionsQuerier(ctx context.Context, q interface {

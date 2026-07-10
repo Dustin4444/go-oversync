@@ -3,6 +3,7 @@ package oversync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,6 +37,7 @@ func TestBootstrap_InstallsRegisteredTableCaptureTriggers(t *testing.T) {
 
 	var captureTriggerCount int
 	var ownerGuardTriggerCount int
+	var truncateGuardTriggerCount int
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM pg_trigger t
@@ -57,8 +60,328 @@ func TestBootstrap_InstallsRegisteredTableCaptureTriggers(t *testing.T) {
 		  AND NOT t.tgisinternal
 	`, schemaName, registeredTableOwnerGuardTrigger).Scan(&ownerGuardTriggerCount))
 	require.Equal(t, 2, ownerGuardTriggerCount)
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relname IN ('users', 'posts')
+		  AND t.tgname = $2
+		  AND NOT t.tgisinternal
+	`, schemaName, registeredTableTruncateGuardTrigger).Scan(&truncateGuardTriggerCount))
+	require.Equal(t, 2, truncateGuardTriggerCount)
+
+	require.NoError(t, svc.Bootstrap(ctx))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relname IN ('users', 'posts')
+		  AND t.tgname = $2
+		  AND NOT t.tgisinternal
+	`, schemaName, registeredTableTruncateGuardTrigger).Scan(&truncateGuardTriggerCount))
+	require.Equal(t, 2, truncateGuardTriggerCount, "repeated bootstrap must replace rather than duplicate truncate guards")
 
 	require.NoError(t, svc.Close(context.Background()))
+}
+
+func TestRegisteredTableGuard_RejectsNullIdentityDrift(t *testing.T) {
+	f := newBundleOwnerGuardFixture(t, "bundle_null_drift_", "bundle-null-drift-test")
+	f.initializeOwner(t, "owner-a")
+
+	_, err := f.pool.Exec(f.ctx, fmt.Sprintf(`
+		ALTER TABLE %s.users DROP CONSTRAINT users_pkey CASCADE;
+		ALTER TABLE %s.users ALTER COLUMN _sync_scope_id DROP NOT NULL;
+		ALTER TABLE %s.users ALTER COLUMN id DROP NOT NULL;
+		ALTER TABLE %s.users DISABLE TRIGGER USER;
+		INSERT INTO %s.users(id, _sync_scope_id, name, email) VALUES
+			('11111111-1111-1111-1111-111111111111', NULL, 'Null owner', 'owner@example.com'),
+			(NULL, 'owner-a', 'Null key', 'key@example.com');
+		ALTER TABLE %s.users ENABLE TRIGGER USER;
+	`, f.schemaIdent, f.schemaIdent, f.schemaIdent, f.schemaIdent, f.schemaIdent, f.schemaIdent))
+	require.NoError(t, err)
+
+	actor := Actor{UserID: "owner-a"}
+	source := f.source(1)
+	for _, statement := range []string{
+		fmt.Sprintf(`UPDATE %s.users SET name = 'changed' WHERE email = 'owner@example.com'`, f.schemaIdent),
+		fmt.Sprintf(`DELETE FROM %s.users WHERE email = 'owner@example.com'`, f.schemaIdent),
+		fmt.Sprintf(`UPDATE %s.users SET name = 'changed' WHERE email = 'key@example.com'`, f.schemaIdent),
+		fmt.Sprintf(`DELETE FROM %s.users WHERE email = 'key@example.com'`, f.schemaIdent),
+	} {
+		err := f.svc.WithinSyncBundle(f.ctx, actor, source, func(tx pgx.Tx) error {
+			_, execErr := tx.Exec(f.ctx, statement)
+			return execErr
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "nullable")
+	}
+
+	var unchanged, captureRows int
+	require.NoError(t, f.pool.QueryRow(f.ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.users WHERE name IN ('Null owner', 'Null key')`, f.schemaIdent)).Scan(&unchanged))
+	require.Equal(t, 2, unchanged)
+	require.NoError(t, f.pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM sync.bundle_capture_stage`).Scan(&captureRows))
+	require.Zero(t, captureRows)
+
+	err = f.svc.WithinSyncBundle(f.ctx, actor, f.source(1), func(tx pgx.Tx) error {
+		_, execErr := tx.Exec(f.ctx, fmt.Sprintf(`INSERT INTO %s.users(id, name, email) VALUES ('22222222-2222-2222-2222-222222222222', 'Valid', 'valid@example.com')`, f.schemaIdent))
+		return execErr
+	})
+	require.NoError(t, err)
+	var owner string
+	require.NoError(t, f.pool.QueryRow(f.ctx, fmt.Sprintf(`SELECT _sync_scope_id FROM %s.users WHERE email = 'valid@example.com'`, f.schemaIdent)).Scan(&owner))
+	require.Equal(t, "owner-a", owner)
+}
+
+func TestBootstrap_MarkedLayoutPerformsNoRegisteredTriggerDDL(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "truncate_install_rollback_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "truncate-install-rollback-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, integrationTestLogger(slog.LevelWarn))
+
+	eventTriggerName := "reject_c3_trigger_ddl_" + suffix
+	eventFunctionName := "reject_c3_trigger_ddl_" + suffix
+	_, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE FUNCTION %s.%s()
+		RETURNS event_trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			RAISE EXCEPTION 'synthetic trigger installation failure';
+		END;
+		$$;
+		CREATE EVENT TRIGGER %s
+		ON ddl_command_start
+		WHEN TAG IN ('CREATE TRIGGER')
+		EXECUTE FUNCTION %s.%s();
+	`, pgx.Identifier{schemaName}.Sanitize(), pgx.Identifier{eventFunctionName}.Sanitize(), pgx.Identifier{eventTriggerName}.Sanitize(), pgx.Identifier{schemaName}.Sanitize(), pgx.Identifier{eventFunctionName}.Sanitize()))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP EVENT TRIGGER IF EXISTS "+pgx.Identifier{eventTriggerName}.Sanitize())
+	})
+
+	require.NoError(t, svc.Bootstrap(ctx), "a coherent marked layout must not execute trigger DDL")
+
+	var count int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_trigger AS trigger
+		JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+		JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = $1
+		  AND relation.relname = 'users'
+		  AND trigger.tgname IN ($2, $3, $4)
+		  AND NOT trigger.tgisinternal
+	`, schemaName, registeredTableCaptureTriggerName, registeredTableOwnerGuardTrigger, registeredTableTruncateGuardTrigger).Scan(&count))
+	require.Equal(t, 3, count, "marked-layout validation must preserve every managed trigger")
+}
+
+type truncateGuardState struct {
+	businessRows      int64
+	rowStateRows      int64
+	bundleRows        int64
+	bundleLogRows     int64
+	nextBundleSeq     int64
+	maxSourceBundleID int64
+}
+
+func loadTruncateGuardState(t *testing.T, ctx context.Context, pool interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, schemaName, userID, sourceID string) truncateGuardState {
+	t.Helper()
+
+	var state truncateGuardState
+	tableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, tableIdent)).Scan(&state.businessRows))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM sync.row_state WHERE user_pk = users.user_pk),
+			(SELECT COUNT(*) FROM sync.bundle_rows WHERE user_pk = users.user_pk),
+			(SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = users.user_pk),
+			users.next_bundle_seq,
+			COALESCE((SELECT max_committed_source_bundle_id FROM sync.source_state WHERE user_pk = users.user_pk AND source_id = $2), 0)
+		FROM sync.user_state AS users
+		WHERE users.user_id = $1
+	`, userID, sourceID).Scan(
+		&state.rowStateRows,
+		&state.bundleRows,
+		&state.bundleLogRows,
+		&state.nextBundleSeq,
+		&state.maxSourceBundleID,
+	))
+	return state
+}
+
+func requireRegisteredTruncateError(t *testing.T, err error, schemaName, tableName string) {
+	t.Helper()
+	require.Error(t, err)
+	var pgErr *pgconn.PgError
+	require.True(t, errors.As(err, &pgErr), "expected PostgreSQL error, got %T: %v", err, err)
+	t.Logf("registered truncate rejected: code=%s message=%q detail=%q hint=%q", pgErr.Code, pgErr.Message, pgErr.Detail, pgErr.Hint)
+	require.Equal(t, "55000", pgErr.Code)
+	require.Equal(t, fmt.Sprintf("TRUNCATE is not allowed on registered table %s.%s", schemaName, tableName), pgErr.Message)
+	require.Equal(t, "Oversync cannot capture TRUNCATE as row-level bundle events.", pgErr.Detail)
+	require.Contains(t, pgErr.Hint, "recreate PostgreSQL and every client database")
+}
+
+func TestRegisteredTableGuard_RejectsDirectAndWithinSyncBundleTruncate(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "truncate_guard_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "truncate-guard-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, integrationTestLogger(slog.LevelWarn))
+	userID := "truncate-guard-user-" + suffix
+	sourceID := "server-app"
+	mustInitializeEmptyScope(t, ctx, svc, userID, sourceID)
+	tableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, $2, $3)`, tableIdent), uuid.New(), "Before Truncate", "before@example.com")
+		return err
+	}))
+
+	want := loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID)
+	_, err := pool.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
+	requireRegisteredTruncateError(t, err, schemaName, "users")
+	require.Equal(t, want, loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID))
+
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	_, err = tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
+	requireRegisteredTruncateError(t, err, schemaName, "users")
+	require.NoError(t, tx.Rollback(ctx), "an explicitly aborted transaction must remain rollbackable")
+	require.Equal(t, want, loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID))
+
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 2}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
+		return err
+	})
+	requireRegisteredTruncateError(t, err, schemaName, "users")
+	require.Equal(t, want, loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID))
+
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 2}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET name = 'Changed' WHERE _sync_scope_id = $1`, tableIdent), userID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
+		return err
+	})
+	requireRegisteredTruncateError(t, err, schemaName, "users")
+	require.Equal(t, want, loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID))
+}
+
+func TestRegisteredTableGuard_RejectsCascadeAndMultiTableTruncate(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "truncate_cascade_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	userTableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
+	require.NoError(t, func() error {
+		_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.unregistered_rows (id UUID PRIMARY KEY)`, schemaIdent))
+		return err
+	}())
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "truncate-cascade-test",
+		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+	}, integrationTestLogger(slog.LevelWarn))
+	userID := "truncate-cascade-user-" + suffix
+	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, 'User', 'user@example.com')`, userTableIdent), uuid.New())
+		return err
+	}))
+	_, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.unregistered_rows (id) VALUES ($1)`, schemaIdent), uuid.New())
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s.unregistered_rows, %s CASCADE`, schemaIdent, userTableIdent))
+	requireRegisteredTruncateError(t, err, schemaName, "users")
+	var unregisteredCount int64
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.unregistered_rows`, schemaIdent)).Scan(&unregisteredCount))
+	require.Equal(t, int64(1), unregisteredCount)
+
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.parents (id UUID PRIMARY KEY);
+		INSERT INTO %s.parents (id) VALUES ('00000000-0000-0000-0000-000000000001');
+		ALTER TABLE %s ADD COLUMN parent_id UUID REFERENCES %s.parents(id);
+	`, schemaIdent, schemaIdent, userTableIdent, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s.parents CASCADE`, schemaIdent))
+	requireRegisteredTruncateError(t, err, schemaName, "users")
+	var parentCount int64
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.parents`, schemaIdent)).Scan(&parentCount))
+	require.Equal(t, int64(1), parentCount)
+}
+
+func TestRegisteredTableGuard_RejectsPartitionTruncate(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "truncate_partition_" + suffix
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	require.NoError(t, func() error {
+		_, err := pool.Exec(ctx, fmt.Sprintf(`
+			CREATE SCHEMA %s;
+			CREATE TABLE %s.records (
+				_sync_scope_id TEXT NOT NULL,
+				id UUID NOT NULL,
+				body TEXT NOT NULL,
+				PRIMARY KEY (_sync_scope_id, id)
+			) PARTITION BY HASH (id);
+			CREATE TABLE %s.records_p0 PARTITION OF %s.records FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+			CREATE TABLE %s.records_p1 PARTITION OF %s.records FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+		`, schemaIdent, schemaIdent, schemaIdent, schemaIdent, schemaIdent, schemaIdent))
+		return err
+	}())
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+	_ = newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "truncate-partition-test",
+		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "records", SyncKeyColumns: []string{"id"}}},
+	}, integrationTestLogger(slog.LevelWarn))
+
+	for _, tableName := range []string{"records", "records_p0", "records_p1"} {
+		var count int
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM pg_trigger AS trigger
+			JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+			JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+			WHERE namespace.nspname = $1 AND relation.relname = $2
+			  AND trigger.tgname = $3 AND NOT trigger.tgisinternal
+		`, schemaName, tableName, registeredTableTruncateGuardTrigger).Scan(&count))
+		require.Equal(t, 1, count)
+	}
+
+	for _, tableName := range []string{"records", "records_p0", "records_p1"} {
+		_, err := pool.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s`, pgx.Identifier{schemaName, tableName}.Sanitize()))
+		requireRegisteredTruncateError(t, err, schemaName, "records")
+	}
 }
 
 func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
@@ -584,6 +907,7 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 type bundleOwnerGuardFixture struct {
 	ctx         context.Context
 	svc         *SyncService
+	pool        *pgxpool.Pool
 	schemaIdent string
 	rowID       uuid.UUID
 }
@@ -611,6 +935,7 @@ func newBundleOwnerGuardFixture(t *testing.T, schemaPrefix, appName string) *bun
 	return &bundleOwnerGuardFixture{
 		ctx:         ctx,
 		svc:         svc,
+		pool:        pool,
 		schemaIdent: pgx.Identifier{schemaName}.Sanitize(),
 		rowID:       uuid.New(),
 	}

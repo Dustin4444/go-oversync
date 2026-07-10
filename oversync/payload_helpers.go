@@ -7,8 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 
 	"github.com/google/uuid"
+	"github.com/mobiletoly/go-oversync/internal/jcs"
+	"github.com/mobiletoly/go-oversync/internal/wirevalue"
 )
 
 // PayloadExtractor provides utilities for extracting typed fields from JSON payloads.
@@ -19,8 +23,8 @@ type PayloadExtractor struct {
 
 // NewPayloadExtractor creates a new PayloadExtractor from JSON payload bytes.
 func NewPayloadExtractor(payload []byte) (*PayloadExtractor, error) {
-	var m map[string]any
-	if err := json.Unmarshal(payload, &m); err != nil {
+	m, err := jcs.DecodeObject(payload)
+	if err != nil {
 		return nil, fmt.Errorf("parse payload: %w", err)
 	}
 	return &PayloadExtractor{data: m}, nil
@@ -52,20 +56,24 @@ func (p *PayloadExtractor) StrFieldRequired(key string) (string, error) {
 }
 
 // Int64Field extracts a nullable int64 from the payload.
-// Accepts both numeric values and numeric strings.
+// Accepts canonical exact-int64 strings and retained integral json.Number
+// values. It never obtains an authoritative integer through float64.
 // Returns nil if the field is missing, null, or cannot be converted.
 func (p *PayloadExtractor) Int64Field(key string) *int64 {
 	if v, ok := p.data[key]; ok && v != nil {
 		switch t := v.(type) {
-		case float64:
-			n := int64(t)
-			return &n
-		case string:
-			if t == "" {
-				return nil
+		case json.Number:
+			n, err := strconv.ParseInt(t.String(), 10, 64)
+			if err == nil {
+				return &n
 			}
-			var n int64
-			_, err := fmt.Sscan(t, &n)
+		case float64:
+			if !math.IsInf(t, 0) && !math.IsNaN(t) && math.Trunc(t) == t && t >= -9007199254740991 && t <= 9007199254740991 {
+				n := int64(t)
+				return &n
+			}
+		case string:
+			n, err := wirevalue.ParseInt64(t)
 			if err == nil {
 				return &n
 			}
@@ -89,15 +97,17 @@ func (p *PayloadExtractor) Int64FieldRequired(key string) (int64, error) {
 func (p *PayloadExtractor) Float64Field(key string) *float64 {
 	if v, ok := p.data[key]; ok && v != nil {
 		switch t := v.(type) {
-		case float64:
-			return &t
+		case json.Number:
+			n, err := strconv.ParseFloat(t.String(), 64)
+			if err == nil && !math.IsInf(n, 0) && !math.IsNaN(n) {
+				return &n
+			}
 		case string:
 			if t == "" {
 				return nil
 			}
-			var n float64
-			_, err := fmt.Sscan(t, &n)
-			if err == nil {
+			n, err := strconv.ParseFloat(t, 64)
+			if err == nil && !math.IsInf(n, 0) && !math.IsNaN(n) {
 				return &n
 			}
 		}
@@ -122,7 +132,17 @@ func (p *PayloadExtractor) BoolField(key string) *bool {
 		switch t := v.(type) {
 		case bool:
 			return &t
+		case json.Number:
+			n, err := strconv.ParseFloat(t.String(), 64)
+			if err != nil || math.IsInf(n, 0) || math.IsNaN(n) {
+				return nil
+			}
+			b := n != 0
+			return &b
 		case float64:
+			if math.IsInf(t, 0) || math.IsNaN(t) {
+				return nil
+			}
 			b := t != 0
 			return &b
 		case string:

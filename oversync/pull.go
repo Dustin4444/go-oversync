@@ -79,19 +79,24 @@ func (s *SyncService) processPullQuerier(
 		return nil, err
 	}
 	if retainedState == nil {
-		return &PullResponse{
-			StableBundleSeq: 0,
-			Bundles:         []Bundle{},
-			HasMore:         false,
-		}, nil
+		retainedState = &retainedHistoryState{NextBundleSeq: 1}
 	}
 	stageStart := s.stageStart()
-	if err := enforceRetainedBundleFloor(userID, afterBundleSeq, retainedState.RetainedFloor); err != nil {
+	if err := enforcePullSequenceBoundary(userID, "checkpoint", afterBundleSeq, *retainedState); err != nil {
 		s.observeStageErr(ctx, "pull", "retained_floor_check", stageStart, 1, 0, err)
 		return nil, err
 	}
 	if targetBundleSeq > 0 {
-		if err := enforceRetainedBundleFloor(userID, targetBundleSeq, retainedState.RetainedFloor); err != nil {
+		if err := enforcePullSequenceBoundary(userID, "target", targetBundleSeq, *retainedState); err != nil {
+			s.observeStageErr(ctx, "pull", "retained_floor_check", stageStart, 1, 0, err)
+			return nil, err
+		}
+		if targetBundleSeq < afterBundleSeq {
+			err := &InvalidPullRequestError{Message: fmt.Sprintf(
+				"target_bundle_seq %d must be greater than or equal to after_bundle_seq %d",
+				targetBundleSeq,
+				afterBundleSeq,
+			)}
 			s.observeStageErr(ctx, "pull", "retained_floor_check", stageStart, 1, 0, err)
 			return nil, err
 		}
@@ -105,11 +110,6 @@ func (s *SyncService) processPullQuerier(
 		s.observeStage(ctx, "pull", "resolve_stable_bundle_seq", stageStart, 1, 0, false)
 	} else {
 		s.observeStage(ctx, "pull", "resolve_stable_bundle_seq", s.stageStart(), 1, 0, false)
-	}
-	if stableBundleSeq > 0 {
-		if err := enforceRetainedBundleFloor(userID, stableBundleSeq, retainedState.RetainedFloor); err != nil {
-			return nil, err
-		}
 	}
 	if afterBundleSeq >= stableBundleSeq {
 		return &PullResponse{

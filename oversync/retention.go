@@ -15,13 +15,19 @@ var errHistoryPruned = errors.New("requested checkpoint is older than retained h
 
 type HistoryPrunedError struct {
 	UserID        string
+	Field         string
 	ProvidedSeq   int64
 	RetainedFloor int64
 }
 
 func (e *HistoryPrunedError) Error() string {
+	field := e.Field
+	if field == "" {
+		field = "checkpoint"
+	}
 	return fmt.Sprintf(
-		"requested checkpoint %d is older than retained history floor %d for user %s",
+		"requested %s %d is older than retained history floor %d for user %s",
+		field,
 		e.ProvidedSeq,
 		e.RetainedFloor,
 		e.UserID,
@@ -30,6 +36,35 @@ func (e *HistoryPrunedError) Error() string {
 
 func (e *HistoryPrunedError) Is(target error) bool {
 	return target == errHistoryPruned
+}
+
+type CheckpointAheadError struct {
+	UserID           string
+	Field            string
+	ProvidedSeq      int64
+	CurrentBundleSeq int64
+}
+
+func (e *CheckpointAheadError) Error() string {
+	field := e.Field
+	if field == "" {
+		field = "checkpoint"
+	}
+	return fmt.Sprintf(
+		"requested %s %d is ahead of current committed bundle sequence %d for user %s",
+		field,
+		e.ProvidedSeq,
+		e.CurrentBundleSeq,
+		e.UserID,
+	)
+}
+
+type InvalidPullRequestError struct {
+	Message string
+}
+
+func (e *InvalidPullRequestError) Error() string {
+	return e.Message
 }
 
 type retainedHistoryState struct {
@@ -81,14 +116,42 @@ func scanRetainedHistoryState(row pgx.Row) (*retainedHistoryState, error) {
 }
 
 func enforceRetainedBundleFloor(userID string, providedSeq int64, retainedFloor int64) error {
-	if providedSeq <= 0 {
-		return nil
+	if providedSeq < retainedFloor {
+		return &HistoryPrunedError{
+			UserID:        userID,
+			ProvidedSeq:   providedSeq,
+			RetainedFloor: retainedFloor,
+		}
 	}
+	return nil
+}
+
+func enforceCommittedBundleRetention(userID string, providedSeq int64, retainedFloor int64) error {
 	if providedSeq <= retainedFloor {
 		return &HistoryPrunedError{
 			UserID:        userID,
 			ProvidedSeq:   providedSeq,
 			RetainedFloor: retainedFloor,
+		}
+	}
+	return nil
+}
+
+func enforcePullSequenceBoundary(userID string, field string, providedSeq int64, state retainedHistoryState) error {
+	if err := enforceRetainedBundleFloor(userID, providedSeq, state.RetainedFloor); err != nil {
+		var prunedErr *HistoryPrunedError
+		if errors.As(err, &prunedErr) {
+			prunedErr.Field = field
+		}
+		return err
+	}
+	currentBundleSeq := state.highestBundleSeq()
+	if providedSeq > currentBundleSeq {
+		return &CheckpointAheadError{
+			UserID:           userID,
+			Field:            field,
+			ProvidedSeq:      providedSeq,
+			CurrentBundleSeq: currentBundleSeq,
 		}
 	}
 	return nil

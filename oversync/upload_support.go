@@ -4,14 +4,14 @@
 package oversync
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"time"
+
+	"github.com/mobiletoly/go-oversync/internal/jcs"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -135,78 +135,5 @@ func ensureUserStatePresent(ctx context.Context, tx pgx.Tx, userID string) error
 }
 
 func canonicalJSON(raw json.RawMessage) ([]byte, error) {
-	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := writeCanonicalJSON(&buf, value); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func writeCanonicalJSON(buf *bytes.Buffer, value any) error {
-	switch v := value.(type) {
-	case nil:
-		buf.WriteString("null")
-	case bool:
-		if v {
-			buf.WriteString("true")
-		} else {
-			buf.WriteString("false")
-		}
-	case string:
-		enc, err := json.Marshal(v)
-		if err != nil {
-			return err
-		}
-		buf.Write(enc)
-	case float64:
-		enc, err := json.Marshal(v)
-		if err != nil {
-			return err
-		}
-		buf.Write(enc)
-	case []any:
-		buf.WriteByte('[')
-		for i, item := range v {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			if err := writeCanonicalJSON(buf, item); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte(']')
-	case map[string]any:
-		keys := make([]string, 0, len(v))
-		for key := range v {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		buf.WriteByte('{')
-		for i, key := range keys {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			encKey, err := json.Marshal(key)
-			if err != nil {
-				return err
-			}
-			buf.Write(encKey)
-			buf.WriteByte(':')
-			if err := writeCanonicalJSON(buf, v[key]); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte('}')
-	default:
-		enc, err := json.Marshal(v)
-		if err != nil {
-			return err
-		}
-		buf.Write(enc)
-	}
-	return nil
+	return jcs.Canonicalize(raw)
 }

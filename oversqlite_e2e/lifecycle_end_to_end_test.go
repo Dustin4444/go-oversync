@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/mattn/go-sqlite3"
 	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
@@ -184,6 +186,99 @@ func TestEndToEnd_ConnectRemoteAuthoritativeRebuildsExistingRemote(t *testing.T)
 	var name string
 	require.NoError(t, f.dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
 	require.Equal(t, "Remote", name)
+}
+
+func TestEndToEnd_AttachConsumesPopulatedAdoptionBaseline(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_adoption_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	userID := "e2e-adoption-user-" + uuid.NewString()
+	rowID := uuid.New()
+	server := newExampleServerWithConfig(t, schema, func(config *exampleserver.ServerConfig) {
+		config.BeforeBootstrap = func(ctx context.Context, pool *pgxpool.Pool, businessSchema string) error {
+			tableIdent := pgx.Identifier{businessSchema, "users"}.Sanitize()
+			_, err := pool.Exec(ctx, fmt.Sprintf(`
+				INSERT INTO %s (_sync_scope_id, id, name, email)
+				VALUES ($1, $2, 'Adopted', 'adopted@example.com')
+			`, tableIdent), userID, rowID)
+			return err
+		}
+	})
+	client, db := newSQLiteClientWithoutConnect(
+		t,
+		server,
+		userID,
+		"adoption-device",
+		oversqlite.DefaultConfig(schema, syncTables("users")),
+		usersDDL,
+	)
+
+	result, err := client.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, result.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, result.Outcome)
+	var name, email string
+	require.NoError(t, db.QueryRow(`SELECT name, email FROM users WHERE id = ?`, rowID.String()).Scan(&name, &email))
+	require.Equal(t, "Adopted", name)
+	require.Equal(t, "adopted@example.com", email)
+	require.Equal(t, int64(1), requireLastBundleSeqSeen(t, db))
+}
+
+func TestRealServer_AttachConsumesPopulatedAdoptionBaseline(t *testing.T) {
+	baseURL := strings.TrimRight(os.Getenv("OVERSQLITE_REAL_SERVER_SMOKE_BASE_URL"), "/")
+	userID := os.Getenv("OVERSYNC_H2_ADOPTED_USER_ID")
+	rowID := os.Getenv("OVERSYNC_H2_ADOPTED_ROW_ID")
+	if baseURL == "" || userID == "" || rowID == "" {
+		t.Skip("set the real-server URL and H2 adopted scope/row identifiers")
+	}
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	_, err = db.Exec(usersDDL)
+	require.NoError(t, err)
+
+	tokenFn := func(ctx context.Context) (string, error) {
+		body, err := json.Marshal(map[string]string{"user": userID, "password": "anything"})
+		if err != nil {
+			return "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/dummy-signin", bytes.NewReader(body))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("dummy signin returned HTTP %d", resp.StatusCode)
+		}
+		var result struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return "", err
+		}
+		return result.Token, nil
+	}
+	client, err := oversqlite.NewClient(db, baseURL, tokenFn, oversqlite.DefaultConfig("business", syncTables("users")))
+	require.NoError(t, err)
+	require.NoError(t, client.Open(context.Background()))
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+	result, err := client.Attach(context.Background(), userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, result.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, result.Outcome)
+	var name, email string
+	require.NoError(t, db.QueryRow(`SELECT name, email FROM users WHERE id = ?`, rowID).Scan(&name, &email))
+	require.Equal(t, "Adopted Before Bootstrap", name)
+	require.Equal(t, "adopted@example.com", email)
+	require.Equal(t, int64(1), requireLastBundleSeqSeen(t, db))
 }
 
 func TestEndToEnd_ConnectRemoteAuthoritativeReplacesAnonymousLocalRows(t *testing.T) {
@@ -782,7 +877,7 @@ func TestEndToEnd_ExpiredInitializerReconnectCanSeedAgain(t *testing.T) {
 	require.Equal(t, "Seed", name)
 }
 
-func TestEndToEnd_RebuildRequiredBlocksSyncUntilExplicitRebuild(t *testing.T) {
+func TestEndToEnd_RebuildRequiredAutomaticallyResumesFromNormalSync(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_rebuild_required_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -815,24 +910,14 @@ func TestEndToEnd_RebuildRequiredBlocksSyncUntilExplicitRebuild(t *testing.T) {
 		return nil, context.DeadlineExceeded
 	})}
 
-	for _, op := range []struct {
-		name string
-		run  func() error
-	}{
-		{name: "PushPending", run: func() error { _, err := clientB.PushPending(ctx); return err }},
-		{name: "PullToStable", run: func() error { _, err := clientB.PullToStable(ctx); return err }},
-		{name: "Sync", run: func() error { _, err := clientB.Sync(ctx); return err }},
-	} {
-		t.Run(op.name, func(t *testing.T) {
-			err := op.run()
-			var rebuildErr *oversqlite.RebuildRequiredError
-			require.ErrorAs(t, err, &rebuildErr)
-		})
-	}
+	_, err = clientB.PushPending(ctx)
+	var rebuildErr *oversqlite.RebuildRequiredError
+	require.ErrorAs(t, err, &rebuildErr)
 	require.Zero(t, requestCount.Load())
 
 	clientB.HTTP = &http.Client{Transport: http.DefaultTransport}
-	mustRebuildE2E(t, clientB, ctx)
+	_, err = clientB.Sync(ctx)
+	require.NoError(t, err)
 
 	info = mustSourceInfoE2E(t, clientB, ctx)
 	require.False(t, info.RebuildRequired)
@@ -1131,8 +1216,9 @@ func TestEndToEnd_SourceRetirementIsVisibleOverHTTPAndReplacementBecomesActive(t
 
 	var retiredResp oversync.SourceRetiredResponse
 	rawDoSyncJSON(t, server, http.MethodPost, "/sync/push-sessions", userID, originalSourceID, http.StatusConflict, oversync.PushSessionCreateRequest{
-		SourceBundleID:  1,
-		PlannedRowCount: 1,
+		SourceBundleID:       1,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: strings.Repeat("0", 64),
 	}, &retiredResp)
 	require.Equal(t, "source_retired", retiredResp.Error)
 	require.Equal(t, originalSourceID, retiredResp.SourceID)

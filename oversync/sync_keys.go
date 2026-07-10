@@ -3,8 +3,9 @@ package oversync
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
+
+	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"strings"
 
 	"github.com/google/uuid"
@@ -146,12 +147,12 @@ func normalizePayloadVisibleSyncKey(payloadObj map[string]any, key normalizedVis
 }
 
 func injectOwnerUserIDPayload(payload []byte, ownerUserID string) ([]byte, error) {
-	var payloadObj map[string]any
-	if err := json.Unmarshal(payload, &payloadObj); err != nil {
+	payloadObj, err := jcs.DecodeObject(payload)
+	if err != nil {
 		return nil, fmt.Errorf("decode payload for owner injection: %w", err)
 	}
 	payloadObj[syncScopeColumnName] = ownerUserID
-	payloadRaw, err := json.Marshal(payloadObj)
+	payloadRaw, err := jcs.Marshal(payloadObj)
 	if err != nil {
 		return nil, fmt.Errorf("marshal owner-injected payload: %w", err)
 	}

@@ -418,12 +418,15 @@ paths:
       description: |
         Returns complete committed bundles only. The first response freezes a stable pull
         ceiling (`stable_bundle_seq`). Follow-up requests should pass the same
-        `target_bundle_seq` until the client reaches that ceiling.
+        `target_bundle_seq` until the client reaches that ceiling. The retained bundle floor is
+        the highest discarded bundle: a checkpoint equal to the floor is valid and the response
+        contains only bundles strictly above it. A positive floor rejects lower checkpoints,
+        including zero. Checkpoints and positive targets above current committed history are
+        rejected rather than clamped.
       security:
         - BearerAuth: []
       parameters:
         - $ref: '#/components/parameters/SourceIDHeader'
-      parameters:
         - name: after_bundle_seq
           in: query
           required: false
@@ -445,7 +448,7 @@ paths:
         - name: target_bundle_seq
           in: query
           required: false
-          description: Frozen stable ceiling captured from the first response in a pull session.
+          description: Frozen stable ceiling captured from the first response in a pull session. Zero asks the server to capture the current committed ceiling.
           schema:
             type: integer
             format: int64
@@ -458,7 +461,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PullResponse'
         '400':
-          description: Invalid pull parameters
+          description: Invalid pull parameters, including a positive target below `after_bundle_seq` (`invalid_request`)
           content:
             application/json:
               schema:
@@ -466,7 +469,7 @@ paths:
         '401':
           description: Authentication required
         '409':
-          description: Requested checkpoint is older than the retained bundle floor, or the scope is not initialized (`history_pruned`, `scope_uninitialized`, or `scope_initializing`)
+          description: Requested checkpoint/target is below retained history or ahead of current committed history, or the scope is not initialized (`history_pruned`, `checkpoint_ahead`, `scope_uninitialized`, or `scope_initializing`)
           content:
             application/json:
               schema:
@@ -778,7 +781,7 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE in HTTP JSON. Hidden server columns such as _sync_scope_id are excluded. For bundle-hash verification, omitted DELETE payload normalizes to logical JSON null before hashing. Non-key binary payload fields use standard base64 on the wire.
+          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE in HTTP JSON. Hidden server columns such as _sync_scope_id are excluded. For bundle-hash verification, omitted DELETE payload normalizes to logical JSON null before hashing. Non-key binary payload fields use standard base64. Exact BIGINT and arbitrary-precision decimal columns use schema-typed JSON strings; approximate REAL/float columns use finite binary64 JSON numbers.
 
     Bundle:
       type: object
@@ -792,6 +795,8 @@ components:
         source_bundle_id:
           type: integer
           format: int64
+        canonical_request_hash:
+          $ref: '#/components/schemas/CanonicalRequestHash'
         rows:
           type: array
           items:
@@ -801,6 +806,12 @@ components:
       type: string
       description: Lowercase hex SHA-256 of the authoritative committed row stream, hashed over the canonical RFC 8785 JSON encoding defined by the active push-session spec. Hash verification uses logical normalized rows, including reconstructed absolute `row_ordinal` from committed-bundle stream position and logical `payload = null` for DELETE.
       example: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+    CanonicalRequestHash:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: Lowercase hex SHA-256 of the immutable original push rows. The logical hash input uses RFC 8785 JCS, decimal strings for row ordinal and base row version, and schema-typed JSON strings for exact BIGINT and decimal payload values. The server independently recomputes and stores this hash so an ambiguous retry can prove that an already-committed source tuple belongs to the same request.
+      example: f9952b89b7b7ce1f4a2b9a3ea31ee7e8ca05d19bb6cb2cd400c8d18a1043fc83
 
     PushRequestRow:
       type: object
@@ -822,11 +833,11 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64 on the wire.
+          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64. Exact BIGINT and arbitrary-precision decimal columns use schema-typed JSON strings; approximate REAL/float columns use JSON numbers restricted to finite binary64/JCS values.
 
     PushSessionCreateRequest:
       type: object
-      required: [source_bundle_id, planned_row_count]
+      required: [source_bundle_id, planned_row_count, canonical_request_hash]
       properties:
         source_bundle_id:
           type: integer
@@ -836,6 +847,8 @@ components:
           type: integer
           format: int64
           minimum: 1
+        canonical_request_hash:
+          $ref: '#/components/schemas/CanonicalRequestHash'
         initialization_id:
           type: string
           description: Required when this push session is seeding an uninitialized scope under an active initialization lease.
@@ -874,7 +887,7 @@ components:
 
     PushSessionCreateStagingResponse:
       type: object
-      required: [push_id, status, planned_row_count, next_expected_row_ordinal]
+      required: [push_id, status, planned_row_count, next_expected_row_ordinal, canonical_request_hash]
       properties:
         push_id:
           type: string
@@ -888,10 +901,12 @@ components:
           type: integer
           format: int64
           minimum: 0
+        canonical_request_hash:
+          $ref: '#/components/schemas/CanonicalRequestHash'
 
     PushSessionCreateAlreadyCommittedResponse:
       type: object
-      required: [status, bundle_seq, source_id, source_bundle_id, row_count, bundle_hash]
+      required: [status, bundle_seq, source_id, source_bundle_id, row_count, bundle_hash, canonical_request_hash]
       properties:
         status:
           type: string
@@ -909,6 +924,8 @@ components:
           format: int64
         bundle_hash:
           $ref: '#/components/schemas/BundleHash'
+        canonical_request_hash:
+          $ref: '#/components/schemas/CanonicalRequestHash'
 
     PushSessionChunkRequest:
       type: object
@@ -937,7 +954,7 @@ components:
 
     PushSessionCommitResponse:
       type: object
-      required: [bundle_seq, source_id, source_bundle_id, row_count, bundle_hash]
+      required: [bundle_seq, source_id, source_bundle_id, row_count, bundle_hash, canonical_request_hash]
       properties:
         bundle_seq:
           type: integer
@@ -952,6 +969,8 @@ components:
           format: int64
         bundle_hash:
           $ref: '#/components/schemas/BundleHash'
+        canonical_request_hash:
+          $ref: '#/components/schemas/CanonicalRequestHash'
 
     PullResponse:
       type: object
@@ -983,7 +1002,7 @@ components:
         payload:
           type: object
           additionalProperties: true
-          description: Full-row after-image for one current row. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64 on the wire.
+          description: Full-row after-image for one current row. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64. Exact BIGINT and arbitrary-precision decimal columns use schema-typed JSON strings; approximate REAL/float columns use finite binary64 JSON numbers.
 
     SnapshotSessionCreateRequest:
       type: object
@@ -1007,7 +1026,7 @@ components:
 
     CommittedBundleRowsResponse:
       type: object
-      required: [bundle_seq, source_id, source_bundle_id, row_count, bundle_hash, rows, next_row_ordinal, has_more]
+      required: [bundle_seq, source_id, source_bundle_id, row_count, bundle_hash, canonical_request_hash, rows, next_row_ordinal, has_more]
       properties:
         bundle_seq:
           type: integer
@@ -1022,6 +1041,8 @@ components:
           format: int64
         bundle_hash:
           $ref: '#/components/schemas/BundleHash'
+        canonical_request_hash:
+          $ref: '#/components/schemas/CanonicalRequestHash'
         rows:
           type: array
           items:

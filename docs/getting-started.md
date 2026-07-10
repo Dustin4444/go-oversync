@@ -29,8 +29,11 @@ The supported envelope is intentionally narrow:
 Registered PostgreSQL tables must satisfy these rules:
 
 - each registered table must have exactly one visible sync key column
-- visible sync key type must be `uuid` or `text`
-- each registered table must define `_sync_scope_id TEXT NOT NULL`
+- visible sync key type must be `uuid` or `text` and must declare `NOT NULL`
+- each registered relation must be a permanent logged PostgreSQL table
+  (`pg_class.relpersistence = 'p'`); `UNLOGGED` and temporary relations are unsupported
+- each registered root and every current partition/inheritance descendant must define
+  `_sync_scope_id TEXT NOT NULL` and the visible sync key as `NOT NULL`
 - `(_sync_scope_id, sync_key)` must be unique
 - every unique constraint and unique index on a registered table must include `_sync_scope_id`
 - every registered foreign key must point to another registered table or to the same registered
@@ -46,6 +49,25 @@ Registered PostgreSQL tables must satisfy these rules:
 - partial, predicate, and expression unique indexes are unsupported on registered tables
 
 If a table violates these rules, `Bootstrap()` fails with an `UnsupportedSchemaError`.
+Persistence validation runs before Oversync creates or accepts `sync.*`, including when an existing
+layout is already marked ready.
+
+The `sync` schema is reserved. Bootstrap also validates every managed table, column, constraint,
+index, sequence, function, and reserved registered-table trigger before readiness. A coherent
+marked layout is not rewritten. Drift fails with a typed `managed sync layout mismatch`; stop all
+server instances, restore the exact object (or use the coordinated recreation procedure below), and
+retry. Do not run mixed server versions during repair.
+
+Nullable identities fail before sync metadata or registered-trigger mutation even when the table is
+empty. Stop writers, resolve existing NULL values through application policy, add the reported
+`NOT NULL` constraints, and retry. Coordinate the migration before starting corrected servers;
+older binaries do not enforce it. HTTP/wire, checkpoint, pull, and snapshot semantics are unchanged.
+
+Do not migrate or repair an incompatible database in place. Stop all server and client processes,
+recreate PostgreSQL with permanent logged business tables, recreate every Go, KMP, and Dart client
+database, and deploy compatible versions together. This reset discards business rows, sync
+history, staged sessions, checkpoints, outboxes, and offline work; mixed-version operation is
+unsupported.
 
 Recommended pattern:
 
@@ -359,7 +381,7 @@ log.Printf("rebuild outcome: %s", rebuildReport.Outcome)
 Behavior to expect:
 
 - `Attach()` resolves first-account lifecycle through `POST /sync/connect`.
-- `Open()`, `PushPending()`, `PullToStable()`, `Sync()`, `Detach()`, and `Rebuild()` now return
+- `Open()`, `PushPending()`, `PullToStable()`, `Sync()`, `Detach()`, and `Rebuild()` return
   structured results in addition to `error`.
 - `PushPending()` freezes one outbound snapshot, uploads it through push sessions, fetches the
   committed authoritative rows, and replays them locally.
@@ -384,7 +406,8 @@ Behavior to expect:
 - every managed table must declare its sync key explicitly
 - managed tables must be FK-closed
 - `PullToStable()` and `Rebuild(ctx)` fail closed while `_sync_outbox_*` exists
-- `Sync()` fails closed while `_sync_attachment_state.rebuild_required = 1`
+- `Sync()` automatically resumes checkpoint recovery while
+  `_sync_attachment_state.rebuild_required = 1`; source-identity recovery remains explicit
 - the durable read checkpoint is `_sync_attachment_state.last_bundle_seq_seen`
 - the next outgoing client bundle id is `_sync_source_state.next_source_bundle_id`
 - sync-visible absolute timestamps should use RFC3339 or RFC3339Nano text with an explicit zone, for example `2026-03-24T18:02:00Z`

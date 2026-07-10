@@ -210,8 +210,11 @@ applied.
 Server-side registered tables are intentionally constrained:
 
 - one sync key column per registered table
-- visible sync key type must be `uuid` or `text`
-- registered PostgreSQL tables must include `_sync_scope_id TEXT NOT NULL`
+- visible sync key type must be `uuid` or `text` and the column must declare `NOT NULL`
+- registered relations must be permanent logged PostgreSQL tables (`pg_class.relpersistence = 'p'`);
+  `UNLOGGED` and temporary relations are unsupported
+- registered PostgreSQL roots and every current partition/inheritance descendant must include
+  `_sync_scope_id TEXT NOT NULL` and a non-null visible sync key
 - registered PostgreSQL row identity must be scope-bound through `(_sync_scope_id, sync_key)`
 - registered tables must be FK-closed
 - registered-to-registered foreign keys must be scope-inclusive and `DEFERRABLE`
@@ -222,8 +225,47 @@ The SQLite client is likewise fail-closed:
 - one configured remote schema per SQLite database
 - one `oversqlite.Client` process owner per SQLite database
 - managed local tables must be FK-closed
+- the configured visible `TEXT`/`BLOB` primary-key column must declare `NOT NULL` explicitly
 
 See `docs/getting-started.md` and `docs/documentation/server.md` for the full table requirements.
+
+Oversync does not provide an in-place migration for deployments outside this supported envelope.
+To reset one, stop every server and client, recreate PostgreSQL with permanent logged business
+tables, recreate every client database, and deploy compatible server and client versions together.
+This procedure discards business history, sync state, checkpoints, outboxes, and offline work;
+mixed-version operation is unsupported.
+
+Nullable identity declarations use a data-preserving operator migration rather than the destructive
+reset above. Stop all writers and mixed-version instances, resolve existing NULL owner/key values
+according to application policy, add explicit `NOT NULL` to every reported PostgreSQL
+root/descendant or SQLite visible key, then retry bootstrap/initialization. Corrected binaries do not
+change the wire, checkpoint, or snapshot contract, but older binaries do not enforce this invariant.
+
+Registered-table `TRUNCATE` is always rejected with PostgreSQL SQLSTATE `55000`, including through
+`CASCADE`, direct current-partition targets, and `WithinSyncBundle`. Administrative reset requires
+the same stopped-process recreation of PostgreSQL and every client database; Oversync exposes no
+runtime reset endpoint or bundle-context escape hatch.
+
+Supported populated registered tables are adopted during `Bootstrap()` without rewriting their
+business rows. Bootstrap locks registered writes and commits trigger installation plus one
+replayable baseline bundle per populated scope atomically. Runtime operations remain unavailable
+until bootstrap succeeds; inconsistent partial sync metadata fails closed. Existing populated
+deployments require a coordinated stop, backup, upgraded bootstrap, readiness check, and restart—do
+not run old and new server versions together during first adoption.
+
+The PostgreSQL `sync` namespace is reserved for Oversync. Every startup validates the complete
+`server_postgres_sync_v1` semantic layout—tables and columns, constraints and indexes, sequences,
+managed functions, and reserved registered-table/partition triggers—before adoption or readiness.
+A healthy marked layout is read-only during bootstrap, so managed function and trigger OIDs remain
+stable. Missing, extra, disabled, invalid, or altered managed objects return a typed
+`UnsupportedSchemaError` with expected/actual fingerprints and bounded field differences; bootstrap
+does not recreate or repair them.
+
+For a managed-layout rejection, stop every old and new server instance before changing DDL. Restore
+the exact reported object while services remain stopped, or use the already-approved C2/C3
+whole-database recreation procedure when exact repair is not trustworthy, then retry bootstrap.
+Do not run an older binary during repair because it can recreate managed functions or triggers.
+H4 changes no HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable state.
 
 ## Packages
 

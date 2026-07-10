@@ -17,7 +17,7 @@ import (
 
 const lifecycleUsersDDL = `
 	CREATE TABLE users (
-		id TEXT PRIMARY KEY,
+		id TEXT PRIMARY KEY NOT NULL,
 		name TEXT NOT NULL,
 		email TEXT NOT NULL
 	)
@@ -787,7 +787,7 @@ func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemove
 
 	_, err := db.Exec(`
 		CREATE TABLE legacy_docs (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			body TEXT NOT NULL
 		)
 	`)

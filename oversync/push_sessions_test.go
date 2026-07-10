@@ -22,11 +22,13 @@ import (
 )
 
 type pushSessionFixture struct {
-	pool       *pgxpool.Pool
-	svc        *SyncService
-	schemaName string
-	writer     Actor
-	reader     Actor
+	pool                        *pgxpool.Pool
+	svc                         *SyncService
+	schemaName                  string
+	writer                      Actor
+	reader                      Actor
+	stagedRowsByPushID          map[string][]PushRequestRow
+	requestHashBySourceBundleID map[int64]string
 }
 
 type pushSessionFixtureOptions struct {
@@ -74,11 +76,13 @@ func newPushSessionFixture(t *testing.T, ctx context.Context, opts pushSessionFi
 	}, logger)
 
 	return &pushSessionFixture{
-		pool:       pool,
-		svc:        svc,
-		schemaName: schemaName,
-		writer:     Actor{UserID: userID, SourceID: "writer"},
-		reader:     Actor{UserID: userID, SourceID: "reader"},
+		pool:                        pool,
+		svc:                         svc,
+		schemaName:                  schemaName,
+		writer:                      Actor{UserID: userID, SourceID: "writer"},
+		reader:                      Actor{UserID: userID, SourceID: "reader"},
+		stagedRowsByPushID:          make(map[string][]PushRequestRow),
+		requestHashBySourceBundleID: make(map[int64]string),
 	}
 }
 
@@ -128,13 +132,21 @@ func (f *pushSessionFixture) createSession(t *testing.T, ctx context.Context, so
 	t.Helper()
 
 	initializationID := resolveConnectForPushSession(t, ctx, f.svc, f.writer, plannedRowCount > 0)
+	requestHash := f.requestHashBySourceBundleID[sourceBundleID]
+	if requestHash == "" {
+		requestHash = strings.Repeat("0", 64)
+	}
 	resp, err := f.svc.CreatePushSession(ctx, f.writer, &PushSessionCreateRequest{
-		SourceBundleID:   sourceBundleID,
-		PlannedRowCount:  plannedRowCount,
-		InitializationID: initializationID,
+		SourceBundleID:       sourceBundleID,
+		PlannedRowCount:      plannedRowCount,
+		CanonicalRequestHash: requestHash,
+		InitializationID:     initializationID,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
+	if resp.PushID != "" {
+		f.stagedRowsByPushID[resp.PushID] = nil
+	}
 	return resp
 }
 
@@ -147,6 +159,21 @@ func (f *pushSessionFixture) uploadChunk(t *testing.T, ctx context.Context, push
 	})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
+	staged := f.stagedRowsByPushID[pushID]
+	if int(startRowOrdinal) == len(staged) {
+		staged = append(staged, rows...)
+		f.stagedRowsByPushID[pushID] = staged
+		var planned int64
+		var sourceBundleID int64
+		require.NoError(t, f.pool.QueryRow(ctx, `SELECT planned_row_count, source_bundle_id FROM sync.push_sessions WHERE push_id = $1::uuid`, pushID).Scan(&planned, &sourceBundleID))
+		if int64(len(staged)) == planned {
+			hash, hashErr := computeCanonicalPushRequestHash(staged)
+			require.NoError(t, hashErr)
+			_, updateErr := f.pool.Exec(ctx, `UPDATE sync.push_sessions SET canonical_request_hash = $2 WHERE push_id = $1::uuid`, pushID, hash)
+			require.NoError(t, updateErr)
+			f.requestHashBySourceBundleID[sourceBundleID] = hash
+		}
+	}
 	return resp
 }
 
@@ -1018,9 +1045,10 @@ func TestPushSessions_ConcurrentSessionCreationLeavesOneActiveStagingSession(t *
 	runCreate := func() {
 		defer wg.Done()
 		resp, err := fixture.svc.CreatePushSession(ctx, fixture.writer, &PushSessionCreateRequest{
-			SourceBundleID:   1,
-			PlannedRowCount:  1,
-			InitializationID: initializationID,
+			SourceBundleID:       1,
+			PlannedRowCount:      1,
+			CanonicalRequestHash: strings.Repeat("0", 64),
+			InitializationID:     initializationID,
 		})
 		results <- createResult{resp: resp, err: err}
 	}
@@ -1114,9 +1142,10 @@ func TestPushSessions_UnknownExpiredAndForeignIDsFailClosed(t *testing.T) {
 	expiredActor := Actor{UserID: "expired-user-" + uuid.NewString(), SourceID: "writer-expired"}
 	expiredInitializationID := resolveConnectForPushSession(t, ctx, fixture.svc, expiredActor, true)
 	expiredSession, err := fixture.svc.CreatePushSession(ctx, expiredActor, &PushSessionCreateRequest{
-		SourceBundleID:   1,
-		PlannedRowCount:  1,
-		InitializationID: expiredInitializationID,
+		SourceBundleID:       1,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: strings.Repeat("0", 64),
+		InitializationID:     expiredInitializationID,
 	})
 	require.NoError(t, err)
 	fixture.setPushSessionExpiry(t, ctx, expiredSession.PushID, time.Now().UTC().Add(-time.Second))
@@ -1275,9 +1304,10 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	createSessionForActor := func(actor Actor, sourceBundleID, plannedRowCount int64) *PushSessionCreateResponse {
 		initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, actor, plannedRowCount > 0)
 		resp, err := fixture.svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
-			SourceBundleID:   sourceBundleID,
-			PlannedRowCount:  plannedRowCount,
-			InitializationID: initializationID,
+			SourceBundleID:       sourceBundleID,
+			PlannedRowCount:      plannedRowCount,
+			CanonicalRequestHash: strings.Repeat("0", 64),
+			InitializationID:     initializationID,
 		})
 		require.NoError(t, err)
 		require.NotNil(t, resp)
@@ -1439,7 +1469,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions",
 			actor:          retiredCreateActor,
-			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 1},
+			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 1, CanonicalRequestHash: strings.Repeat("0", 64)},
 			expectedStatus: http.StatusConflict,
 			expectedCode:   "source_retired",
 		},
@@ -1459,7 +1489,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions",
 			actor:          prunedActor,
-			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 1},
+			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 1, CanonicalRequestHash: strings.Repeat("0", 64)},
 			expectedStatus: http.StatusConflict,
 			expectedCode:   "history_pruned",
 		},
@@ -1469,7 +1499,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions",
 			actor:          validActor,
-			body:           PushSessionCreateRequest{SourceBundleID: 2, PlannedRowCount: 1},
+			body:           PushSessionCreateRequest{SourceBundleID: 2, PlannedRowCount: 1, CanonicalRequestHash: strings.Repeat("0", 64)},
 			expectedStatus: http.StatusConflict,
 			expectedCode:   "source_sequence_out_of_order",
 		},
@@ -1582,15 +1612,17 @@ func TestPushSessions_StaleOutstandingCommitFailsClosedAfterSourceRetirement(t *
 
 	mustPushUserBundle(t, ctx, fixture.svc, oldActor, fixture.schemaName, 1, uuid.New(), "Bootstrap")
 
+	staleRows := []PushRequestRow{fixture.userRow(uuid.New(), "StaleBeforeRetire")}
 	session, err := fixture.svc.CreatePushSession(ctx, oldActor, &PushSessionCreateRequest{
-		SourceBundleID:  2,
-		PlannedRowCount: 1,
+		SourceBundleID:       2,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: mustCanonicalPushRequestHash(t, staleRows),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, session)
 	_, err = fixture.svc.UploadPushChunk(ctx, oldActor, session.PushID, &PushSessionChunkRequest{
 		StartRowOrdinal: 0,
-		Rows:            []PushRequestRow{fixture.userRow(uuid.New(), "StaleBeforeRetire")},
+		Rows:            staleRows,
 	})
 	require.NoError(t, err)
 
@@ -1645,8 +1677,9 @@ func TestHandleCreatePushSession_UsesActorSourceIDAsOnlyRequestLevelSourceOfTrut
 		"source_id":"wrong-source",
 		"source_bundle_id":1,
 		"planned_row_count":1,
+		"canonical_request_hash":"%s",
 		"initialization_id":"%s"
-	}`, initializationID)))
+	}`, strings.Repeat("0", 64), initializationID)))
 	req = req.WithContext(ContextWithActor(req.Context(), fixture.writer))
 	rec := httptest.NewRecorder()
 	handlers.HandleCreatePushSession(rec, req)

@@ -36,24 +36,31 @@ enabled = true
 
 [languages.go.domains]
 rules = [
-  { domain = "root", match = ["main.go"] },
+  # Reusable server framework.
+  { domain = "tests", source_roles = ["test"], match = ["oversync/**/*_test.go"] },
+  { domain = "main", match = ["oversync/**/*.go"] },
 
-  { domain = "oversync_tests", match = ["oversync/**/*_test.go"] },
-  { domain = "oversync", match = ["oversync/**/*.go"] },
-
-  { domain = "oversqlite_tests", match = ["oversqlite/**/*_test.go"] },
+  # Reusable Go/SQLite client framework.
+  { domain = "oversqlite_tests", source_roles = ["test"], match = ["oversqlite/**/*_test.go"] },
   { domain = "oversqlite", match = ["oversqlite/**/*.go"] },
 
-  { domain = "oversqlite_e2e_tests", match = ["oversqlite_e2e/**/*_test.go"] },
+  # Cross-library PostgreSQL/SQLite end-to-end suite.
+  { domain = "oversqlite_e2e", source_roles = ["test"], match = ["oversqlite_e2e/**/*_test.go"] },
 
-  { domain = "example_internal", match = ["examples/internal/**/*.go"] },
+  # Shared support used by the example applications.
+  { domain = "example_support", source_roles = ["example"], match = ["examples/internal/**/*.go"] },
 
-  { domain = "example_nethttp_server_tests", match = ["examples/nethttp_server/**/*_test.go"] },
-  { domain = "example_nethttp_server", match = ["examples/nethttp_server/**/*.go"] },
+  # Reference net/http server application.
+  { domain = "nethttp_server_tests", source_roles = ["test", "example"], match = ["examples/nethttp_server/**/*_test.go"] },
+  { domain = "nethttp_server", source_roles = ["example"], match = ["examples/nethttp_server/**/*.go"] },
 
-  { domain = "example_samplesync_server_tests", match = ["examples/samplesync_server/**/*_test.go"] },
-  { domain = "example_samplesync_server", match = ["examples/samplesync_server/**/*.go"] },
+  # Sample server for the SQLiteNow KMP sample application.
+  { domain = "samplesync_server", source_roles = ["example"], match = ["examples/samplesync_server/**/*.go"] },
 
-  { domain = "example_mobile_flow_tests", match = ["examples/mobile_flow/**/*_test.go"] },
-  { domain = "example_mobile_flow", match = ["examples/mobile_flow/**/*.go"] },
+  # Standalone mobile-flow module and simulator application.
+  { domain = "mobile_flow_tests", source_roles = ["test", "example"], match = ["examples/mobile_flow/**/*_test.go"] },
+  { domain = "mobile_flow", source_roles = ["example"], match = ["examples/mobile_flow/**/*.go"] },
+
+  # Repository-level informational CLI.
+  { domain = "repo_cli", source_roles = ["example"], match = ["main.go"] },
 ]

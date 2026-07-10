@@ -222,7 +222,7 @@ func TestPushPending_StructuredConflictBuildsConflictContextFromOutboundSnapshot
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -263,7 +263,7 @@ func TestPushPending_StructuredConflictServerWinsResolverRecoversToServerState(t
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -311,7 +311,7 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -366,7 +366,7 @@ func TestPushPending_StructuredConflictKeepMergedRetriesMergedPayload(t *testing
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
@@ -417,7 +417,7 @@ func TestPushPending_StructuredConflictKeepMergedLatestUpdatedAtWins(t *testing.
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL,
 			created_at TEXT NOT NULL,
@@ -499,7 +499,7 @@ func TestPushPending_StructuredConflictPreservesSiblingRowsFromRejectedBundle(t 
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)

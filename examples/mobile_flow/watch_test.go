@@ -40,7 +40,7 @@ func newWatchMobileClient(t *testing.T, cfg *oversqlite.Config, watchSupported b
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	t.Cleanup(func() { _ = db.Close() })
-	if _, err := db.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL)`); err != nil {
 		t.Fatalf("create users table: %v", err)
 	}
 	client, err := oversqlite.NewClient(db, "http://mobile-flow-watch.test", func(context.Context) (string, error) {

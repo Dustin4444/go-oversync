@@ -32,7 +32,7 @@ func newUsersClientForTest(t *testing.T, ts *TestServer, userID string) (*sql.DB
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL,
 			created_at TEXT NOT NULL,
@@ -76,14 +76,14 @@ func newUsersAndPostsClientForTest(t *testing.T, ts *TestServer, userID string) 
 
 	_, err = db.Exec(`
 		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
 		CREATE TABLE posts (
-			id TEXT PRIMARY KEY,
+			id TEXT PRIMARY KEY NOT NULL,
 			title TEXT NOT NULL,
 			content TEXT NOT NULL,
 			author_id TEXT NULL,

@@ -54,7 +54,7 @@ The scenario also forces both supported restart boundaries:
 
 ### Canonical binary wire contract
 
-The scenario now also checks that the supported binary HTTP contract survives a large multi-batch,
+The scenario checks that the supported binary HTTP contract survives a large multi-batch,
 multi-device run:
 
 - non-key binary payload fields use standard base64 on the wire
@@ -114,10 +114,9 @@ Look at:
 - deferred-FK snapshot apply
 - whether the example schema was changed outside the supported envelope
 
-## Why This Scenario Still Matters
+## Why This Scenario Matters
 
-This scenario is no longer about old upload-status-array behavior. It is now a stress test for the
-bundle-based guarantees:
+This scenario is a stress test for the bundle-based guarantees:
 
 - one logical dirty-set push
 - multi-chunk push-session upload for that one logical push

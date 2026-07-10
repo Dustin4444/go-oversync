@@ -5,30 +5,62 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
+
+	"github.com/mobiletoly/go-oversync/internal/jcs"
+	"github.com/mobiletoly/go-oversync/internal/wirevalue"
 )
 
-func (s *SyncService) normalizePushPayloadBinaryFields(schemaName, tableName string, payloadObject map[string]any) error {
+func (s *SyncService) normalizePushPayloadFields(schemaName, tableName string, payloadObject map[string]any) error {
 	columnTypes := s.columnTypesForTable(schemaName, tableName)
 	if len(columnTypes) == 0 {
 		return nil
 	}
 
 	for columnName, rawValue := range payloadObject {
-		if columnTypes[strings.ToLower(columnName)] != "bytea" || rawValue == nil {
+		columnType := columnTypes[strings.ToLower(columnName)]
+		if rawValue == nil {
 			continue
 		}
-
-		encodedValue, ok := rawValue.(string)
-		if !ok {
-			return &PushValidationError{Message: fmt.Sprintf("payload binary field %s.%s.%s must be a base64 string", schemaName, tableName, columnName)}
+		switch columnType {
+		case "bytea":
+			encodedValue, ok := rawValue.(string)
+			if !ok {
+				return &PushValidationError{Message: fmt.Sprintf("payload binary field %s.%s.%s must be a base64 string", schemaName, tableName, columnName)}
+			}
+			decodedValue, err := base64.StdEncoding.DecodeString(encodedValue)
+			if err != nil {
+				return &PushValidationError{Message: fmt.Sprintf("payload binary field %s.%s.%s must be valid base64", schemaName, tableName, columnName)}
+			}
+			payloadObject[columnName] = "\\x" + hex.EncodeToString(decodedValue)
+		case "int8":
+			raw, ok := rawValue.(string)
+			if !ok {
+				return &PushValidationError{Message: fmt.Sprintf("payload exact-int64 field %s.%s.%s must be a JSON string", schemaName, tableName, columnName)}
+			}
+			if _, err := wirevalue.ParseInt64(raw); err != nil {
+				return &PushValidationError{Message: fmt.Sprintf("payload exact-int64 field %s.%s.%s is invalid: %v", schemaName, tableName, columnName, err)}
+			}
+		case "numeric":
+			raw, ok := rawValue.(string)
+			if !ok {
+				return &PushValidationError{Message: fmt.Sprintf("payload exact-decimal field %s.%s.%s must be a JSON string", schemaName, tableName, columnName)}
+			}
+			if err := wirevalue.ValidateDecimal(raw); err != nil {
+				return &PushValidationError{Message: fmt.Sprintf("payload exact-decimal field %s.%s.%s is invalid: %v", schemaName, tableName, columnName, err)}
+			}
+		case "float4", "float8":
+			number, ok := rawValue.(json.Number)
+			if !ok {
+				return &PushValidationError{Message: fmt.Sprintf("payload approximate field %s.%s.%s must be a JSON number", schemaName, tableName, columnName)}
+			}
+			parsed, err := strconv.ParseFloat(number.String(), 64)
+			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+				return &PushValidationError{Message: fmt.Sprintf("payload approximate field %s.%s.%s must be a finite binary64 value", schemaName, tableName, columnName)}
+			}
 		}
-
-		decodedValue, err := base64.StdEncoding.DecodeString(encodedValue)
-		if err != nil {
-			return &PushValidationError{Message: fmt.Sprintf("payload binary field %s.%s.%s must be valid base64", schemaName, tableName, columnName)}
-		}
-		payloadObject[columnName] = "\\x" + hex.EncodeToString(decodedValue)
 	}
 
 	return nil
@@ -44,8 +76,8 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 		return append(json.RawMessage(nil), payload...), nil
 	}
 
-	var payloadObject map[string]any
-	if err := json.Unmarshal(payload, &payloadObject); err != nil {
+	payloadObject, err := jcs.DecodeObject(payload)
+	if err != nil {
 		return nil, fmt.Errorf("decode payload for %s.%s: %w", schemaName, tableName, err)
 	}
 
@@ -54,15 +86,39 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 		changed = true
 	}
 	for columnName, rawValue := range payloadObject {
-		if columnTypes[strings.ToLower(columnName)] != "bytea" {
+		if rawValue == nil {
 			continue
 		}
-		canonicalValue, ok, err := canonicalizeWireBinaryValue(rawValue)
-		if err != nil {
-			return nil, fmt.Errorf("canonicalize binary payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
-		}
-		if ok && canonicalValue != rawValue {
-			payloadObject[columnName] = canonicalValue
+		columnType := columnTypes[strings.ToLower(columnName)]
+		switch columnType {
+		case "bytea":
+			canonicalValue, ok, err := canonicalizeWireBinaryValue(rawValue)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalize binary payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			if ok && canonicalValue != rawValue {
+				payloadObject[columnName] = canonicalValue
+				changed = true
+			}
+		case "int8":
+			raw, err := exactNumberText(rawValue)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalize exact int64 payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			if _, err := wirevalue.ParseInt64(raw); err != nil {
+				return nil, fmt.Errorf("canonicalize exact int64 payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			payloadObject[columnName] = raw
+			changed = true
+		case "numeric":
+			raw, err := exactNumberText(rawValue)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalize exact decimal payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			if err := wirevalue.ValidateDecimal(raw); err != nil {
+				return nil, fmt.Errorf("canonicalize exact decimal payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			payloadObject[columnName] = raw
 			changed = true
 		}
 	}
@@ -71,7 +127,7 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 		return append(json.RawMessage(nil), payload...), nil
 	}
 
-	canonicalPayload, err := json.Marshal(payloadObject)
+	canonicalPayload, err := jcs.Marshal(payloadObject)
 	if err != nil {
 		return nil, fmt.Errorf("marshal canonical payload for %s.%s: %w", schemaName, tableName, err)
 	}
@@ -80,6 +136,17 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 		return nil, fmt.Errorf("canonicalize canonical payload for %s.%s: %w", schemaName, tableName, err)
 	}
 	return canonicalPayload, nil
+}
+
+func exactNumberText(value any) (string, error) {
+	switch typed := value.(type) {
+	case json.Number:
+		return typed.String(), nil
+	case string:
+		return typed, nil
+	default:
+		return "", fmt.Errorf("expected exact numeric JSON string or database number, got %T", value)
+	}
 }
 
 func (s *SyncService) columnTypesForTable(schemaName, tableName string) map[string]string {

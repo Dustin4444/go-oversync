@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
@@ -25,7 +24,7 @@ import (
 
 const usersDDL = `
 	CREATE TABLE users (
-		id TEXT PRIMARY KEY,
+		id TEXT PRIMARY KEY NOT NULL,
 		name TEXT NOT NULL,
 		email TEXT NOT NULL,
 		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -35,7 +34,7 @@ const usersDDL = `
 
 const postsDDL = `
 	CREATE TABLE posts (
-		id TEXT PRIMARY KEY,
+		id TEXT PRIMARY KEY NOT NULL,
 		title TEXT NOT NULL,
 		content TEXT NOT NULL,
 		author_id TEXT NOT NULL,
@@ -47,7 +46,7 @@ const postsDDL = `
 
 const categoriesDDL = `
 	CREATE TABLE categories (
-		id TEXT PRIMARY KEY,
+		id TEXT PRIMARY KEY NOT NULL,
 		name TEXT NOT NULL,
 		parent_id TEXT REFERENCES categories(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 	)
@@ -55,7 +54,7 @@ const categoriesDDL = `
 
 const typedRowsDDL = `
 	CREATE TABLE typed_rows (
-		id TEXT PRIMARY KEY,
+		id TEXT PRIMARY KEY NOT NULL,
 		name TEXT NOT NULL,
 		note TEXT NULL,
 		count_value INTEGER NULL,
@@ -105,9 +104,7 @@ func newExampleServerWithConfig(
 ) *exampleserver.TestServer {
 	t.Helper()
 
-	databaseURL := integrationTestDatabaseURL()
-	ensureSharedExampleDatabase(t, databaseURL)
-	resetSharedExampleDatabase(t, databaseURL)
+	databaseURL := createIsolatedExampleDatabase(t, integrationTestDatabaseURL())
 
 	cfg := &exampleserver.ServerConfig{
 		DatabaseURL:    databaseURL,
@@ -130,66 +127,37 @@ func newExampleServerWithConfig(
 	return ts
 }
 
-func ensureSharedExampleDatabase(t *testing.T, databaseURL string) {
+func createIsolatedExampleDatabase(t *testing.T, databaseURL string) string {
 	t.Helper()
 
-	adminURL, _, dbName := buildSharedDatabaseURLs(t, databaseURL)
+	adminURL, resolvedDatabaseURL, _ := buildSharedDatabaseURLs(t, databaseURL)
+	dbName := "oversync_e2e_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	parsed, err := url.Parse(resolvedDatabaseURL)
+	require.NoError(t, err)
+	parsed.Path = "/" + dbName
+	isolatedDatabaseURL := parsed.String()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	adminConn, err := pgx.Connect(ctx, adminURL)
 	require.NoError(t, err)
 	defer adminConn.Close(ctx)
-
-	var exists bool
-	require.NoError(t, adminConn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, dbName).Scan(&exists))
-	if exists {
-		return
-	}
-
 	_, err = adminConn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{dbName}.Sanitize())
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "42P04" {
-			require.NoError(t, err)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		cleanupConn, err := pgx.Connect(cleanupCtx, adminURL)
+		if err != nil {
+			t.Errorf("connect to drop isolated E2E database: %v", err)
+			return
 		}
-	}
-}
-
-func resetSharedExampleDatabase(t *testing.T, databaseURL string) {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	conn, err := pgx.Connect(ctx, databaseURL)
-	require.NoError(t, err)
-	defer conn.Close(ctx)
-
-	rows, err := conn.Query(ctx, `
-		SELECT nspname
-		FROM pg_namespace
-		WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'public')
-		  AND nspname NOT LIKE 'pg_toast%'
-		  AND nspname NOT LIKE 'pg_temp_%'
-		  AND nspname NOT LIKE 'pg_toast_temp_%'
-		ORDER BY nspname
-	`)
-	require.NoError(t, err)
-	defer rows.Close()
-
-	var schemas []string
-	for rows.Next() {
-		var schema string
-		require.NoError(t, rows.Scan(&schema))
-		schemas = append(schemas, schema)
-	}
-	require.NoError(t, rows.Err())
-
-	for _, schema := range schemas {
-		_, err := conn.Exec(ctx, `DROP SCHEMA IF EXISTS `+pgx.Identifier{schema}.Sanitize()+` CASCADE`)
-		require.NoError(t, err)
-	}
+		defer cleanupConn.Close(cleanupCtx)
+		if _, err := cleanupConn.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+pgx.Identifier{dbName}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop isolated E2E database: %v", err)
+		}
+	})
+	return isolatedDatabaseURL
 }
 
 func buildSharedDatabaseURLs(t *testing.T, databaseURL string) (adminURL string, resolvedDatabaseURL string, dbName string) {
@@ -426,7 +394,15 @@ func errorJSONResponse(status int, v any) *http.Response {
 func syncTables(names ...string) []oversqlite.SyncTable {
 	tables := make([]oversqlite.SyncTable, 0, len(names))
 	for _, name := range names {
-		tables = append(tables, oversqlite.SyncTable{TableName: name, SyncKeyColumnName: "id"})
+		table := oversqlite.SyncTable{TableName: name, SyncKeyColumnName: "id"}
+		if name == "typed_rows" {
+			table.NumericColumns = map[string]oversqlite.NumericColumnKind{
+				"count_value":  oversqlite.NumericColumnExactInt64,
+				"enabled_flag": oversqlite.NumericColumnExactInt64,
+				"rating":       oversqlite.NumericColumnApproximate,
+			}
+		}
+		tables = append(tables, table)
 	}
 	return tables
 }

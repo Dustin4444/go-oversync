@@ -111,6 +111,18 @@ func (h *HTTPSyncHandlers) writeJSON(w http.ResponseWriter, response any, encode
 	}
 }
 
+func (h *HTTPSyncHandlers) writeServiceUnavailable(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, errServiceShuttingDown) && !errors.Is(err, errServiceNotReady) {
+		return false
+	}
+	message := "Sync service is shutting down"
+	if errors.Is(err, errServiceNotReady) {
+		message = "Sync service bootstrap is incomplete"
+	}
+	h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", message)
+	return true
+}
+
 func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
 	if !ok {
@@ -125,8 +137,7 @@ func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *htt
 
 	response, err := h.service.CreatePushSession(r.Context(), actor, &req)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *PushSessionInvalidError
@@ -192,8 +203,7 @@ func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http
 
 	response, err := h.service.UploadPushChunk(r.Context(), actor, pushID, &req)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *PushChunkInvalidError
@@ -248,8 +258,7 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 
 	response, err := h.service.CommitPushSession(r.Context(), actor, pushID)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *PushCommitInvalidError
@@ -319,8 +328,7 @@ func (h *HTTPSyncHandlers) HandleConnect(w http.ResponseWriter, r *http.Request)
 
 	response, err := h.service.Connect(r.Context(), actor, &req)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *ConnectInvalidError
@@ -356,8 +364,7 @@ func (h *HTTPSyncHandlers) HandleGetCommittedBundleRows(w http.ResponseWriter, r
 
 	response, err := h.service.GetCommittedBundleRows(r.Context(), actor, bundleSeq, queryParams.afterRowOrdinal, queryParams.maxRows)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *CommittedBundleChunkInvalidError
@@ -391,8 +398,7 @@ func (h *HTTPSyncHandlers) HandleDeletePushSession(w http.ResponseWriter, r *htt
 	pushID := r.PathValue("push_id")
 
 	if err := h.service.DeletePushSession(r.Context(), actor, pushID); err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *PushChunkInvalidError
@@ -474,13 +480,22 @@ func (h *HTTPSyncHandlers) HandlePull(w http.ResponseWriter, r *http.Request) {
 
 	response, err := h.service.ProcessPull(r.Context(), actor, afterBundleSeq, maxBundles, targetBundleSeq)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var prunedErr *HistoryPrunedError
 		if errors.As(err, &prunedErr) {
 			h.writeError(w, http.StatusConflict, "history_pruned", prunedErr.Error())
+			return
+		}
+		var aheadErr *CheckpointAheadError
+		if errors.As(err, &aheadErr) {
+			h.writeError(w, http.StatusConflict, "checkpoint_ahead", aheadErr.Error())
+			return
+		}
+		var invalidErr *InvalidPullRequestError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "invalid_request", invalidErr.Error())
 			return
 		}
 		var uninitializedErr *ScopeUninitializedError
@@ -588,8 +603,7 @@ func (h *HTTPSyncHandlers) writeWatchSetupError(w http.ResponseWriter, err error
 		h.writeError(w, http.StatusServiceUnavailable, "bundle_change_watch_disabled", "Bundle change watch is disabled")
 		return
 	}
-	if errors.Is(err, errServiceShuttingDown) {
-		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+	if h.writeServiceUnavailable(w, err) {
 		return
 	}
 	var uninitializedErr *ScopeUninitializedError
@@ -659,8 +673,7 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 
 	response, err := h.service.CreateSnapshotSessionWithRequest(r.Context(), actor, req)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *SnapshotSessionInvalidError
@@ -741,8 +754,7 @@ func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http
 
 	response, err := h.service.GetSnapshotChunk(r.Context(), actor, snapshotID, afterRowOrdinal, queryParams.maxRows)
 	if err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *SnapshotChunkInvalidError
@@ -782,8 +794,7 @@ func (h *HTTPSyncHandlers) HandleDeleteSnapshotSession(w http.ResponseWriter, r 
 
 	snapshotID := r.PathValue("snapshot_id")
 	if err := h.service.DeleteSnapshotSession(r.Context(), actor, snapshotID); err != nil {
-		if errors.Is(err, errServiceShuttingDown) {
-			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		if h.writeServiceUnavailable(w, err) {
 			return
 		}
 		var invalidErr *SnapshotChunkInvalidError

@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -14,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
 	"github.com/mobiletoly/go-oversync/examples/mobile_flow/config"
 	"github.com/mobiletoly/go-oversync/examples/mobile_flow/simulator"
 )
@@ -30,7 +28,6 @@ func main() {
 		dbFlag         = flag.String("db", "postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable", "Database URL for verification")
 		jwtSecretFlag  = flag.String("jwt-secret", "", "JWT secret for local token generation (defaults to env JWT_SECRET, else server default)")
 		parallelFlag   = flag.Int("parallel", 1, "Number of parallel users to simulate (1-100)")
-		cleanupFlag    = flag.Bool("cleanup", true, "Clean up server database before starting")
 		preserveDBFlag = flag.Bool("preserve-db", false, "Preserve SQLite database files for manual inspection")
 	)
 	flag.Parse()
@@ -68,16 +65,6 @@ func main() {
 	}
 
 	ctx := context.Background()
-
-	// Clean up server database if requested
-	if *cleanupFlag {
-		logger.Info("🧹 Cleaning up server database before starting...")
-		if err := cleanupServerDatabase(ctx, cfg); err != nil {
-			logger.Warn("Failed to cleanup server database", "error", err)
-		} else {
-			logger.Info("✅ Server database cleaned up successfully")
-		}
-	}
 
 	// Check if parallel execution is requested
 	if *parallelFlag > 1 {
@@ -464,62 +451,4 @@ func runScenarioForUser(ctx context.Context, sim *simulator.Simulator, scenarioN
 
 	// Run single scenario
 	return sim.RunScenario(ctx, scenarioName)
-}
-
-// cleanupServerDatabase cleans up sync and business tables on the server
-func cleanupServerDatabase(ctx context.Context, cfg *config.Config) error {
-	db, err := sql.Open("postgres", cfg.DatabaseURL)
-	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
-	// Test connection
-	if err := db.PingContext(ctx); err != nil {
-		return fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin cleanup transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, `
-		TRUNCATE TABLE
-			business.file_reviews,
-			business.files,
-			business.posts,
-			business.users,
-			business.typed_rows,
-			business.categories,
-			business.team_members,
-			business.teams
-		RESTART IDENTITY CASCADE
-	`); err != nil {
-		return fmt.Errorf("failed to truncate business tables: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		TRUNCATE TABLE
-			sync.snapshot_session_rows,
-			sync.snapshot_sessions,
-			sync.push_session_rows,
-			sync.push_sessions,
-			sync.bundle_capture_stage,
-			sync.bundle_rows,
-			sync.bundle_log,
-			sync.source_state,
-			sync.scope_state,
-			sync.row_state,
-			sync.user_state
-		RESTART IDENTITY CASCADE
-	`); err != nil {
-		return fmt.Errorf("failed to truncate sync tables: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit cleanup transaction: %w", err)
-	}
-	return nil
 }

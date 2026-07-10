@@ -11,12 +11,14 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mobiletoly/go-oversync/examples/internal/exampleauth"
@@ -34,6 +36,10 @@ type ServerConfig struct {
 	InitializationLeaseTTL     time.Duration
 	EnableEmptyFirstDeferral   bool
 	EmptyFirstDeferralDuration time.Duration
+	// BeforeBootstrap is a test/conformance hook that runs after the application
+	// schema exists and before Oversync observes it. Production callers should
+	// leave it nil.
+	BeforeBootstrap func(context.Context, *pgxpool.Pool, string) error
 }
 
 // ServerComponents holds the initialized server components
@@ -52,7 +58,8 @@ type ServerComponents struct {
 // TestServer represents a running test server instance
 type TestServer struct {
 	*ServerComponents
-	HTTPServer *httptest.Server
+	HTTPServer   *httptest.Server
+	dropDatabase func()
 }
 
 type emptyFirstDeferralCandidate struct {
@@ -177,6 +184,13 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		cancel()
 		return nil, err
 	}
+	if config.BeforeBootstrap != nil {
+		if err := config.BeforeBootstrap(ctx, pool, businessSchema); err != nil {
+			pool.Close()
+			cancel()
+			return nil, fmt.Errorf("before bootstrap: %w", err)
+		}
+	}
 
 	// Configure sync service with registered tables and handlers
 	serviceConfig := &oversync.ServiceConfig{
@@ -251,19 +265,6 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	// Add unauthenticated auxiliary syncx endpoints
 	mux.HandleFunc("GET /syncx/health", syncHandlers.HandleHealth)
 	mux.HandleFunc("GET /syncx/status", syncHandlers.HandleStatus)
-	mux.HandleFunc("POST /test/reset", func(w http.ResponseWriter, r *http.Request) {
-		if err := resetExampleDatabase(r.Context(), pool, syncService, logger, businessSchema); err != nil {
-			logger.Error("failed to reset example database", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "reset_failed", "message": err.Error()})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status": "ok",
-			"schema": businessSchema,
-		})
-	})
 	mux.HandleFunc("POST /test/retention-floor", func(w http.ResponseWriter, r *http.Request) {
 		type request struct {
 			UserID              string `json:"user_id"`
@@ -541,35 +542,6 @@ func (c *emptyFirstDeferralController) decide(userID, sourceID string, now time.
 	return true, expiresAt
 }
 
-func resetExampleDatabase(ctx context.Context, pool *pgxpool.Pool, syncService *oversync.SyncService, logger *slog.Logger, businessSchema string) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if strings.TrimSpace(businessSchema) == "" {
-		businessSchema = "business"
-	}
-	if err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-		businessSchemaIdent := qualifiedSchema(businessSchema)
-		if _, err := tx.Exec(ctx, `DROP SCHEMA IF EXISTS sync CASCADE`); err != nil {
-			return fmt.Errorf("drop sync schema: %w", err)
-		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, businessSchemaIdent)); err != nil {
-			return fmt.Errorf("drop business schema: %w", err)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	if err := InitializeApplicationTables(ctx, pool, logger, businessSchema); err != nil {
-		return fmt.Errorf("reinitialize application tables: %w", err)
-	}
-	if err := syncService.Bootstrap(ctx); err != nil {
-		return fmt.Errorf("rebootstrap sync service: %w", err)
-	}
-	logger.Info("example database reset complete", "schema", businessSchema)
-	return nil
-}
-
 func configuredPoolSizeFromEnv() (maxConns int32, minConns int32, err error) {
 	maxConns = 50
 	minConns = 5
@@ -626,12 +598,23 @@ func BrowserTestCORSMiddleware(next http.Handler) http.Handler {
 
 // NewTestServer creates a new test server instance using the shared server setup
 func NewTestServer(config *ServerConfig) (*TestServer, error) {
-	components, err := SetupServer(config)
-	if err != nil {
-		return nil, err
+	resolvedConfig := *config
+	var dropDatabase func()
+	if resolvedConfig.DatabaseURL == "" {
+		var err error
+		resolvedConfig.DatabaseURL, dropDatabase, err = createExampleTestDatabase(
+			context.Background(),
+			"postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable",
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if err := resetExampleDatabase(context.Background(), components.Pool, components.SyncService, components.Logger, components.BusinessSchema); err != nil {
-		components.Close()
+	components, err := SetupServer(&resolvedConfig)
+	if err != nil {
+		if dropDatabase != nil {
+			dropDatabase()
+		}
 		return nil, err
 	}
 
@@ -641,7 +624,41 @@ func NewTestServer(config *ServerConfig) (*TestServer, error) {
 	return &TestServer{
 		ServerComponents: components,
 		HTTPServer:       httpServer,
+		dropDatabase:     dropDatabase,
 	}, nil
+}
+
+func createExampleTestDatabase(ctx context.Context, baseDatabaseURL string) (string, func(), error) {
+	parsed, err := url.Parse(baseDatabaseURL)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse example test database URL: %w", err)
+	}
+	databaseName := "oversync_nethttp_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	adminURL := *parsed
+	adminURL.Path = "/postgres"
+	adminConn, err := pgx.Connect(ctx, adminURL.String())
+	if err != nil {
+		return "", nil, fmt.Errorf("connect to create example test database: %w", err)
+	}
+	if _, err := adminConn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{databaseName}.Sanitize()); err != nil {
+		_ = adminConn.Close(ctx)
+		return "", nil, fmt.Errorf("create example test database %s: %w", databaseName, err)
+	}
+	_ = adminConn.Close(ctx)
+
+	testURL := *parsed
+	testURL.Path = "/" + databaseName
+	drop := func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		conn, err := pgx.Connect(cleanupCtx, adminURL.String())
+		if err != nil {
+			return
+		}
+		defer conn.Close(cleanupCtx)
+		_, _ = conn.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+pgx.Identifier{databaseName}.Sanitize()+" WITH (FORCE)")
+	}
+	return testURL.String(), drop, nil
 }
 
 // Close shuts down the test server and cleans up resources
@@ -650,6 +667,10 @@ func (ts *TestServer) Close() {
 		ts.HTTPServer.Close()
 	}
 	ts.ServerComponents.Close()
+	if ts.dropDatabase != nil {
+		ts.dropDatabase()
+		ts.dropDatabase = nil
+	}
 }
 
 // URL returns the base URL of the test server

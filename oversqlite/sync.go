@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/mobiletoly/go-oversync/internal/jcs"
+	"github.com/mobiletoly/go-oversync/internal/wirevalue"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -183,13 +185,9 @@ func canonicalPayloadEqual(left sql.NullString, right sql.NullString) (bool, err
 }
 
 func canonicalizeJSON(raw string) ([]byte, error) {
-	var value any
-	if err := json.Unmarshal([]byte(raw), &value); err != nil {
-		return nil, fmt.Errorf("failed to normalize JSON payload: %w", err)
-	}
-	normalized, err := json.Marshal(value)
+	normalized, err := jcs.Canonicalize([]byte(raw))
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal normalized JSON payload: %w", err)
+		return nil, fmt.Errorf("failed to normalize JSON payload: %w", err)
 	}
 	return normalized, nil
 }
@@ -204,8 +202,8 @@ func nullStringValue(value sql.NullString) any {
 // processPayloadForUpload converts locally stored JSON payloads into the wire format expected by
 // bundle-shaped push requests. BLOB values are converted from hex to base64 to match JSON transport.
 func (c *Client) processPayloadForUpload(tableName, payloadStr string) (json.RawMessage, error) {
-	var payloadData map[string]any
-	if err := json.Unmarshal([]byte(payloadStr), &payloadData); err != nil {
+	payloadData, err := jcs.DecodeObject([]byte(payloadStr))
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse payload JSON: %w", err)
 	}
 
@@ -218,11 +216,17 @@ func (c *Client) processPayloadForUpload(tableName, payloadStr string) (json.Raw
 	if tableInfo.PrimaryKey != nil {
 		pkColLower = strings.ToLower(tableInfo.PrimaryKey.Name)
 	}
+	if err := c.normalizeConfiguredNumericPayloadForWire(tableName, payloadData, tableInfo); err != nil {
+		return nil, err
+	}
 	for _, col := range tableInfo.Columns {
+		colNameLower := strings.ToLower(col.Name)
+		if payloadData[colNameLower] == nil {
+			continue
+		}
 		if !col.IsBlob() {
 			continue
 		}
-		colNameLower := strings.ToLower(col.Name)
 		hexValue, ok := payloadData[colNameLower].(string)
 		if !ok || hexValue == "" {
 			continue
@@ -260,9 +264,47 @@ func (c *Client) processPayloadForUpload(tableName, payloadStr string) (json.Raw
 		payloadData[colNameLower] = base64.StdEncoding.EncodeToString(hexBytes)
 	}
 
-	processedBytes, err := json.Marshal(payloadData)
+	processedBytes, err := jcs.Marshal(payloadData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal processed payload: %w", err)
 	}
 	return processedBytes, nil
+}
+
+func (c *Client) normalizeConfiguredNumericPayloadForWire(tableName string, payloadData map[string]any, tableInfo *TableInfo) error {
+	for _, col := range tableInfo.Columns {
+		colNameLower := strings.ToLower(col.Name)
+		if payloadData[colNameLower] == nil {
+			continue
+		}
+		kind, configured := c.numericKindForColumn(tableName, col.Name)
+		if !configured {
+			continue
+		}
+		switch kind {
+		case wirevalue.NumericKindExactInt64:
+			var raw string
+			switch value := payloadData[colNameLower].(type) {
+			case string:
+				raw = value
+			case json.Number:
+				raw = value.String()
+			default:
+				return fmt.Errorf("exact-int64 column %s must be a SQLite integer or canonical string", col.Name)
+			}
+			if _, err := wirevalue.ParseInt64(raw); err != nil {
+				return fmt.Errorf("invalid exact int64 in column %s: %w", col.Name, err)
+			}
+			payloadData[colNameLower] = raw
+		case wirevalue.NumericKindExactDecimal:
+			raw, ok := payloadData[colNameLower].(string)
+			if !ok {
+				return fmt.Errorf("exact-decimal column %s must be a JSON string", col.Name)
+			}
+			if err := wirevalue.ValidateDecimal(raw); err != nil {
+				return fmt.Errorf("invalid exact decimal in column %s: %w", col.Name, err)
+			}
+		}
+	}
+	return nil
 }

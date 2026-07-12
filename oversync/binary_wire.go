@@ -35,30 +35,49 @@ func (s *SyncService) normalizePushPayloadFields(schemaName, tableName string, p
 				return &PushValidationError{Message: fmt.Sprintf("payload binary field %s.%s.%s must be valid base64", schemaName, tableName, columnName)}
 			}
 			payloadObject[columnName] = "\\x" + hex.EncodeToString(decodedValue)
-		case "int8":
+		case "int2", "int4", "int8":
 			raw, ok := rawValue.(string)
 			if !ok {
-				return &PushValidationError{Message: fmt.Sprintf("payload exact-int64 field %s.%s.%s must be a JSON string", schemaName, tableName, columnName)}
+				return numericPushValidationError(schemaName, tableName, columnName, "canonical signed integer JSON string", "legacy_json_number")
 			}
-			if _, err := wirevalue.ParseInt64(raw); err != nil {
-				return &PushValidationError{Message: fmt.Sprintf("payload exact-int64 field %s.%s.%s is invalid: %v", schemaName, tableName, columnName, err)}
+			value, err := wirevalue.ParseInt64(raw)
+			if err != nil {
+				return numericPushValidationError(schemaName, tableName, columnName, "canonical signed integer JSON string", "invalid_integer")
 			}
-		case "numeric":
+			if !integerFitsPostgresType(value, columnType) {
+				return numericPushValidationError(schemaName, tableName, columnName, "canonical signed integer JSON string", "out_of_range")
+			}
+		case "numeric", "decimal":
 			raw, ok := rawValue.(string)
 			if !ok {
-				return &PushValidationError{Message: fmt.Sprintf("payload exact-decimal field %s.%s.%s must be a JSON string", schemaName, tableName, columnName)}
+				return numericPushValidationError(schemaName, tableName, columnName, "finite decimal JSON string", "legacy_json_number")
 			}
 			if err := wirevalue.ValidateDecimal(raw); err != nil {
-				return &PushValidationError{Message: fmt.Sprintf("payload exact-decimal field %s.%s.%s is invalid: %v", schemaName, tableName, columnName, err)}
+				return numericPushValidationError(schemaName, tableName, columnName, "finite decimal JSON string", "invalid_decimal")
 			}
 		case "float4", "float8":
-			number, ok := rawValue.(json.Number)
+			raw, ok := rawValue.(string)
 			if !ok {
-				return &PushValidationError{Message: fmt.Sprintf("payload approximate field %s.%s.%s must be a JSON number", schemaName, tableName, columnName)}
+				return numericPushValidationError(schemaName, tableName, columnName, "canonical finite binary64 JSON string", "legacy_json_number")
 			}
-			parsed, err := strconv.ParseFloat(number.String(), 64)
-			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
-				return &PushValidationError{Message: fmt.Sprintf("payload approximate field %s.%s.%s must be a finite binary64 value", schemaName, tableName, columnName)}
+			if _, err := wirevalue.ParseFloat64(raw); err != nil {
+				return numericPushValidationError(schemaName, tableName, columnName, "canonical finite binary64 JSON string", "invalid_float")
+			}
+		case "bool":
+			switch raw := rawValue.(type) {
+			case bool:
+				// Direct protocol clients may send a JSON Boolean.
+			case string:
+				switch raw {
+				case "0":
+					payloadObject[columnName] = false
+				case "1":
+					payloadObject[columnName] = true
+				default:
+					return numericPushValidationError(schemaName, tableName, columnName, `JSON Boolean or SQLite ingress string "0"/"1"`, "invalid_boolean_bridge")
+				}
+			default:
+				return numericPushValidationError(schemaName, tableName, columnName, `JSON Boolean or SQLite ingress string "0"/"1"`, "invalid_boolean_bridge")
 			}
 		}
 	}
@@ -100,17 +119,21 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 				payloadObject[columnName] = canonicalValue
 				changed = true
 			}
-		case "int8":
+		case "int2", "int4", "int8":
 			raw, err := exactNumberText(rawValue)
 			if err != nil {
-				return nil, fmt.Errorf("canonicalize exact int64 payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+				return nil, fmt.Errorf("canonicalize integer payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
 			}
-			if _, err := wirevalue.ParseInt64(raw); err != nil {
-				return nil, fmt.Errorf("canonicalize exact int64 payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			value, err := wirevalue.ParseInt64(raw)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalize integer payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			if !integerFitsPostgresType(value, columnType) {
+				return nil, fmt.Errorf("canonicalize integer payload for %s.%s.%s: value is outside PostgreSQL %s range", schemaName, tableName, columnName, columnType)
 			}
 			payloadObject[columnName] = raw
 			changed = true
-		case "numeric":
+		case "numeric", "decimal":
 			raw, err := exactNumberText(rawValue)
 			if err != nil {
 				return nil, fmt.Errorf("canonicalize exact decimal payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
@@ -120,6 +143,28 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 			}
 			payloadObject[columnName] = raw
 			changed = true
+		case "float4", "float8":
+			raw, err := exactNumberText(rawValue)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalize floating payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			value, err := parseDatabaseFloat(raw)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalize floating payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			if columnType == "float4" {
+				value = float64(float32(value))
+			}
+			canonical, err := wirevalue.RenderFloat64(value)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalize floating payload for %s.%s.%s: %w", schemaName, tableName, columnName, err)
+			}
+			payloadObject[columnName] = canonical
+			changed = true
+		case "bool":
+			if _, ok := rawValue.(bool); !ok {
+				return nil, fmt.Errorf("canonicalize Boolean payload for %s.%s.%s: expected database Boolean, got %T", schemaName, tableName, columnName, rawValue)
+			}
 		}
 	}
 
@@ -136,6 +181,38 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 		return nil, fmt.Errorf("canonicalize canonical payload for %s.%s: %w", schemaName, tableName, err)
 	}
 	return canonicalPayload, nil
+}
+
+func numericPushValidationError(schemaName, tableName, columnName, expected, category string) error {
+	return &PushValidationError{Message: fmt.Sprintf(
+		"payload field %s.%s.%s must use %s (category=%s)",
+		schemaName,
+		tableName,
+		columnName,
+		expected,
+		category,
+	)}
+}
+
+func integerFitsPostgresType(value int64, columnType string) bool {
+	switch columnType {
+	case "int2":
+		return value >= -32768 && value <= 32767
+	case "int4":
+		return value >= -2147483648 && value <= 2147483647
+	case "int8":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseDatabaseFloat(raw string) (float64, error) {
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
+		return 0, fmt.Errorf("database value must be finite")
+	}
+	return value, nil
 }
 
 func exactNumberText(value any) (string, error) {

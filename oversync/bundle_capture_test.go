@@ -189,6 +189,82 @@ func TestBootstrap_MarkedLayoutPerformsNoRegisteredTriggerDDL(t *testing.T) {
 	require.Equal(t, 3, count, "marked-layout validation must preserve every managed trigger")
 }
 
+func TestBootstrap_ExistingLayoutPreservesDirectWriteAndTruncateGuards(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "fast_attach_guards_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+	config := &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "fast-attach-guards",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}
+	first := newBootstrappedIntegrationService(t, ctx, pool, config, integrationTestLogger(slog.LevelWarn))
+	require.NoError(t, first.Close(ctx))
+	service, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = service.Close(context.Background()) })
+	require.NoError(t, service.Bootstrap(ctx))
+
+	tableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
+	scopeID := "fast-attach-owner-" + suffix
+	mustInitializeEmptyScope(t, ctx, service, scopeID, "seed")
+	directID := uuid.New()
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s (_sync_scope_id, id, name, email)
+		VALUES ($1, $2, 'direct', 'direct@example.com')
+	`, tableIdent), scopeID, directID)
+	require.ErrorContains(t, err, "requires oversync sync bundle context")
+
+	manager := NewScopeManager(service, ScopeManagerConfig{Logger: integrationTestLogger(slog.LevelWarn)})
+	managedID := uuid.New()
+	managedResult, err := manager.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, 'managed', 'managed@example.com')`, tableIdent), managedID)
+		return execErr
+	})
+	require.NoError(t, err)
+	require.NotNil(t, managedResult.Bundle)
+	require.Equal(t, int64(1), managedResult.Bundle.BundleSeq)
+	require.Len(t, managedResult.Bundle.Rows, 1)
+
+	bundleID := uuid.New()
+	require.NoError(t, service.WithinSyncBundle(ctx, Actor{UserID: scopeID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, 'bundle', 'bundle@example.com')`, tableIdent), bundleID)
+		return execErr
+	}))
+
+	for _, statement := range []string{
+		fmt.Sprintf(`UPDATE %s SET name = 'direct update' WHERE id = '%s'`, tableIdent, managedID),
+		fmt.Sprintf(`DELETE FROM %s WHERE id = '%s'`, tableIdent, bundleID),
+	} {
+		_, err = pool.Exec(ctx, statement)
+		require.ErrorContains(t, err, "requires oversync sync bundle context")
+	}
+	_, err = pool.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
+	requireRegisteredTruncateError(t, err, schemaName, "users")
+
+	pull, err := service.ProcessPull(ctx, Actor{UserID: scopeID, SourceID: "reader"}, 0, 10, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), pull.StableBundleSeq)
+	require.Len(t, pull.Bundles, 2)
+	for _, bundle := range pull.Bundles {
+		require.Len(t, bundle.Rows, 1)
+	}
+	var businessRows, bundleRows int
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s WHERE _sync_scope_id = $1`, tableIdent), scopeID).Scan(&businessRows))
+	require.Equal(t, 2, businessRows)
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM sync.bundle_rows AS rows
+		JOIN sync.user_state AS users ON users.user_pk = rows.user_pk
+		WHERE users.user_id = $1
+	`, scopeID).Scan(&bundleRows))
+	require.Equal(t, 2, bundleRows)
+}
+
 type truncateGuardState struct {
 	businessRows      int64
 	rowStateRows      int64

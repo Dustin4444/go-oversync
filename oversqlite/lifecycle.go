@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mobiletoly/go-oversync/internal/sessionid"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -84,8 +85,11 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 	if userID == "" {
 		return AttachResult{}, fmt.Errorf("userID must be provided")
 	}
-	if strings.TrimSpace(c.sourceID) == "" {
+	if c.sourceID == "" {
 		return AttachResult{}, &OpenRequiredError{Operation: "Attach(userID)"}
+	}
+	if err := validateSourceID(c.sourceID); err != nil {
+		return AttachResult{}, err
 	}
 
 	state, err := c.openLocked(ctx)
@@ -94,22 +98,22 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 		return AttachResult{}, err
 	}
 	c.sourceID = state.SourceID
+	if err := c.verifyConnectLifecycleSupported(ctx); err != nil {
+		return AttachResult{}, err
+	}
 
 	if state.PendingTransitionKind == lifecycleTransitionRemote {
-		if strings.TrimSpace(state.PendingTargetScope) != userID || strings.TrimSpace(state.SourceID) != c.sourceID {
+		if strings.TrimSpace(state.PendingTargetScope) != userID || state.SourceID != c.sourceID {
 			return AttachResult{}, &AttachLocalStateConflictError{
-				Reason: fmt.Sprintf("pending remote_replace belongs to scope %q on source %q", state.PendingTargetScope, state.SourceID),
+				Reason: "pending remote_replace belongs to a different scope or source",
 			}
 		}
-		c.UserID = userID
 		restore, err := c.finalizeRemoteReplaceLocked(ctx, state)
 		if err != nil {
 			return AttachResult{}, err
 		}
 		c.pendingInitializationID = ""
-		if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
-			return AttachResult{}, err
-		}
+		c.UserID = userID
 		c.sessionConnected = true
 		status, err := c.syncStatusLocked(ctx)
 		if err != nil {
@@ -149,10 +153,6 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 			RequestedUserID: userID,
 		}
 	}
-	if err := c.verifyConnectLifecycleSupported(ctx); err != nil {
-		return AttachResult{}, err
-	}
-
 	hasPendingRows, err := c.pendingChangeCount(ctx)
 	if err != nil {
 		return AttachResult{}, err
@@ -206,7 +206,6 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 			SyncStatus: status,
 		}, nil
 	case "remote_authoritative":
-		c.UserID = userID
 		if err := c.beginRemoteReplaceLocked(ctx, userID, c.sourceID); err != nil {
 			return AttachResult{}, err
 		}
@@ -219,9 +218,7 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 			return AttachResult{}, err
 		}
 		c.pendingInitializationID = ""
-		if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
-			return AttachResult{}, err
-		}
+		c.UserID = userID
 		c.sessionConnected = true
 		status, err := c.syncStatusLocked(ctx)
 		if err != nil {
@@ -266,7 +263,10 @@ func (c *Client) Detach(ctx context.Context) (DetachResult, error) {
 		return DetachResult{}, err
 	}
 	defer c.writeMu.Unlock()
+	return c.detachLocked(ctx)
+}
 
+func (c *Client) detachLocked(ctx context.Context) (DetachResult, error) {
 	status, err := c.pendingSyncStatusLocked(ctx)
 	if err != nil {
 		return DetachResult{}, err
@@ -310,18 +310,29 @@ func (c *Client) Detach(ctx context.Context) (DetachResult, error) {
 
 // SyncThenDetach runs a bounded best-effort Sync followed by Detach.
 func (c *Client) SyncThenDetach(ctx context.Context) (SyncThenDetachResult, error) {
+	if err := c.tryBeginSyncOperation(); err != nil {
+		return SyncThenDetachResult{}, err
+	}
+	defer c.writeMu.Unlock()
+	if err := c.ensureConnectedSessionLocked(ctx, "SyncThenDetach()"); err != nil {
+		return SyncThenDetachResult{}, err
+	}
+	if err := c.validateProtocolGateLocked(ctx, "sync_then_detach_capabilities"); err != nil {
+		return SyncThenDetachResult{}, err
+	}
+
 	const maxAttempts = 3
 	var (
 		previousPending int64 = 1<<63 - 1
 		lastSync        SyncReport
 	)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		syncReport, err := c.Sync(ctx)
+		syncReport, err := c.syncLocked(ctx)
 		if err != nil {
 			return SyncThenDetachResult{}, err
 		}
 		lastSync = syncReport
-		detachResult, err := c.Detach(ctx)
+		detachResult, err := c.detachLocked(ctx)
 		if err != nil {
 			return SyncThenDetachResult{}, err
 		}
@@ -333,7 +344,7 @@ func (c *Client) SyncThenDetach(ctx context.Context) (SyncThenDetachResult, erro
 				RemainingPendingRowCount: 0,
 			}, nil
 		}
-		pending, err := c.PendingSyncStatus(ctx)
+		pending, err := c.pendingSyncStatusLocked(ctx)
 		if err != nil {
 			return SyncThenDetachResult{}, err
 		}
@@ -347,7 +358,7 @@ func (c *Client) SyncThenDetach(ctx context.Context) (SyncThenDetachResult, erro
 		}
 		previousPending = pending.PendingRowCount
 	}
-	pending, err := c.PendingSyncStatus(ctx)
+	pending, err := c.pendingSyncStatusLocked(ctx)
 	if err != nil {
 		return SyncThenDetachResult{}, err
 	}
@@ -378,8 +389,11 @@ func (c *Client) SourceInfo(ctx context.Context) (SourceInfo, error) {
 	}
 	defer c.writeMu.Unlock()
 
-	if strings.TrimSpace(c.sourceID) == "" {
+	if c.sourceID == "" {
 		return SourceInfo{}, &OpenRequiredError{Operation: "SourceInfo()"}
+	}
+	if err := validateSourceID(c.sourceID); err != nil {
+		return SourceInfo{}, err
 	}
 	attachment, err := loadAttachmentState(ctx, c.DB)
 	if err != nil {
@@ -415,7 +429,7 @@ func (c *Client) pendingSyncStatusLocked(ctx context.Context) (PendingSyncStatus
 	if err != nil {
 		return PendingSyncStatus{}, err
 	}
-	if strings.TrimSpace(state.PendingInitializationID) != "" {
+	if state.PendingInitializationID != "" {
 		total++
 	}
 	return PendingSyncStatus{
@@ -473,7 +487,7 @@ func (c *Client) UninstallSync(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) loadManagedSyncTablesForUninstall(ctx context.Context, tx *sql.Tx) ([]string, error) {
+func (c *Client) loadManagedSyncTablesForUninstall(ctx context.Context, tx sqliteTransaction) ([]string, error) {
 	tableNames := make([]string, 0, len(c.config.Tables))
 	seen := make(map[string]struct{}, len(c.config.Tables))
 
@@ -522,7 +536,7 @@ func (c *Client) loadManagedSyncTablesForUninstall(ctx context.Context, tx *sql.
 	return tableNames, nil
 }
 
-func sqliteTableExists(ctx context.Context, tx *sql.Tx, tableName string) (bool, error) {
+func sqliteTableExists(ctx context.Context, tx queryRower, tableName string) (bool, error) {
 	var count int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*)
@@ -562,10 +576,14 @@ func (c *Client) connectRequest(ctx context.Context, userID, sourceID string, ha
 		return nil, fmt.Errorf("failed to marshal connect request: %w", err)
 	}
 
-	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "connect_request", http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/sync/connect", reqBody, "application/json")
+	result, err := c.doAuthenticatedBoundedRequestWithRetry(
+		ctx, "connect_request", http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/sync/connect",
+		reqBody, "application/json", snapshotControlBodyLimit, snapshotControlBodyLimit, nil, nil,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send connect request: %w", err)
 	}
+	body, statusCode := result.body, result.statusCode
 	if statusCode == http.StatusNotFound || statusCode == http.StatusMethodNotAllowed || statusCode == http.StatusNotImplemented {
 		return nil, &AttachLifecycleUnsupportedError{Reason: "missing /sync/connect endpoint"}
 	}
@@ -577,7 +595,26 @@ func (c *Client) connectRequest(ctx context.Context, userID, sourceID string, ha
 	if err := json.Unmarshal(body, &connectResp); err != nil {
 		return nil, fmt.Errorf("failed to decode connect response: %w", err)
 	}
+	if err := validateConnectResponse(&connectResp); err != nil {
+		return nil, err
+	}
 	return &connectResp, nil
+}
+
+func validateConnectResponse(resp *oversync.ConnectResponse) error {
+	if resp == nil {
+		return fmt.Errorf("connect response is invalid")
+	}
+	if resp.Resolution == "initialize_local" {
+		if err := sessionid.Validate(resp.InitializationID); err != nil {
+			return fmt.Errorf("connect response initialization_id is invalid")
+		}
+		return nil
+	}
+	if resp.InitializationID != "" {
+		return fmt.Errorf("connect response initialization_id is invalid")
+	}
+	return nil
 }
 
 func (c *Client) persistConnectedLifecycleState(ctx context.Context, userID, initializationID string) error {
@@ -601,11 +638,23 @@ func (c *Client) persistConnectedLifecycleState(ctx context.Context, userID, ini
 	return persistOperationState(ctx, c.DB, &operationStateRecord{Kind: operationKindNone})
 }
 
-func (c *Client) beginRemoteReplaceLocked(ctx context.Context, userID, sourceID string) error {
-	state, err := c.loadLifecycleState(ctx)
+func (c *Client) beginRemoteReplaceLocked(ctx context.Context, userID, sourceID string) (resultErr error) {
+	tx, err := beginImmediateTx(ctx, c.DB)
+	if err != nil {
+		return fmt.Errorf("failed to begin remote_replace guard transaction: %w", err)
+	}
+	defer tx.rollbackOnReturn(&resultErr, "remote_replace guard transaction")
+
+	attachment, err := loadAttachmentState(ctx, tx)
 	if err != nil {
 		return err
 	}
+	operation, err := loadOperationState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	state := toLifecycleState(attachment, operation)
+	state.SourceID = sourceID
 	state.BindingState = lifecycleBindingAnonymous
 	state.BindingScope = ""
 	state.PendingTransitionKind = lifecycleTransitionRemote
@@ -614,8 +663,25 @@ func (c *Client) beginRemoteReplaceLocked(ctx context.Context, userID, sourceID 
 	state.PendingSnapshotBundleSeq = 0
 	state.PendingSnapshotRowCount = 0
 	state.PendingInitializationID = ""
-	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
+	var outboxRows int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboxRows); err != nil {
+		return fmt.Errorf("failed to count outbox rows before remote_replace: %w", err)
+	}
+	outbox, err := loadOutboxBundle(ctx, tx)
+	if err != nil {
 		return err
+	}
+	if outbox.State != outboxStateNone || outboxRows != 0 {
+		return &PendingPushReplayError{OutboundCount: int(outboxRows)}
+	}
+	if err := c.persistLifecycleStateInTx(ctx, tx, state); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_dirty_rows`); err != nil {
+		return fmt.Errorf("failed to discard pre-attach anonymous dirty rows for remote_replace: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit remote_replace guard transaction: %w", err)
 	}
 	return nil
 }
@@ -627,120 +693,64 @@ func (c *Client) finalizeRemoteReplaceLocked(ctx context.Context, state *lifecyc
 	if state.PendingTransitionKind != lifecycleTransitionRemote {
 		return nil, fmt.Errorf("cannot finalize lifecycle transition %q as remote_replace", state.PendingTransitionKind)
 	}
-	refreshedState, err := c.ensureRemoteReplaceSnapshotStagedLocked(ctx, state)
+	limits, err := c.negotiateSnapshotLimits(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.prepareAttachedClientStateForRemoteReplace(ctx, refreshedState.PendingTargetScope, refreshedState.SourceID); err != nil {
+	options := snapshotApplyOptions{
+		FinalizeRemoteReplace: true,
+		RemoteTargetUserID:    state.PendingTargetScope,
+	}
+	guard, err := c.pinSnapshotApplyGuard(ctx, options)
+	if err != nil {
 		return nil, err
 	}
-	session := &oversync.SnapshotSession{
-		SnapshotID:        refreshedState.PendingStagedSnapshotID,
-		SnapshotBundleSeq: refreshedState.PendingSnapshotBundleSeq,
-		RowCount:          refreshedState.PendingSnapshotRowCount,
-	}
-	if err := c.applyStagedSnapshotLocked(ctx, session, snapshotApplyOptions{}); err != nil {
+	options.PinnedGuard = guard
+	if err := c.clearSnapshotStage(ctx); err != nil {
 		return nil, err
 	}
-	return &RestoreSummary{
-		BundleSeq: session.SnapshotBundleSeq,
-		RowCount:  session.RowCount,
-	}, nil
-}
-
-func (c *Client) ensureRemoteReplaceSnapshotStagedLocked(ctx context.Context, state *lifecycleState) (*lifecycleState, error) {
-	if state == nil {
-		return nil, fmt.Errorf("remote_replace lifecycle state is required")
-	}
-	if strings.TrimSpace(state.PendingStagedSnapshotID) != "" {
-		stagedCount, err := c.countSnapshotStageRows(ctx, state.PendingStagedSnapshotID)
-		if err != nil {
-			return nil, err
-		}
-		if stagedCount == state.PendingSnapshotRowCount {
-			return state, nil
-		}
-		if err := c.clearSnapshotStage(ctx); err != nil {
-			return nil, err
-		}
-		state.PendingStagedSnapshotID = ""
-		state.PendingSnapshotBundleSeq = 0
-		state.PendingSnapshotRowCount = 0
-		if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
-			return nil, err
-		}
+	state.PendingStagedSnapshotID = ""
+	state.PendingSnapshotBundleSeq = 0
+	state.PendingSnapshotRowCount = 0
+	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
+		return nil, err
 	}
 
+	startedAt := time.Now()
 	session, err := c.createSnapshotSession(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer c.deleteSnapshotSessionBestEffort(context.Background(), session.SnapshotID)
+	defer c.deleteSnapshotSessionBestEffort(session.SnapshotID)
 
-	if err := c.clearSnapshotStage(ctx); err != nil {
-		return nil, err
-	}
 	state.PendingStagedSnapshotID = session.SnapshotID
 	state.PendingSnapshotBundleSeq = session.SnapshotBundleSeq
 	state.PendingSnapshotRowCount = session.RowCount
 	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
 		return nil, err
 	}
-
-	afterRowOrdinal := int64(0)
-	for {
-		chunk, err := c.fetchSnapshotChunk(ctx, session.SnapshotID, session.SnapshotBundleSeq, afterRowOrdinal, c.snapshotChunkRows())
-		if err != nil {
+	transfer, err := c.downloadSnapshotSession(ctx, session, limits)
+	if err != nil {
+		return nil, err
+	}
+	if c.beforeSnapshotApplyHook != nil {
+		if err := c.beforeSnapshotApplyHook(ctx); err != nil {
 			return nil, err
 		}
-		if err := c.stageSnapshotChunk(ctx, chunk, afterRowOrdinal); err != nil {
-			return nil, err
-		}
-		if !chunk.HasMore {
-			break
-		}
-		afterRowOrdinal = chunk.NextRowOrdinal
 	}
-	return state, nil
-}
-
-func (c *Client) prepareAttachedClientStateForRemoteReplace(ctx context.Context, userID, sourceID string) error {
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin remote_replace attach transaction: %w", err)
+	if err := c.applyStagedSnapshotLocked(ctx, session, options); err != nil {
+		return nil, err
 	}
-	defer tx.Rollback()
-
-	if err := ensureSourceState(ctx, tx, sourceID); err != nil {
-		return err
+	if c.snapshotObserver != nil {
+		c.snapshotObserver(snapshotRestoreObservation{
+			StagedRows: transfer.rows, DeclaredWireBytes: transfer.bytes,
+			AppliedRows: session.RowCount, Duration: time.Since(startedAt),
+		})
 	}
-	attachment, err := loadAttachmentState(ctx, tx)
-	if err != nil {
-		return err
-	}
-	attachment.CurrentSourceID = sourceID
-	attachment.BindingState = attachmentBindingAttached
-	attachment.AttachedUserID = userID
-	attachment.SchemaName = c.config.Schema
-	attachment.LastBundleSeqSeen = 0
-	attachment.RebuildRequired = false
-	attachment.PendingInitializationID = ""
-	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
-		return err
-	}
-	if err := persistOperationState(ctx, tx, &operationStateRecord{
-		Kind:              operationKindRemoteReplace,
-		TargetUserID:      userID,
-		StagedSnapshotID:  "",
-		SnapshotBundleSeq: 0,
-		SnapshotRowCount:  0,
-	}); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit remote_replace attach transaction: %w", err)
-	}
-	return nil
+	return &RestoreSummary{
+		BundleSeq: session.SnapshotBundleSeq,
+		RowCount:  session.RowCount,
+	}, nil
 }
 
 func (c *Client) countSnapshotStageRows(ctx context.Context, snapshotID string) (int64, error) {
@@ -753,8 +763,4 @@ func (c *Client) countSnapshotStageRows(ctx context.Context, snapshotID string) 
 		return 0, fmt.Errorf("failed to count staged snapshot rows: %w", err)
 	}
 	return count, nil
-}
-
-func (c *Client) armDestructiveTransition(ctx context.Context, transitionKind, pendingTargetSourceID string) error {
-	return nil
 }

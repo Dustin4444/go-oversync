@@ -137,7 +137,14 @@ func TestMobileApp_OnDetach_KeepsOfflineWritesPending(t *testing.T) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
 			_ = json.NewEncoder(w).Encode(oversync.CapabilitiesResponse{
-				Features: map[string]bool{"connect_lifecycle": true},
+				ProtocolVersion: oversync.SyncProtocolVersion,
+				Features:        map[string]bool{"connect_lifecycle": true},
+				BundleLimits: oversync.BundleCapabilitiesLimits{
+					DefaultRowsPerSnapshotChunk: 1, MaxRowsPerSnapshotChunk: 1,
+					DefaultBytesPerSnapshotChunk: 1024, MaxBytesPerSnapshotChunk: 1024,
+					MaxBytesPerSnapshotRow: 1024, MaxConcurrentSnapshotBuilds: 8,
+					MaxConcurrentSnapshotChunkRequests: 4,
+				},
 			})
 		case "/sync/connect":
 			_ = json.NewEncoder(w).Encode(oversync.ConnectResponse{Resolution: "initialize_empty"})

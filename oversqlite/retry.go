@@ -9,7 +9,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"strings"
 	"syscall"
 	"time"
 
@@ -25,6 +24,31 @@ type RetryPolicy struct {
 	JitterFraction float64
 }
 
+// SnapshotCapacityRetryPolicy configures elapsed-time retry for server snapshot
+// admission capacity. It is intentionally independent of RetryPolicy so a busy
+// server does not consume the generic transport-attempt budget.
+type SnapshotCapacityRetryPolicy struct {
+	Enabled        bool
+	MaxWait        time.Duration
+	FallbackDelay  time.Duration
+	JitterFraction float64
+}
+
+// SnapshotCapacityRetryExhaustedError reports that snapshot admission remained
+// unavailable for the configured capacity-wait budget.
+type SnapshotCapacityRetryExhaustedError struct {
+	Operation string
+	ErrorCode string
+	Waited    time.Duration
+}
+
+func (e *SnapshotCapacityRetryExhaustedError) Error() string {
+	if e == nil {
+		return "oversqlite snapshot capacity retry exhausted"
+	}
+	return fmt.Sprintf("oversqlite snapshot capacity retry exhausted for %s", e.Operation)
+}
+
 // RetryExhaustedError reports that the configured retry budget was exhausted for an operation.
 type RetryExhaustedError struct {
 	Operation string
@@ -37,34 +61,24 @@ func (e *RetryExhaustedError) Error() string {
 	if e == nil {
 		return "oversqlite retry policy exhausted"
 	}
-	if e.LastErr == nil {
-		return fmt.Sprintf("oversqlite retry policy exhausted for %s after %d attempts", e.Operation, e.Attempts)
-	}
-	return fmt.Sprintf("oversqlite retry policy exhausted for %s after %d attempts: %v", e.Operation, e.Attempts, e.LastErr)
+	return fmt.Sprintf("oversqlite retry policy exhausted for %s after %d attempts", e.Operation, e.Attempts)
 }
 
-// Unwrap returns the last underlying retry failure.
+// Unwrap deliberately does not expose the remote retry failure.
 func (e *RetryExhaustedError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.LastErr
+	return nil
 }
 
 type retryHTTPError struct {
 	Operation  string
 	StatusCode int
-	Message    string
 }
 
 func (e *retryHTTPError) Error() string {
 	if e == nil {
 		return "http request failed"
 	}
-	if strings.TrimSpace(e.Message) == "" {
-		return fmt.Sprintf("%s request returned status %d", e.Operation, e.StatusCode)
-	}
-	return fmt.Sprintf("%s request returned status %d: %s", e.Operation, e.StatusCode, e.Message)
+	return fmt.Sprintf("%s request returned status %d", e.Operation, e.StatusCode)
 }
 
 var defaultRetryPolicy = RetryPolicy{
@@ -75,11 +89,25 @@ var defaultRetryPolicy = RetryPolicy{
 	JitterFraction: 0.2,
 }
 
+var defaultSnapshotCapacityRetryPolicy = SnapshotCapacityRetryPolicy{
+	Enabled:        true,
+	MaxWait:        30 * time.Second,
+	FallbackDelay:  time.Second,
+	JitterFraction: 1,
+}
+
 type normalizedRetryPolicy struct {
 	enabled        bool
 	maxAttempts    int
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
+	jitterFraction float64
+}
+
+type normalizedSnapshotCapacityRetryPolicy struct {
+	enabled        bool
+	maxWait        time.Duration
+	fallbackDelay  time.Duration
 	jitterFraction float64
 }
 
@@ -133,34 +161,40 @@ func normalizeRetryPolicy(policy *RetryPolicy) normalizedRetryPolicy {
 	}
 }
 
-func (c *Client) withRetry(ctx context.Context, operation string, fn func() error) error {
-	policy := c.normalizedRetryPolicy()
-	if !policy.enabled {
-		return fn()
+func (c *Client) normalizedSnapshotCapacityRetryPolicy() normalizedSnapshotCapacityRetryPolicy {
+	if c == nil || c.config == nil || c.config.SnapshotCapacityRetryPolicy == nil {
+		return normalizeSnapshotCapacityRetryPolicy(&defaultSnapshotCapacityRetryPolicy)
 	}
+	return normalizeSnapshotCapacityRetryPolicy(c.config.SnapshotCapacityRetryPolicy)
+}
 
-	attempt := 0
-	backoff := policy.initialBackoff
-	for {
-		attempt++
-		err := fn()
-		if err == nil {
-			return nil
-		}
-		if !isRetryableOperationError(ctx, err) {
-			return err
-		}
-		if attempt >= policy.maxAttempts {
-			return &RetryExhaustedError{
-				Operation: operation,
-				Attempts:  attempt,
-				LastErr:   err,
-			}
-		}
-		if err := waitRetryBackoff(ctx, jitterDuration(backoff, policy.jitterFraction)); err != nil {
-			return err
-		}
-		backoff = nextRetryBackoff(backoff, policy.maxBackoff)
+func normalizeSnapshotCapacityRetryPolicy(policy *SnapshotCapacityRetryPolicy) normalizedSnapshotCapacityRetryPolicy {
+	if policy == nil {
+		policy = &defaultSnapshotCapacityRetryPolicy
+	}
+	if !policy.Enabled {
+		return normalizedSnapshotCapacityRetryPolicy{}
+	}
+	maxWait := policy.MaxWait
+	if maxWait <= 0 {
+		maxWait = defaultSnapshotCapacityRetryPolicy.MaxWait
+	}
+	fallbackDelay := policy.FallbackDelay
+	if fallbackDelay <= 0 {
+		fallbackDelay = defaultSnapshotCapacityRetryPolicy.FallbackDelay
+	}
+	jitter := policy.JitterFraction
+	if jitter < 0 {
+		jitter = 0
+	}
+	if jitter > 1 {
+		jitter = 1
+	}
+	return normalizedSnapshotCapacityRetryPolicy{
+		enabled:        true,
+		maxWait:        maxWait,
+		fallbackDelay:  fallbackDelay,
+		jitterFraction: jitter,
 	}
 }
 
@@ -185,7 +219,6 @@ func withRetryValue[T any](ctx context.Context, policy normalizedRetryPolicy, op
 			return zero, &RetryExhaustedError{
 				Operation: operation,
 				Attempts:  attempt,
-				LastErr:   err,
 			}
 		}
 		if err := waitRetryBackoff(ctx, jitterDuration(backoff, policy.jitterFraction)); err != nil {
@@ -201,6 +234,10 @@ func isRetryableOperationError(ctx context.Context, err error) bool {
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return false
+	}
+	var boundedErr *boundedHTTPFailureError
+	if errors.As(err, &boundedErr) {
+		return boundedErr.retryable
 	}
 	var httpErr *retryHTTPError
 	if errors.As(err, &httpErr) {
@@ -226,10 +263,6 @@ func isRetryableOperationError(ctx context.Context, err error) bool {
 		}
 	}
 
-	errorText := strings.ToLower(err.Error())
-	if strings.Contains(errorText, "connection reset by peer") || strings.Contains(errorText, "broken pipe") {
-		return true
-	}
 	return false
 }
 
@@ -275,81 +308,27 @@ func jitterDuration(base time.Duration, fraction float64) time.Duration {
 	return time.Duration(math.Round(jittered))
 }
 
-type responsePayload struct {
-	body       []byte
-	statusCode int
-}
-
-func (c *Client) doAuthenticatedRequest(ctx context.Context, method, endpoint string, body []byte, contentType string) ([]byte, int, error) {
-	var bodyReader io.Reader
-	if len(body) > 0 {
-		bodyReader = strings.NewReader(string(body))
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
-	if err != nil {
-		return nil, 0, err
-	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	if strings.TrimSpace(contentType) != "" {
-		httpReq.Header.Set("Content-Type", contentType)
-	}
-	c.applyAuthenticatedSyncHeaders(httpReq, token)
-
-	resp, err := c.HTTP.Do(httpReq)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-
-	responseBody, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return nil, 0, readErr
-	}
-	return responseBody, resp.StatusCode, nil
-}
-
-func (c *Client) applyAuthenticatedSyncHeaders(httpReq *http.Request, token string) {
+func (c *Client) applyAuthenticatedSyncHeaders(httpReq *http.Request, token string) error {
 	if httpReq == nil {
-		return
+		return nil
 	}
 	sourceID := ""
 	if c != nil {
 		sourceID = c.sourceID
 	}
-	applyAuthenticatedSyncHeadersWithSourceID(httpReq, token, sourceID)
+	return applyAuthenticatedSyncHeadersWithSourceID(httpReq, token, sourceID)
 }
 
-func applyAuthenticatedSyncHeadersWithSourceID(httpReq *http.Request, token string, sourceID string) {
+func applyAuthenticatedSyncHeadersWithSourceID(httpReq *http.Request, token string, sourceID string) error {
 	if httpReq == nil {
-		return
+		return nil
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
-	sourceID = strings.TrimSpace(sourceID)
+	if err := validateOptionalSourceID(sourceID); err != nil {
+		return err
+	}
 	if sourceID != "" {
 		httpReq.Header.Set(oversync.SourceIDHeader, sourceID)
 	}
-}
-
-func (c *Client) doAuthenticatedRequestWithRetry(ctx context.Context, operation, method, endpoint string, body []byte, contentType string) ([]byte, int, error) {
-	result, err := withRetryValue(ctx, c.normalizedRetryPolicy(), operation, func() (responsePayload, error) {
-		responseBody, statusCode, err := c.doAuthenticatedRequest(ctx, method, endpoint, body, contentType)
-		if err != nil {
-			return responsePayload{}, err
-		}
-		if statusCode == http.StatusTooManyRequests || statusCode == http.StatusBadGateway || statusCode == http.StatusServiceUnavailable || statusCode == http.StatusGatewayTimeout {
-			return responsePayload{}, &retryHTTPError{
-				Operation:  operation,
-				StatusCode: statusCode,
-				Message:    decodeServerErrorBody(responseBody),
-			}
-		}
-		return responsePayload{body: responseBody, statusCode: statusCode}, nil
-	})
-	if err != nil {
-		return nil, 0, err
-	}
-	return result.body, result.statusCode, nil
+	return nil
 }

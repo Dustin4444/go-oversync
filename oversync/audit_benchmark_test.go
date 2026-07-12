@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +51,11 @@ func (p auditBenchmarkProfile) String() string {
 func currentAuditBenchmarkProfile(b *testing.B) auditBenchmarkProfile {
 	b.Helper()
 
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(auditBenchmarkProfileEnvironment))) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(auditBenchmarkProfileEnvironment)))
+	if (raw == "full" || raw == "large" || raw == "top") && strings.EqualFold(os.Getenv("GITHUB_ACTIONS"), "true") {
+		b.Fatalf("heavy audit benchmark profile is local-only and must not run in GitHub Actions")
+	}
+	switch raw {
 	case "", "smoke":
 		return auditBenchmarkProfileSmoke
 	case "full":
@@ -110,13 +115,14 @@ func auditBenchmarkFatalOperation(b *testing.B, operation string, timeout time.D
 }
 
 type auditDatabaseBenchmarkFixture struct {
-	ctx              context.Context
-	pool             *pgxpool.Pool
-	svc              *SyncService
-	schemaName       string
-	writer           Actor
-	reader           Actor
-	operationTimeout time.Duration
+	ctx                 context.Context
+	pool                *pgxpool.Pool
+	svc                 *SyncService
+	schemaName          string
+	writer              Actor
+	reader              Actor
+	operationTimeout    time.Duration
+	postgresContainerID string
 }
 
 func newAuditDatabaseBenchmarkFixture(b *testing.B, scenario string) *auditDatabaseBenchmarkFixture {
@@ -229,15 +235,20 @@ func newAuditDatabaseBenchmarkFixture(b *testing.B, scenario string) *auditDatab
 		b.Fatalf("unexpected benchmark connect resolution %q", connect.Resolution)
 	}
 
-	return &auditDatabaseBenchmarkFixture{
-		ctx:              ctx,
-		pool:             pool,
-		svc:              svc,
-		schemaName:       schemaName,
-		writer:           writer,
-		reader:           Actor{UserID: userID, SourceID: "reader"},
-		operationTimeout: operationTimeout,
+	fixture := &auditDatabaseBenchmarkFixture{
+		ctx:                 ctx,
+		pool:                pool,
+		svc:                 svc,
+		schemaName:          schemaName,
+		writer:              writer,
+		reader:              Actor{UserID: userID, SourceID: "reader"},
+		operationTimeout:    operationTimeout,
+		postgresContainerID: "",
 	}
+	if managedServer != nil {
+		fixture.postgresContainerID = managedServer.containerID
+	}
+	return fixture
 }
 
 type auditBenchmarkPayloadShape struct {
@@ -789,6 +800,9 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 				requiredProfile = auditBenchmarkProfileTop
 			}
 			requireAuditBenchmarkProfile(b, requiredProfile)
+			if b.N != 1 {
+				b.Fatalf("run this audit benchmark with -benchtime=1x; b.N=%d", b.N)
+			}
 			fixture := newAuditDatabaseBenchmarkFixture(b, fmt.Sprintf("snapshot_%d", rowCount))
 
 			seedStartedAt := time.Now()
@@ -805,6 +819,25 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 			}
 			b.Logf("COPY-seeded snapshot authoritative rows=%d in %s", rowCount, seedElapsed)
 
+			var snapshotTableBytesBefore int64
+			if err := fixture.pool.QueryRow(fixture.ctx, `SELECT pg_total_relation_size('sync.snapshot_session_rows')`).Scan(&snapshotTableBytesBefore); err != nil {
+				b.Fatalf("measure snapshot row table bytes before materialization: %v", err)
+			}
+			var snapshotWALStart string
+			if err := fixture.pool.QueryRow(fixture.ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&snapshotWALStart); err != nil {
+				b.Fatalf("read snapshot materialization starting WAL LSN: %v", err)
+			}
+			var snapshotTableBytesAfterCreate int64
+			var snapshotWALBytesAfterCreate float64
+
+			runtime.GC()
+			var before runtime.MemStats
+			runtime.ReadMemStats(&before)
+			highWater := startAuditGoMemoryHighWater()
+			postgresMemory, err := startAuditContainerMemoryHighWater(fixture.postgresContainerID)
+			if err != nil {
+				b.Fatalf("start PostgreSQL container memory sampler: %v", err)
+			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -820,6 +853,21 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 				if session.RowCount != int64(rowCount) {
 					b.Fatalf("snapshot materialized %d rows, want %d", session.RowCount, rowCount)
 				}
+				if err := fixture.pool.QueryRow(fixture.ctx, `
+					SELECT pg_total_relation_size('sync.snapshot_session_rows'),
+					       pg_wal_lsn_diff(pg_current_wal_lsn(), $1::pg_lsn)
+				`, snapshotWALStart).Scan(&snapshotTableBytesAfterCreate, &snapshotWALBytesAfterCreate); err != nil {
+					b.Fatalf("measure snapshot materialization storage: %v", err)
+				}
+				chunkCtx, cancelChunk := context.WithTimeout(fixture.ctx, fixture.operationTimeout)
+				chunk, chunkErr := fixture.svc.GetSnapshotChunk(chunkCtx, fixture.reader, session.SnapshotID, 0, fixture.svc.maxRowsPerSnapshotChunk(), fixture.svc.maxBytesPerSnapshotChunk())
+				cancelChunk()
+				if chunkErr != nil {
+					auditBenchmarkFatalOperation(b, "select snapshot chunk", fixture.operationTimeout, chunkErr)
+				}
+				if rowCount > 0 && len(chunk.Rows) == 0 {
+					b.Fatal("non-empty snapshot returned empty first chunk")
+				}
 
 				deleteCtx, cancelDelete := context.WithTimeout(fixture.ctx, fixture.operationTimeout)
 				deleteErr := fixture.svc.DeleteSnapshotSession(deleteCtx, fixture.reader, session.SnapshotID)
@@ -830,6 +878,19 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 				b.StartTimer()
 			}
 			b.StopTimer()
+			maxHeap, maxInUse := highWater.finish()
+			postgresBaseline, postgresPeak, postgresMemoryErr := postgresMemory.finish()
+			if postgresMemoryErr != nil {
+				b.Fatalf("sample PostgreSQL container memory: %v", postgresMemoryErr)
+			}
+			peakHeapDelta := uint64(0)
+			if maxHeap > before.HeapAlloc {
+				peakHeapDelta = maxHeap - before.HeapAlloc
+			}
+			peakInUseDelta := uint64(0)
+			if maxInUse > before.HeapInuse {
+				peakInUseDelta = maxInUse - before.HeapInuse
+			}
 
 			b.ReportMetric(float64(rowCount), "rows/op")
 			if seedRowsPerSecond > 0 {
@@ -838,6 +899,34 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 			if elapsed := b.Elapsed().Seconds(); elapsed > 0 {
 				b.ReportMetric(float64(rowCount*b.N)/elapsed, "rows/s")
 			}
+			metrics := fixture.svc.snapshotRuntimeMetricsSnapshot()
+			b.ReportMetric(float64(metrics.MaterializationBatchRowsHighWater), "material_batch_rows_high_water")
+			b.ReportMetric(float64(metrics.MaterializationBatchBytesHighWater), "material_batch_bytes_high_water")
+			b.ReportMetric(float64(metrics.MaterializationPageQueries), "material_page_queries")
+			b.ReportMetric(float64(metrics.MaterializationCopyBatches), "material_copy_batches")
+			b.ReportMetric(float64(metrics.ChunkQueries), "chunk_queries")
+			b.ReportMetric(float64(metrics.ChunkRowsHighWater), "chunk_rows_high_water")
+			b.ReportMetric(float64(metrics.ChunkBytesHighWater), "chunk_bytes_high_water")
+			b.ReportMetric(float64(metrics.ChunkRetainedRowsHighWater), "chunk_retained_rows_high_water")
+			b.ReportMetric(float64(before.HeapAlloc), "baseline_heap_B")
+			b.ReportMetric(float64(maxHeap), "peak_heap_B")
+			b.ReportMetric(float64(peakHeapDelta), "peak_heap_delta_B")
+			b.ReportMetric(float64(peakInUseDelta), "peak_heap_inuse_delta_B")
+			b.ReportMetric(float64(postgresBaseline), "postgres_container_baseline_B")
+			b.ReportMetric(float64(postgresPeak), "postgres_container_peak_B")
+			b.ReportMetric(float64(snapshotTableBytesBefore), "snapshot_table_bytes_before")
+			b.ReportMetric(float64(snapshotTableBytesAfterCreate), "snapshot_table_bytes_after_create")
+			b.ReportMetric(snapshotWALBytesAfterCreate, "snapshot_wal_bytes_after_create")
+			b.Logf(
+				"snapshot_create_storage rows=%d table_bytes_before=%d table_bytes_after_create=%d wal_bytes_after_create=%.0f material_page_queries=%d material_copy_batches=%d chunk_queries=%d",
+				rowCount,
+				snapshotTableBytesBefore,
+				snapshotTableBytesAfterCreate,
+				snapshotWALBytesAfterCreate,
+				metrics.MaterializationPageQueries,
+				metrics.MaterializationCopyBatches,
+				metrics.ChunkQueries,
+			)
 		})
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 // BundleChangeEvent is a metadata-only wake-up hint for a newer committed bundle.
@@ -186,6 +187,9 @@ func (s *SyncService) emitBundleChangeNotify(ctx context.Context, tx pgx.Tx, use
 	if !s.bundleChangeWatchEnabled() {
 		return nil
 	}
+	if err := sourceid.ValidateOptional(event.SourceID); err != nil {
+		return fmt.Errorf("bundle change event source_id is invalid: %w", err)
+	}
 	cfg := s.effectiveBundleChangeWatchConfig()
 	payload, err := json.Marshal(bundleChangeNotification{
 		UserPK:         userPK,
@@ -299,6 +303,9 @@ func (s *SyncService) publishBundleChangeNotification(payload string) error {
 	}
 	if notification.UserPK <= 0 || notification.BundleSeq <= 0 {
 		return fmt.Errorf("bundle change notification requires positive user_pk and bundle_seq")
+	}
+	if err := sourceid.ValidateOptional(notification.SourceID); err != nil {
+		return fmt.Errorf("bundle change notification source_id is invalid: %w", err)
 	}
 	s.ensureBundleChangeHub().publish(notification.UserPK, BundleChangeEvent{
 		BundleSeq:      notification.BundleSeq,

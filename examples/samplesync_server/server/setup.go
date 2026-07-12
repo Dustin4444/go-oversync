@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,11 +20,15 @@ import (
 )
 
 type ServerConfig struct {
-	DatabaseURL string
-	JWTSecret   string
-	Logger      *slog.Logger
-	AppName     string
+	DatabaseURL                        string
+	JWTSecret                          string
+	Logger                             *slog.Logger
+	AppName                            string
+	MaxConcurrentSnapshotBuilds        int
+	MaxConcurrentSnapshotChunkRequests int
 }
+
+const maxLoggedBodyBytes = 100_000
 
 type ServerComponents struct {
 	Pool        *pgxpool.Pool
@@ -88,8 +93,10 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	}
 
 	svcCfg := &oversync.ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
+		MaxSupportedSchemaVersion:          1,
+		AppName:                            appName,
+		MaxConcurrentSnapshotBuilds:        config.MaxConcurrentSnapshotBuilds,
+		MaxConcurrentSnapshotChunkRequests: config.MaxConcurrentSnapshotChunkRequests,
 		BundleChangeWatch: oversync.BundleChangeWatchConfig{
 			Enabled: true,
 		},
@@ -99,6 +106,17 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			{Schema: "business", Table: "comment", SyncKeyColumns: []string{"id"}},
 		},
 	}
+	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(
+		svcCfg.MaxConcurrentSnapshotBuilds,
+		svcCfg.MaxConcurrentSnapshotChunkRequests,
+	)
+	if err != nil {
+		pool.Close()
+		cancel()
+		return nil, err
+	}
+	svcCfg.MaxConcurrentSnapshotBuilds = builds
+	svcCfg.MaxConcurrentSnapshotChunkRequests = chunks
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
 		svcCfg.LogStageTimings = true
 	}
@@ -200,6 +218,31 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	}, nil
 }
 
+func configuredSnapshotConcurrencyFromEnv(builds, chunks int) (int, int, error) {
+	parse := func(name string, current int) (int, error) {
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			return current, nil
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return 0, fmt.Errorf("%s must be a positive integer", name)
+		}
+		return parsed, nil
+	}
+
+	var err error
+	builds, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", builds)
+	if err != nil {
+		return 0, 0, err
+	}
+	chunks, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", chunks)
+	if err != nil {
+		return 0, 0, err
+	}
+	return builds, chunks, nil
+}
+
 // BrowserTestCORSMiddleware keeps the example server usable from browser-based demos.
 // It is intentionally permissive because this binary is a local sample server.
 func BrowserTestCORSMiddleware(next http.Handler) http.Handler {
@@ -225,7 +268,7 @@ func LoggingMiddleware(enable bool, next http.Handler, logger *slog.Logger) http
 		}
 		start := time.Now()
 		var bodyLog string
-		if r.Method == http.MethodPost && r.ContentLength > 0 && r.ContentLength < 100_000 {
+		if r.Method == http.MethodPost && r.ContentLength > 0 && r.ContentLength <= maxLoggedBodyBytes {
 			if bodyBytes, err := io.ReadAll(r.Body); err == nil {
 				bodyLog = string(bodyBytes)
 				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -234,10 +277,10 @@ func LoggingMiddleware(enable bool, next http.Handler, logger *slog.Logger) http
 			}
 		}
 		logger.Info("HTTP Request", "method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery, "body", bodyLog)
-		rw := &respCapture{ResponseWriter: w, status: 200}
+		rw := &respCapture{ResponseWriter: w, status: http.StatusOK, limit: maxLoggedBodyBytes}
 		next.ServeHTTP(rw, r)
 		fields := map[string]any{"status": rw.status, "duration": time.Since(start).String()}
-		if (r.URL.Path == "/sync/pull" || strings.HasPrefix(r.URL.Path, "/sync/push-sessions") || strings.HasPrefix(r.URL.Path, "/sync/committed-bundles/")) && len(rw.buf) > 0 && len(rw.buf) < 100_000 {
+		if (r.URL.Path == "/sync/pull" || strings.HasPrefix(r.URL.Path, "/sync/push-sessions") || strings.HasPrefix(r.URL.Path, "/sync/committed-bundles/")) && len(rw.buf) > 0 && !rw.truncated {
 			fields["body"] = string(rw.buf)
 		}
 		// Extra structured logs for dev: push/download summaries and user id
@@ -263,12 +306,26 @@ func LoggingMiddleware(enable bool, next http.Handler, logger *slog.Logger) http
 
 type respCapture struct {
 	http.ResponseWriter
-	status int
-	buf    []byte
+	status    int
+	limit     int
+	buf       []byte
+	truncated bool
 }
 
 func (w *respCapture) WriteHeader(code int) { w.status = code; w.ResponseWriter.WriteHeader(code) }
 func (w *respCapture) Write(b []byte) (int, error) {
-	w.buf = append(w.buf, b...)
-	return w.ResponseWriter.Write(b)
+	n, err := w.ResponseWriter.Write(b)
+	written := b[:n]
+	remaining := w.limit - len(w.buf)
+	if remaining > 0 {
+		captured := len(written)
+		if captured > remaining {
+			captured = remaining
+		}
+		w.buf = append(w.buf, written[:captured]...)
+	}
+	if len(written) > remaining {
+		w.truncated = true
+	}
+	return n, err
 }

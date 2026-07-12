@@ -81,9 +81,9 @@ func TestPayloadExtractor_Int64Field(t *testing.T) {
 
 	extractor, _ := NewPayloadExtractor(payload)
 
-	// Test numeric value
-	if num := extractor.Int64Field("number"); num == nil || *num != 42 {
-		t.Errorf("Expected 42, got %v", num)
+	// Numeric JSON tokens are not a compatibility representation.
+	if num := extractor.Int64Field("number"); num != nil {
+		t.Errorf("Expected nil for numeric JSON token, got %v", num)
 	}
 
 	// Test string number
@@ -135,12 +135,12 @@ func TestPayloadExtractor_BoolField(t *testing.T) {
 	}{
 		{"bool_true", &[]bool{true}[0]},
 		{"bool_false", &[]bool{false}[0]},
-		{"string_true", &[]bool{true}[0]},
-		{"string_false", &[]bool{false}[0]},
+		{"string_true", nil},
+		{"string_false", nil},
 		{"string_1", &[]bool{true}[0]},
 		{"string_0", &[]bool{false}[0]},
-		{"number_1", &[]bool{true}[0]},
-		{"number_0", &[]bool{false}[0]},
+		{"number_1", nil},
+		{"number_0", nil},
 		{"empty_string", nil},
 		{"invalid", nil},
 		{"null_field", nil},
@@ -157,6 +157,32 @@ func TestPayloadExtractor_BoolField(t *testing.T) {
 			if result == nil || *result != *test.expected {
 				t.Errorf("Field %s: expected %v, got %v", test.field, *test.expected, result)
 			}
+		}
+	}
+}
+
+func TestPayloadExtractor_Float64Field(t *testing.T) {
+	payload := []byte(`{
+		"canonical": "1.25",
+		"subnormal": "5e-324",
+		"number": 1.25,
+		"noncanonical": "1.0",
+		"nonfinite": "NaN"
+	}`)
+	extractor, err := NewPayloadExtractor(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if value := extractor.Float64Field("canonical"); value == nil || *value != 1.25 {
+		t.Errorf("canonical float = %v, want 1.25", value)
+	}
+	if value := extractor.Float64Field("subnormal"); value == nil || *value != 5e-324 {
+		t.Errorf("subnormal float = %v, want 5e-324", value)
+	}
+	for _, field := range []string{"number", "noncanonical", "nonfinite"} {
+		if value := extractor.Float64Field(field); value != nil {
+			t.Errorf("%s = %v, want rejection", field, value)
 		}
 	}
 }
@@ -238,7 +264,7 @@ func TestPayloadExtractor_HasField(t *testing.T) {
 func TestNewPayloadExtractorFromMap(t *testing.T) {
 	data := map[string]any{
 		"name": "John",
-		"age":  float64(30), // Use float64 to match JSON unmarshaling behavior
+		"age":  "30",
 	}
 
 	extractor := NewPayloadExtractorFromMap(data)

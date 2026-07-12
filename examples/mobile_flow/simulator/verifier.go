@@ -96,15 +96,19 @@ func (v *DatabaseVerifier) VerifyTypedRowsForUser(ctx context.Context, userID st
 		SELECT COUNT(*)
 		FROM business.typed_rows
 		WHERE _sync_scope_id = $1
-		  AND id = 'typed-null'
+		  AND id = $2
 		  AND name = 'Typed Null'
 		  AND note IS NULL
 		  AND count_value IS NULL
-		  AND enabled_flag = 0
+		  AND small_count IS NULL
+		  AND medium_count IS NULL
+		  AND exact_amount IS NULL
+		  AND enabled_flag = FALSE
 		  AND rating IS NULL
+		  AND float4_value IS NULL
 		  AND data IS NULL
 		  AND created_at IS NULL`
-	if err := v.pool.QueryRow(ctx, nullQuery, userID).Scan(&nullMatches); err != nil {
+	if err := v.pool.QueryRow(ctx, nullQuery, userID, typedNullRowID).Scan(&nullMatches); err != nil {
 		return fmt.Errorf("failed to verify null typed row: %w", err)
 	}
 	if nullMatches != 1 {
@@ -116,15 +120,19 @@ func (v *DatabaseVerifier) VerifyTypedRowsForUser(ctx context.Context, userID st
 		SELECT COUNT(*)
 		FROM business.typed_rows
 		WHERE _sync_scope_id = $1
-		  AND id = 'typed-rich'
+		  AND id = $2
 		  AND name = 'Typed Rich'
 		  AND note = 'second-device'
-		  AND count_value = 42
-		  AND enabled_flag = 1
+		  AND count_value = 9007199254740993
+		  AND small_count = -32768
+		  AND medium_count = 2147483647
+		  AND exact_amount = 12345678901234567890.1234567890::numeric
+		  AND enabled_flag = TRUE
 		  AND abs(rating - 1.25) < 0.000001
+		  AND abs(float4_value - 3.5) < 0.000001
 		  AND encode(data, 'hex') = 'cafebabe'
 		  AND created_at = '2026-03-24T18:42:11Z'::timestamptz`
-	if err := v.pool.QueryRow(ctx, richQuery, userID).Scan(&richMatches); err != nil {
+	if err := v.pool.QueryRow(ctx, richQuery, userID, typedRichRowID).Scan(&richMatches); err != nil {
 		return fmt.Errorf("failed to verify rich typed row: %w", err)
 	}
 	if richMatches != 1 {

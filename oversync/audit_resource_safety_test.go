@@ -228,6 +228,10 @@ func TestAuditResourceSafety_StagedAndSnapshotSessionPressureExpiresAndCleansUp(
 	require.Equal(t, "staging", postCleanup.Status)
 	postCleanupSnapshot, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return fixture.count(t, `SELECT COUNT(*) FROM sync.snapshot_sessions`) == 1 &&
+			fixture.count(t, `SELECT COUNT(*) FROM sync.snapshot_session_rows`) == 1
+	}, 5*time.Second, 10*time.Millisecond)
 	elapsed := time.Since(startedAt)
 
 	require.Equal(t, int64(1), fixture.count(t, `SELECT COUNT(*) FROM sync.push_sessions`))
@@ -315,7 +319,7 @@ func TestAuditResourceSafety_RetainedStorageAndFetchChunksStayWithinConfiguredBo
 	require.NoError(t, err)
 	require.Equal(t, int64(6), snapshot.RowCount)
 	require.Equal(t, int64(6), fixture.count(t, `SELECT COUNT(*) FROM sync.snapshot_session_rows`))
-	snapshotPage, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, snapshot.SnapshotID, 0, 100)
+	snapshotPage, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, snapshot.SnapshotID, 0, 100, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, snapshotPage.Rows, 2)
 	require.True(t, snapshotPage.HasMore)

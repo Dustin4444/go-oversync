@@ -33,7 +33,7 @@ func TestC1JCSCanonicalJSONAndTypedStringRequestHashes(t *testing.T) {
 }
 
 func TestC1UploadMutationAndReplayPreserveTypedExactValues(t *testing.T) {
-	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "exact_rows", SyncKeyColumnName: "id", NumericColumns: map[string]NumericColumnKind{"value": NumericColumnExactDecimal}}}, `
+	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "exact_rows", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE exact_rows (
 			id TEXT PRIMARY KEY NOT NULL,
 			value TEXT NOT NULL,
@@ -57,16 +57,12 @@ func TestC1SQLiteIntegerAndDecimalMapping(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{
 		TableName: "exact_rows", SyncKeyColumnName: "id",
-		NumericColumns: map[string]NumericColumnKind{
-			"min_value": NumericColumnExactInt64,
-			"max_value": NumericColumnExactInt64,
-			"amount":    NumericColumnExactDecimal,
-		},
 	}}, `
 		CREATE TABLE exact_rows (
 			id TEXT PRIMARY KEY NOT NULL,
 			min_value INTEGER NOT NULL,
 			max_value INTEGER NOT NULL,
+			score REAL NOT NULL,
 			amount TEXT NOT NULL
 		)
 	`)
@@ -76,28 +72,45 @@ func TestC1SQLiteIntegerAndDecimalMapping(t *testing.T) {
 		"id":        "n-1",
 		"min_value": "-9223372036854775808",
 		"max_value": "9223372036854775807",
+		"score":     "1",
 		"amount":    "1234567890.123456789",
 	}
 	require.NoError(t, client.upsertRowInTx(ctx, tx, "exact_rows", payload))
-	var minValue, maxValue, amount, minType, maxType, amountType string
+	var minValue, maxValue, amount, minType, maxType, scoreType, amountType string
+	var score float64
 	require.NoError(t, tx.QueryRowContext(ctx, `
-		SELECT CAST(min_value AS TEXT), CAST(max_value AS TEXT), amount,
-		       typeof(min_value), typeof(max_value), typeof(amount)
+		SELECT CAST(min_value AS TEXT), CAST(max_value AS TEXT), score, amount,
+		       typeof(min_value), typeof(max_value), typeof(score), typeof(amount)
 		FROM exact_rows WHERE id = 'n-1'
-	`).Scan(&minValue, &maxValue, &amount, &minType, &maxType, &amountType))
+	`).Scan(&minValue, &maxValue, &score, &amount, &minType, &maxType, &scoreType, &amountType))
 	require.Equal(t, "-9223372036854775808", minValue)
 	require.Equal(t, "9223372036854775807", maxValue)
+	require.Equal(t, 1.0, score)
 	require.Equal(t, "1234567890.123456789", amount)
 	require.Equal(t, "integer", minType)
 	require.Equal(t, "integer", maxType)
+	require.Equal(t, "real", scoreType)
 	require.Equal(t, "text", amountType)
 
 	require.Error(t, client.upsertRowInTx(ctx, tx, "exact_rows", map[string]interface{}{
-		"id": "n-2", "min_value": "1.5", "max_value": "1", "amount": "1",
+		"id": "n-2", "min_value": "1.5", "max_value": "1", "score": "1", "amount": "1",
 	}))
 	var count int
 	require.NoError(t, tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM exact_rows WHERE id = 'n-2'`).Scan(&count))
 	require.Zero(t, count, "unsupported mapping must reject before mutation")
+}
+
+func TestC1SQLiteAffinityEncodesEveryNumericWireValueAsString(t *testing.T) {
+	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "numeric_rows", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE numeric_rows (
+			id TEXT PRIMARY KEY NOT NULL,
+			large_count INTEGER NOT NULL,
+			score REAL NOT NULL
+		)
+	`)
+	wire, err := client.processPayloadForUpload("numeric_rows", `{"id":"n-1","large_count":"9007199254740993","score":-0.0}`)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"id":"n-1","large_count":"9007199254740993","score":"0"}`, string(wire))
 }
 
 func TestC1FreshDurableStateUsesOnlyRevisedContract(t *testing.T) {
@@ -116,5 +129,5 @@ func TestC1FreshDurableStateUsesOnlyRevisedContract(t *testing.T) {
 		found = found || name == "canonical_json_contract"
 	}
 	require.NoError(t, rows.Err())
-	require.True(t, found, "fresh corrected durable state must carry the JCS typed-numeric-string contract marker")
+	require.True(t, found, "fresh corrected durable state must carry the JCS uniform numeric-string contract marker")
 }

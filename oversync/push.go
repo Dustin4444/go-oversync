@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/internal/protocolhash"
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 type PushValidationError struct {
@@ -75,10 +76,6 @@ func computeCanonicalPushRequestHash(rows []PushRequestRow) (string, error) {
 	}
 	hash, _, err := protocolhash.PushRequest(logicalRows)
 	return hash, err
-}
-
-func (s *SyncService) preparePushRows(rows []PushRequestRow) ([]pushPreparedRow, error) {
-	return s.preparePushRowsWithOptions(rows, false)
 }
 
 func (s *SyncService) preparePushRowsPreservingInput(rows []PushRequestRow) ([]pushPreparedRow, error) {
@@ -229,24 +226,6 @@ func (s *SyncService) tableOrderIndex(schemaName, tableName string) int {
 		return idx
 	}
 	return 0
-}
-
-func loadRowStateSnapshot(ctx context.Context, tx pgx.Tx, userPK int64, tableID int32, keyBytes []byte) (*rowStateSnapshot, error) {
-	var state rowStateSnapshot
-	err := tx.QueryRow(ctx, `
-		SELECT bundle_seq, deleted
-		FROM sync.row_state
-		WHERE user_pk = $1
-		  AND table_id = $2
-		  AND key_bytes = $3
-	`, userPK, tableID, keyBytes).Scan(&state.rowVersion, &state.deleted)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("load row state for table_id %d: %w", tableID, err)
-	}
-	return &state, nil
 }
 
 func loadRowStateSnapshots(ctx context.Context, tx pgx.Tx, userPK int64, rows []pushPreparedRow) ([]indexedRowStateSnapshot, error) {
@@ -607,6 +586,9 @@ func (s *SyncService) loadCommittedBundle(ctx context.Context, tx pgx.Tx, userID
 		  AND bundle_seq = $2
 	`, userPK, bundleSeq).Scan(&bundle.BundleSeq, &bundle.SourceID, &bundle.SourceBundleID, &bundle.RowCount, &bundleHash, &bundle.CanonicalRequestHash); err != nil {
 		return nil, fmt.Errorf("load bundle_log %d: %w", bundleSeq, err)
+	}
+	if err := sourceid.Validate(bundle.SourceID); err != nil {
+		return nil, fmt.Errorf("persisted bundle_log source_id is invalid: %w", err)
 	}
 	bundle.BundleHash = renderBundleHash(bundleHash)
 

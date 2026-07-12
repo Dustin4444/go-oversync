@@ -40,8 +40,8 @@ func TestSerializeRowInTx_TypedRows_PreservesNullBlobAndTimestampText(t *testing
 		"name":"Ada",
 		"note":null,
 		"count_value":null,
-		"enabled_flag":1,
-		"rating":6.57111473696007,
+		"enabled_flag":"1",
+		"rating":"6.5711147369600704",
 		"data":null,
 		"created_at":"2026-03-24T10:42:11-08:00"
 	}`, string(payload))
@@ -72,7 +72,7 @@ func TestProcessPayloadForUpload_TypedRows_Base64EncodesBlobAndKeepsNulls(t *tes
 		"name":"Blob Row",
 		"note":null,
 		"count_value":null,
-		"enabled_flag":0,
+		"enabled_flag":"0",
 		"rating":1.25,
 		"data":"001122ff",
 		"created_at":"2026-03-24T18:42:11Z"
@@ -85,6 +85,8 @@ func TestProcessPayloadForUpload_TypedRows_Base64EncodesBlobAndKeepsNulls(t *tes
 	require.Equal(t, "ABEi/w==", decoded["data"])
 	require.Nil(t, decoded["note"])
 	require.Nil(t, decoded["count_value"])
+	require.Equal(t, "0", decoded["enabled_flag"])
+	require.Equal(t, "1.25", decoded["rating"])
 	require.Equal(t, "2026-03-24T18:42:11Z", decoded["created_at"])
 
 	gotBytes, err := base64.StdEncoding.DecodeString(decoded["data"].(string))

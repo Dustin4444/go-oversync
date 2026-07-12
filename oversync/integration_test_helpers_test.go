@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -136,32 +135,6 @@ func resetTestBusinessSchema(ctx context.Context, pool *pgxpool.Pool, schema str
 func resetTestSyncSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS sync CASCADE`); err != nil {
 		return fmt.Errorf("drop sync schema: %w", err)
-	}
-	return nil
-}
-
-func cleanupSyncUser(ctx context.Context, pool *pgxpool.Pool, userID string) error {
-	userPK, err := lookupUserPK(ctx, pool, userID)
-	if err != nil {
-		if strings.Contains(err.Error(), "missing user_state row") {
-			return nil
-		}
-		return err
-	}
-	queries := []string{
-		`DELETE FROM sync.bundle_capture_stage WHERE user_pk = $1`,
-		`DELETE FROM sync.push_sessions WHERE user_pk = $1`,
-		`DELETE FROM sync.source_state WHERE user_pk = $1`,
-		`DELETE FROM sync.bundle_rows WHERE user_pk = $1`,
-		`DELETE FROM sync.bundle_log WHERE user_pk = $1`,
-		`DELETE FROM sync.row_state WHERE user_pk = $1`,
-		`DELETE FROM sync.scope_state WHERE user_pk = $1`,
-		`DELETE FROM sync.user_state WHERE user_pk = $1`,
-	}
-	for _, q := range queries {
-		if _, err := pool.Exec(ctx, q, userPK); err != nil {
-			return err
-		}
 	}
 	return nil
 }

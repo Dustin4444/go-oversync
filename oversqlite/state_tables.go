@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"github.com/mobiletoly/go-oversync/internal/sessionid"
 )
 
 const (
@@ -86,6 +88,12 @@ func loadAttachmentState(ctx context.Context, q queryRower) (*attachmentStateRec
 		return nil, fmt.Errorf("failed to load attachment state: %w", err)
 	}
 	rec.RebuildRequired = rebuildRequired == 1
+	if err := validateOptionalSourceID(rec.CurrentSourceID); err != nil {
+		return nil, fmt.Errorf("persisted attachment source id is invalid: %w", err)
+	}
+	if err := sessionid.ValidateOptional(rec.PendingInitializationID); err != nil {
+		return nil, fmt.Errorf("persisted attachment initialization id is invalid: %w", err)
+	}
 	if strings.TrimSpace(rec.BindingState) == "" {
 		rec.BindingState = attachmentBindingAnonymous
 	}
@@ -95,6 +103,12 @@ func loadAttachmentState(ctx context.Context, q queryRower) (*attachmentStateRec
 func persistAttachmentState(ctx context.Context, e execer, rec *attachmentStateRecord) error {
 	if rec == nil {
 		return fmt.Errorf("attachment state is required")
+	}
+	if err := validateOptionalSourceID(rec.CurrentSourceID); err != nil {
+		return fmt.Errorf("attachment source id is invalid: %w", err)
+	}
+	if err := sessionid.ValidateOptional(rec.PendingInitializationID); err != nil {
+		return fmt.Errorf("attachment initialization id is invalid: %w", err)
 	}
 	rebuildRequired := 0
 	if rec.RebuildRequired {
@@ -128,12 +142,18 @@ func loadOperationState(ctx context.Context, q queryRower) (*operationStateRecor
 	if strings.TrimSpace(rec.Kind) == "" {
 		rec.Kind = operationKindNone
 	}
+	if err := validateOptionalSourceID(rec.ReplacementSourceID); err != nil {
+		return nil, fmt.Errorf("persisted operation replacement source id is invalid: %w", err)
+	}
 	return &rec, nil
 }
 
 func persistOperationState(ctx context.Context, e execer, rec *operationStateRecord) error {
 	if rec == nil {
 		return fmt.Errorf("operation state is required")
+	}
+	if err := validateOptionalSourceID(rec.ReplacementSourceID); err != nil {
+		return fmt.Errorf("operation replacement source id is invalid: %w", err)
 	}
 	if strings.TrimSpace(rec.Kind) == "" {
 		rec.Kind = operationKindNone
@@ -155,7 +175,9 @@ func persistOperationState(ctx context.Context, e execer, rec *operationStateRec
 }
 
 func ensureSourceState(ctx context.Context, e execer, sourceID string) error {
-	sourceID = strings.TrimSpace(sourceID)
+	if err := validateOptionalSourceID(sourceID); err != nil {
+		return err
+	}
 	if sourceID == "" {
 		return nil
 	}
@@ -164,15 +186,14 @@ func ensureSourceState(ctx context.Context, e execer, sourceID string) error {
 		VALUES(?, 1, '')
 		ON CONFLICT(source_id) DO NOTHING
 	`, sourceID); err != nil {
-		return fmt.Errorf("failed to ensure source state for %s: %w", sourceID, err)
+		return fmt.Errorf("failed to ensure source state: %w", err)
 	}
 	return nil
 }
 
 func loadSourceState(ctx context.Context, q queryRower, sourceID string) (*sourceStateRecord, error) {
-	sourceID = strings.TrimSpace(sourceID)
-	if sourceID == "" {
-		return nil, fmt.Errorf("sourceID must be provided")
+	if err := validateSourceID(sourceID); err != nil {
+		return nil, err
 	}
 	var rec sourceStateRecord
 	if err := q.QueryRowContext(ctx, `
@@ -185,10 +206,19 @@ func loadSourceState(ctx context.Context, q queryRower, sourceID string) (*sourc
 		}
 		return nil, fmt.Errorf("failed to load source state: %w", err)
 	}
+	if err := validateSourceID(rec.SourceID); err != nil {
+		return nil, fmt.Errorf("persisted source state id is invalid: %w", err)
+	}
+	if err := validateOptionalSourceID(rec.ReplacedBySourceID); err != nil {
+		return nil, fmt.Errorf("persisted replacement source id is invalid: %w", err)
+	}
 	return &rec, nil
 }
 
 func updateSourceNextBundleID(ctx context.Context, e execer, sourceID string, nextSourceBundleID int64) error {
+	if err := validateSourceID(sourceID); err != nil {
+		return err
+	}
 	if _, err := e.ExecContext(ctx, `
 		UPDATE _sync_source_state
 		SET next_source_bundle_id = CASE
@@ -203,6 +233,12 @@ func updateSourceNextBundleID(ctx context.Context, e execer, sourceID string, ne
 }
 
 func markSourceReplaced(ctx context.Context, e execer, sourceID, replacedBySourceID string) error {
+	if err := validateSourceID(sourceID); err != nil {
+		return err
+	}
+	if err := validateSourceID(replacedBySourceID); err != nil {
+		return err
+	}
 	if _, err := e.ExecContext(ctx, `
 		UPDATE _sync_source_state
 		SET replaced_by_source_id = ?
@@ -234,12 +270,24 @@ func loadOutboxBundle(ctx context.Context, q queryRower) (*outboxBundleRecord, e
 	if strings.TrimSpace(rec.State) == "" {
 		rec.State = outboxStateNone
 	}
+	if err := validateOptionalSourceID(rec.SourceID); err != nil {
+		return nil, fmt.Errorf("persisted outbox source id is invalid: %w", err)
+	}
+	if err := sessionid.ValidateOptional(rec.InitializationID); err != nil {
+		return nil, fmt.Errorf("persisted outbox initialization id is invalid: %w", err)
+	}
 	return &rec, nil
 }
 
 func persistOutboxBundle(ctx context.Context, e execer, rec *outboxBundleRecord) error {
 	if rec == nil {
 		return fmt.Errorf("outbox bundle is required")
+	}
+	if err := validateOptionalSourceID(rec.SourceID); err != nil {
+		return fmt.Errorf("outbox source id is invalid: %w", err)
+	}
+	if err := sessionid.ValidateOptional(rec.InitializationID); err != nil {
+		return fmt.Errorf("outbox initialization id is invalid: %w", err)
 	}
 	if strings.TrimSpace(rec.State) == "" {
 		rec.State = outboxStateNone
@@ -263,18 +311,6 @@ func persistOutboxBundle(ctx context.Context, e execer, rec *outboxBundleRecord)
 
 func clearOutboxBundle(ctx context.Context, e execer) error {
 	return persistOutboxBundle(ctx, e, &outboxBundleRecord{})
-}
-
-func loadApplyMode(ctx context.Context, q queryRower) (int, error) {
-	var applyMode int
-	if err := q.QueryRowContext(ctx, `
-		SELECT apply_mode
-		FROM _sync_apply_state
-		WHERE singleton_key = 1
-	`).Scan(&applyMode); err != nil {
-		return 0, fmt.Errorf("failed to load apply state: %w", err)
-	}
-	return applyMode, nil
 }
 
 func setApplyMode(ctx context.Context, e execer, enabled bool) error {

@@ -3,7 +3,6 @@ package oversqlite
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 func (c *Client) syncStatusLocked(ctx context.Context) (SyncStatus, error) {
@@ -24,7 +23,7 @@ func (c *Client) syncStatusLocked(ctx context.Context) (SyncStatus, error) {
 	}
 	authority := AuthorityStatusAuthoritativeMaterialized
 	switch {
-	case strings.TrimSpace(attachment.PendingInitializationID) != "":
+	case attachment.PendingInitializationID != "":
 		authority = AuthorityStatusPendingLocalSeed
 	case liveStructuredRows == 0:
 		authority = AuthorityStatusAuthoritativeEmpty

@@ -66,7 +66,7 @@ go run . --scenario=watch-server-unsupported-fallback
 go run . --scenario=watch-idle-cleanup
 go run . --scenario=watch-many-clients-converge
 go run . --scenario=bundle-fk-atomicity
-go run . --scenario=complex-multi-batch --cleanup=true --verbose
+go run . --scenario=complex-multi-batch --verbose
 go run . --scenario=all
 ```
 
@@ -75,7 +75,6 @@ Useful flags:
 - `--server=http://127.0.0.1:8080`
 - `--db=postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable`
 - `--parallel=10`
-- `--cleanup=true`
 - `--verbose`
 
 ## Implemented Scenarios

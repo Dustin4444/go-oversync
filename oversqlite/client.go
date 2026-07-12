@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,30 +30,32 @@ import (
 
 // Client manages SQLite database and two-way sync operations
 type Client struct {
-	DB                 *sql.DB
-	BaseURL            string
-	Token              func(context.Context) (string, error) // returns JWT
-	UserID             string
-	Resolver           Resolver
-	HTTP               *http.Client
-	config             *Config
-	logger             *slog.Logger
-	writeMu            sync.Mutex // Serialize write operations to prevent SQLite locking issues
-	pkByTable          map[string]string
-	keyByTable         map[string][]string
-	numericKindByTable map[string]map[string]wirevalue.NumericKind
-	tableOrder         map[string]int
-	tableInfo          *TableInfoProvider
-	closed             uint32
+	DB         *sql.DB
+	BaseURL    string
+	Token      func(context.Context) (string, error) // returns JWT
+	UserID     string
+	Resolver   Resolver
+	HTTP       *http.Client
+	config     *Config
+	logger     *slog.Logger
+	writeMu    sync.Mutex // Serialize write operations to prevent SQLite locking issues
+	pkByTable  map[string]string
+	keyByTable map[string][]string
+	tableOrder map[string]int
+	tableInfo  *TableInfoProvider
+	closed     uint32
 
 	// Pause switches (atomic): allow callers to suspend sync activity deterministically
 	uploadPaused            int32
 	downloadPaused          int32
 	snapshotStats           snapshotTransferStats
+	snapshotObserver        func(snapshotRestoreObservation)
 	pushStats               pushTransferStats
 	beforePushFreezeHook    func(context.Context) error
 	beforePushCommitHook    func(context.Context) error
 	beforePushReplayHook    func(context.Context) error
+	beforeSnapshotApplyHook func(context.Context) error
+	afterSnapshotRowsHook   func()
 	dbOwnershipKey          string
 	pendingInitializationID string
 	sessionConnected        bool
@@ -101,14 +102,39 @@ var activeClientDBOwnership = struct {
 }
 
 type snapshotTransferStats struct {
-	sessionsCreated int64
-	chunksFetched   int64
+	sessionsCreated          int64
+	chunksFetched            int64
+	maxChunkRows             int64
+	maxChunkWireBytes        int64
+	maxChunkDecodedBodyBytes int64
+	maxLiveStagedApplyRows   int64
+	maxLiveStagedApplyText   int64
+	maxAppliedInMemoryRows   int64
+	capacityResponses        int64
+	capacityRetries          int64
+	capacityWaitNanos        int64
 }
 
 // SnapshotTransferStats exposes snapshot-session transfer counters for diagnostics.
 type SnapshotTransferStats struct {
-	SessionsCreated int64
-	ChunksFetched   int64
+	SessionsCreated             int64
+	ChunksFetched               int64
+	MaxChunkRows                int64
+	MaxChunkWireBytes           int64
+	MaxChunkDecodedBodyBytes    int64
+	MaxLiveStagedApplyRows      int64
+	MaxLiveStagedApplyTextBytes int64
+	MaxAppliedInMemoryRows      int64
+	CapacityResponses           int64
+	CapacityRetries             int64
+	CapacityWait                time.Duration
+}
+
+type snapshotRestoreObservation struct {
+	StagedRows        int64
+	DeclaredWireBytes int64
+	AppliedRows       int64
+	Duration          time.Duration
 }
 
 type pushTransferStats struct {
@@ -255,21 +281,7 @@ type SyncTable struct {
 	TableName         string   // Table name (e.g., "users", "posts")
 	SyncKeyColumnName string   // Single-column convenience field for the current supported envelope
 	SyncKeyColumns    []string // Ordered sync key columns for the bundle-based runtime
-	// NumericColumns declares columns whose wire representation differs from
-	// ordinary JSON values. ExactInt64 and ExactDecimal are JSON strings;
-	// Approximate is a JCS binary64 number.
-	NumericColumns map[string]NumericColumnKind
 }
-
-// NumericColumnKind defines the Oversqlite wire and SQLite binding contract for
-// one numeric business column.
-type NumericColumnKind string
-
-const (
-	NumericColumnExactInt64   NumericColumnKind = "exact_int64"
-	NumericColumnExactDecimal NumericColumnKind = "exact_decimal"
-	NumericColumnApproximate  NumericColumnKind = "approximate"
-)
 
 type BundleChangeWatchMode string
 
@@ -280,16 +292,18 @@ const (
 
 // Config holds configuration for the SQLite sync client
 type Config struct {
-	Schema                string                // e.g., "app"
-	Tables                []SyncTable           // Table configurations with explicit primary key columns
-	UploadLimit           int                   // e.g., 200 rows per push chunk
-	DownloadLimit         int                   // e.g., 1000
-	SnapshotChunkRows     int                   // e.g., 1000
-	BackoffMin            time.Duration         // 1s
-	BackoffMax            time.Duration         // 60s
-	RetryPolicy           *RetryPolicy          // nil => conservative built-in retry policy; explicit disabled policy turns retries off
-	BundleChangeWatchMode BundleChangeWatchMode // off by default; auto uses /sync/watch only when advertised by server
-	WatchFallbackInterval time.Duration         // 0 => BackoffMax, or 60s when BackoffMax is unset
+	Schema                      string                       // e.g., "app"
+	Tables                      []SyncTable                  // Table configurations with explicit primary key columns
+	UploadLimit                 int                          // e.g., 200 rows per push chunk
+	DownloadLimit               int                          // e.g., 1000
+	SnapshotChunkRows           int                          // e.g., 1000
+	SnapshotChunkBytes          int64                        // e.g., 4 MiB
+	BackoffMin                  time.Duration                // 1s
+	BackoffMax                  time.Duration                // 60s
+	RetryPolicy                 *RetryPolicy                 // nil => conservative built-in retry policy; explicit disabled policy turns retries off
+	SnapshotCapacityRetryPolicy *SnapshotCapacityRetryPolicy // nil => enabled with a 30-second elapsed-time budget
+	BundleChangeWatchMode       BundleChangeWatchMode        // off by default; auto uses /sync/watch only when advertised by server
+	WatchFallbackInterval       time.Duration                // 0 => BackoffMax, or 60s when BackoffMax is unset
 }
 
 // DefaultConfig returns a default configuration for the specified tables.
@@ -302,6 +316,7 @@ func DefaultConfig(schema string, tables []SyncTable) *Config {
 		UploadLimit:           1000,
 		DownloadLimit:         1000,
 		SnapshotChunkRows:     1000,
+		SnapshotChunkBytes:    4 << 20,
 		BackoffMin:            1 * time.Second,
 		BackoffMax:            60 * time.Second,
 		BundleChangeWatchMode: BundleChangeWatchOff,
@@ -326,8 +341,17 @@ func (c *Client) SnapshotTransferDiagnostics() SnapshotTransferStats {
 		return SnapshotTransferStats{}
 	}
 	return SnapshotTransferStats{
-		SessionsCreated: atomic.LoadInt64(&c.snapshotStats.sessionsCreated),
-		ChunksFetched:   atomic.LoadInt64(&c.snapshotStats.chunksFetched),
+		SessionsCreated:             atomic.LoadInt64(&c.snapshotStats.sessionsCreated),
+		ChunksFetched:               atomic.LoadInt64(&c.snapshotStats.chunksFetched),
+		MaxChunkRows:                atomic.LoadInt64(&c.snapshotStats.maxChunkRows),
+		MaxChunkWireBytes:           atomic.LoadInt64(&c.snapshotStats.maxChunkWireBytes),
+		MaxChunkDecodedBodyBytes:    atomic.LoadInt64(&c.snapshotStats.maxChunkDecodedBodyBytes),
+		MaxLiveStagedApplyRows:      atomic.LoadInt64(&c.snapshotStats.maxLiveStagedApplyRows),
+		MaxLiveStagedApplyTextBytes: atomic.LoadInt64(&c.snapshotStats.maxLiveStagedApplyText),
+		MaxAppliedInMemoryRows:      atomic.LoadInt64(&c.snapshotStats.maxAppliedInMemoryRows),
+		CapacityResponses:           atomic.LoadInt64(&c.snapshotStats.capacityResponses),
+		CapacityRetries:             atomic.LoadInt64(&c.snapshotStats.capacityRetries),
+		CapacityWait:                time.Duration(atomic.LoadInt64(&c.snapshotStats.capacityWaitNanos)),
 	}
 }
 
@@ -338,6 +362,23 @@ func (c *Client) ResetSnapshotTransferDiagnostics() {
 	}
 	atomic.StoreInt64(&c.snapshotStats.sessionsCreated, 0)
 	atomic.StoreInt64(&c.snapshotStats.chunksFetched, 0)
+	atomic.StoreInt64(&c.snapshotStats.maxChunkRows, 0)
+	atomic.StoreInt64(&c.snapshotStats.maxChunkWireBytes, 0)
+	atomic.StoreInt64(&c.snapshotStats.maxChunkDecodedBodyBytes, 0)
+	atomic.StoreInt64(&c.snapshotStats.maxLiveStagedApplyRows, 0)
+	atomic.StoreInt64(&c.snapshotStats.maxLiveStagedApplyText, 0)
+	atomic.StoreInt64(&c.snapshotStats.maxAppliedInMemoryRows, 0)
+	atomic.StoreInt64(&c.snapshotStats.capacityResponses, 0)
+	atomic.StoreInt64(&c.snapshotStats.capacityRetries, 0)
+	atomic.StoreInt64(&c.snapshotStats.capacityWaitNanos, 0)
+}
+
+func atomicRecordMax(target *int64, value int64) {
+	for current := atomic.LoadInt64(target); value > current; current = atomic.LoadInt64(target) {
+		if atomic.CompareAndSwapInt64(target, current, value) {
+			return
+		}
+	}
 }
 
 // PushTransferDiagnostics returns cumulative push transfer counters for the current client instance.
@@ -398,6 +439,20 @@ func NewClient(db *sql.DB, baseURL string, tok func(ctx context.Context) (string
 	if config.Schema == "" {
 		return nil, fmt.Errorf("config.Schema must be provided (no default schema)")
 	}
+	if config.SnapshotChunkRows < 0 {
+		return nil, fmt.Errorf("config.SnapshotChunkRows must be positive when provided")
+	}
+	if config.SnapshotChunkBytes < 0 {
+		return nil, fmt.Errorf("config.SnapshotChunkBytes must be positive when provided")
+	}
+	normalizedConfig := *config
+	if normalizedConfig.SnapshotChunkRows == 0 {
+		normalizedConfig.SnapshotChunkRows = 1000
+	}
+	if normalizedConfig.SnapshotChunkBytes == 0 {
+		normalizedConfig.SnapshotChunkBytes = 4 << 20
+	}
+	config = &normalizedConfig
 
 	identity, err := claimClientDBOwnership(db)
 	if err != nil {
@@ -425,21 +480,20 @@ func NewClient(db *sql.DB, baseURL string, tok func(ctx context.Context) (string
 	}
 
 	client = &Client{
-		DB:                 db,
-		BaseURL:            baseURL,
-		Token:              tok,
-		UserID:             "",
-		Resolver:           &ServerWinsResolver{},
-		HTTP:               &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
-		config:             config,
-		logger:             slog.Default(),
-		pkByTable:          validatedTables.pkByTable,
-		keyByTable:         validatedTables.keyByTable,
-		numericKindByTable: validatedTables.numericKindByTable,
-		tableOrder:         validatedTables.tableOrder,
-		tableInfo:          tableInfoProvider,
-		dbOwnershipKey:     identity.Key,
-		sourceID:           "",
+		DB:             db,
+		BaseURL:        baseURL,
+		Token:          tok,
+		UserID:         "",
+		Resolver:       &ServerWinsResolver{},
+		HTTP:           &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
+		config:         config,
+		logger:         slog.Default(),
+		pkByTable:      validatedTables.pkByTable,
+		keyByTable:     validatedTables.keyByTable,
+		tableOrder:     validatedTables.tableOrder,
+		tableInfo:      tableInfoProvider,
+		dbOwnershipKey: identity.Key,
+		sourceID:       "",
 		sourceIDGenerator: func() string {
 			return uuid.NewString()
 		},
@@ -509,16 +563,15 @@ func (c *Client) getTableInfo(tableName string) (*TableInfo, error) {
 	return c.tableInfoProvider().Get(c.DB, strings.ToLower(tableName))
 }
 
-func (c *Client) getTableInfoTx(tx *sql.Tx, tableName string) (*TableInfo, error) {
+func (c *Client) getTableInfoTx(tx tableInfoQueryer, tableName string) (*TableInfo, error) {
 	return c.tableInfoProvider().Get(tx, strings.ToLower(tableName))
 }
 
 type validatedSyncTables struct {
-	pkByTable          map[string]string
-	keyByTable         map[string][]string
-	numericKindByTable map[string]map[string]wirevalue.NumericKind
-	tableOrder         map[string]int
-	tableInfoByKey     map[string]*TableInfo
+	pkByTable      map[string]string
+	keyByTable     map[string][]string
+	tableOrder     map[string]int
+	tableInfoByKey map[string]*TableInfo
 }
 
 func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTable) (*validatedSyncTables, error) {
@@ -527,7 +580,6 @@ func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTa
 	}
 	pkByTable := make(map[string]string, len(tables))
 	keyByTable := make(map[string][]string, len(tables))
-	numericKindByTable := make(map[string]map[string]wirevalue.NumericKind, len(tables))
 	tableInfoByKey := make(map[string]*TableInfo, len(tables))
 	managedTables := make(map[string]struct{}, len(tables))
 	for _, syncTable := range tables {
@@ -563,11 +615,6 @@ func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTa
 
 		pkByTable[tableName] = resolvedPK
 		keyByTable[tableName] = append([]string(nil), keyColumns...)
-		numericKinds, err := validateNumericColumnKinds(syncTable, tableInfo)
-		if err != nil {
-			return nil, err
-		}
-		numericKindByTable[tableName] = numericKinds
 		tableInfoByKey[tableName] = tableInfo
 	}
 	if err := validateManagedForeignKeyClosure(managedTables, tableInfoByKey); err != nil {
@@ -578,64 +625,11 @@ func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTa
 		return nil, err
 	}
 	return &validatedSyncTables{
-		pkByTable:          pkByTable,
-		keyByTable:         keyByTable,
-		numericKindByTable: numericKindByTable,
-		tableOrder:         tableOrder,
-		tableInfoByKey:     tableInfoByKey,
+		pkByTable:      pkByTable,
+		keyByTable:     keyByTable,
+		tableOrder:     tableOrder,
+		tableInfoByKey: tableInfoByKey,
 	}, nil
-}
-
-func validateNumericColumnKinds(syncTable SyncTable, tableInfo *TableInfo) (map[string]wirevalue.NumericKind, error) {
-	result := make(map[string]wirevalue.NumericKind, len(syncTable.NumericColumns))
-	columns := make(map[string]ColumnInfo, len(tableInfo.Columns))
-	for _, column := range tableInfo.Columns {
-		columns[strings.ToLower(column.Name)] = column
-	}
-	for configuredName, configuredKind := range syncTable.NumericColumns {
-		name := strings.ToLower(strings.TrimSpace(configuredName))
-		if name == "" {
-			return nil, fmt.Errorf("table %s numeric column name must not be empty", syncTable.TableName)
-		}
-		column, ok := columns[name]
-		if !ok {
-			return nil, fmt.Errorf("table %s numeric column %s does not exist", syncTable.TableName, configuredName)
-		}
-		if _, exists := result[name]; exists {
-			return nil, fmt.Errorf("table %s numeric column %s is configured more than once", syncTable.TableName, configuredName)
-		}
-		var kind wirevalue.NumericKind
-		switch configuredKind {
-		case NumericColumnExactInt64:
-			kind = wirevalue.NumericKindExactInt64
-			if !column.IsInteger() {
-				return nil, fmt.Errorf("table %s exact-int64 column %s must have SQLite INTEGER affinity", syncTable.TableName, configuredName)
-			}
-		case NumericColumnExactDecimal:
-			kind = wirevalue.NumericKindExactDecimal
-			if !column.IsText() {
-				return nil, fmt.Errorf("table %s exact-decimal column %s must have SQLite TEXT affinity", syncTable.TableName, configuredName)
-			}
-		case NumericColumnApproximate:
-			kind = wirevalue.NumericKindApproximate
-			if !column.IsReal() {
-				return nil, fmt.Errorf("table %s approximate column %s must have SQLite REAL affinity", syncTable.TableName, configuredName)
-			}
-		default:
-			return nil, fmt.Errorf("table %s numeric column %s has unsupported kind %q", syncTable.TableName, configuredName, configuredKind)
-		}
-		result[name] = kind
-	}
-	return result, nil
-}
-
-func (c *Client) numericKindForColumn(tableName, columnName string) (wirevalue.NumericKind, bool) {
-	if c == nil {
-		return "", false
-	}
-	byColumn := c.numericKindByTable[strings.ToLower(strings.TrimSpace(tableName))]
-	kind, ok := byColumn[strings.ToLower(strings.TrimSpace(columnName))]
-	return kind, ok
 }
 
 func validateClientSchemaScope(db *sql.DB, schemaName string) error {
@@ -950,7 +944,7 @@ func initializeDatabase(db *sql.DB) error {
 
 		`CREATE TABLE IF NOT EXISTS _sync_outbox_bundle (
 				singleton_key           INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
-				canonical_json_contract TEXT NOT NULL CHECK (canonical_json_contract = 'jcs_typed_numeric_strings_v0'),
+				canonical_json_contract TEXT NOT NULL CHECK (canonical_json_contract = 'jcs_uniform_numeric_strings_v1'),
 				state                   TEXT NOT NULL DEFAULT 'none' CHECK (state IN ('none', 'prepared', 'committed_remote')),
 				source_id               TEXT NOT NULL DEFAULT '',
 				source_bundle_id        INTEGER NOT NULL DEFAULT 0,
@@ -1027,7 +1021,7 @@ func initializeDatabase(db *sql.DB) error {
 	if _, err := db.Exec(`
 			INSERT INTO _sync_outbox_bundle (
 				singleton_key, canonical_json_contract, state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id, remote_bundle_hash, remote_bundle_seq
-			) VALUES (1, 'jcs_typed_numeric_strings_v0', 'none', '', 0, '', 0, '', '', 0)
+			) VALUES (1, 'jcs_uniform_numeric_strings_v1', 'none', '', 0, '', 0, '', '', 0)
 			ON CONFLICT(singleton_key) DO NOTHING
 		`); err != nil {
 		return fmt.Errorf("failed to initialize outbox bundle row: %w", err)
@@ -1065,6 +1059,17 @@ func (c *Client) PullToStable(ctx context.Context) (RemoteSyncReport, error) {
 		return RemoteSyncReport{}, err
 	}
 	defer c.writeMu.Unlock()
+	if err := c.ensureConnectedSessionLocked(ctx, "PullToStable()"); err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx); err != nil {
+		return RemoteSyncReport{}, err
+	} else if sourceRecoveryErr != nil {
+		return RemoteSyncReport{}, sourceRecoveryErr
+	}
+	if err := c.validateProtocolGateLocked(ctx, "pull_capabilities"); err != nil {
+		return RemoteSyncReport{}, err
+	}
 	return c.pullToStableLocked(ctx)
 }
 
@@ -1077,6 +1082,18 @@ func (c *Client) Sync(ctx context.Context) (SyncReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "Sync()"); err != nil {
 		return SyncReport{}, err
 	}
+	if sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx); err != nil {
+		return SyncReport{}, err
+	} else if sourceRecoveryErr != nil {
+		return SyncReport{}, sourceRecoveryErr
+	}
+	if err := c.validateProtocolGateLocked(ctx, "sync_capabilities"); err != nil {
+		return SyncReport{}, err
+	}
+	return c.syncLocked(ctx)
+}
+
+func (c *Client) syncLocked(ctx context.Context) (SyncReport, error) {
 	if remoteReport, resumed, err := c.resumeRequiredRecoveryLocked(ctx); resumed || err != nil {
 		if err != nil {
 			return SyncReport{}, err
@@ -1124,6 +1141,12 @@ func (c *Client) Rebuild(ctx context.Context) (RemoteSyncReport, error) {
 		return RemoteSyncReport{}, err
 	}
 	defer c.writeMu.Unlock()
+	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if err := c.validateProtocolGateLocked(ctx, "rebuild_capabilities"); err != nil {
+		return RemoteSyncReport{}, err
+	}
 	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
 	if err != nil {
 		return RemoteSyncReport{}, err
@@ -1158,7 +1181,7 @@ func (c *Client) SerializeRow(ctx context.Context, table, pk string) (json.RawMe
 	}
 
 	// Build query with correct primary key column
-	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", quoteIdent(tableLc), quoteIdent(pkColumn))
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", localPayloadSelectList(tableInfo), quoteIdent(tableLc), quoteIdent(pkColumn))
 
 	rows, err := c.DB.Query(query, pkValue)
 	if err != nil {
@@ -1219,7 +1242,7 @@ func (c *Client) SerializeRow(ctx context.Context, table, pk string) (json.RawMe
 		}
 	}
 
-	if err := c.prepareLocalRowForWire(tableLc, row, tableInfo); err != nil {
+	if err := prepareLocalRowPayload(row, tableInfo); err != nil {
 		return nil, err
 	}
 	jsonData, err := jcs.Marshal(row)
@@ -1248,7 +1271,7 @@ func (c *Client) serializeRowInTx(ctx context.Context, tx *sql.Tx, table, pk str
 		return nil, fmt.Errorf("failed to convert primary key for query: %w", err)
 	}
 
-	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", quoteIdent(tableLc), quoteIdent(pkColumn))
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", localPayloadSelectList(tableInfo), quoteIdent(tableLc), quoteIdent(pkColumn))
 	rows, err := tx.QueryContext(ctx, query, pkValue)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query row: %w", err)
@@ -1301,7 +1324,7 @@ func (c *Client) serializeRowInTx(ctx context.Context, tx *sql.Tx, table, pk str
 		}
 	}
 
-	if err := c.prepareLocalRowForWire(tableLc, row, tableInfo); err != nil {
+	if err := prepareLocalRowPayload(row, tableInfo); err != nil {
 		return nil, err
 	}
 	jsonData, err := jcs.Marshal(row)
@@ -1312,42 +1335,28 @@ func (c *Client) serializeRowInTx(ctx context.Context, tx *sql.Tx, table, pk str
 	return json.RawMessage(jsonData), nil
 }
 
-func (c *Client) prepareLocalRowForWire(tableName string, row map[string]interface{}, tableInfo *TableInfo) error {
+func localPayloadSelectList(tableInfo *TableInfo) string {
+	parts := make([]string, 0, len(tableInfo.Columns))
+	for _, col := range tableInfo.Columns {
+		if col.IsInteger() {
+			parts = append(parts, fmt.Sprintf("CAST(%s AS TEXT) AS %s", quoteIdent(col.Name), quoteIdent(col.Name)))
+		} else if col.IsReal() {
+			parts = append(parts, fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE printf('%%!.17g', %s) END AS %s", quoteIdent(col.Name), quoteIdent(col.Name), quoteIdent(col.Name)))
+		} else {
+			parts = append(parts, quoteIdent(col.Name))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func prepareLocalRowPayload(row map[string]interface{}, tableInfo *TableInfo) error {
 	for _, col := range tableInfo.Columns {
 		key := strings.ToLower(col.Name)
 		value := row[key]
 		if value == nil {
 			continue
 		}
-		kind, configured := c.numericKindForColumn(tableName, col.Name)
-		if !configured {
-			if col.IsInteger() {
-				if integer, ok := value.(int64); ok && (integer > 9007199254740991 || integer < -9007199254740991) {
-					return fmt.Errorf("column %s contains an integer outside the JCS exact range; configure it as exact_int64", col.Name)
-				}
-			}
-			continue
-		}
-		switch kind {
-		case wirevalue.NumericKindExactInt64:
-			var raw string
-			switch typed := value.(type) {
-			case int64:
-				raw = strconv.FormatInt(typed, 10)
-			case int:
-				raw = strconv.FormatInt(int64(typed), 10)
-			case string:
-				raw = typed
-			case []byte:
-				raw = string(typed)
-			default:
-				return fmt.Errorf("exact-int64 column %s must be stored as SQLite INTEGER", col.Name)
-			}
-			if _, err := wirevalue.ParseInt64(raw); err != nil {
-				return fmt.Errorf("invalid exact int64 in column %s: %w", col.Name, err)
-			}
-			row[key] = raw
-		case wirevalue.NumericKindExactDecimal:
+		if col.IsInteger() {
 			raw, ok := value.(string)
 			if !ok {
 				if bytes, bytesOK := value.([]byte); bytesOK {
@@ -1355,15 +1364,12 @@ func (c *Client) prepareLocalRowForWire(tableName string, row map[string]interfa
 				}
 			}
 			if !ok {
-				return fmt.Errorf("exact-decimal column %s must be stored as SQLite TEXT", col.Name)
+				return fmt.Errorf("INTEGER column %s must be extracted with SQL CAST AS TEXT", col.Name)
 			}
-			if err := wirevalue.ValidateDecimal(raw); err != nil {
-				return fmt.Errorf("invalid exact decimal in column %s: %w", col.Name, err)
+			if _, err := wirevalue.ParseInt64(raw); err != nil {
+				return fmt.Errorf("invalid INTEGER in column %s: %w", col.Name, err)
 			}
 			row[key] = raw
-		case wirevalue.NumericKindApproximate:
-			// SQLite REAL values are already returned as float64. JCS performs
-			// their standard finite binary64 serialization.
 		}
 	}
 	return nil

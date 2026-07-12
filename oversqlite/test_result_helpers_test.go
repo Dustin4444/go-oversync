@@ -13,13 +13,6 @@ func mustOpen(t *testing.T, client *Client, ctx context.Context) {
 	require.NoError(t, err)
 }
 
-func mustAttach(t *testing.T, client *Client, ctx context.Context, userID string) AttachResult {
-	t.Helper()
-	result, err := client.Attach(ctx, userID)
-	require.NoError(t, err)
-	return result
-}
-
 func mustDetach(t *testing.T, client *Client, ctx context.Context) DetachResult {
 	t.Helper()
 	result, err := client.Detach(ctx)

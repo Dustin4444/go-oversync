@@ -161,7 +161,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CanonicalSessionToken'
       requestBody:
         required: true
         content:
@@ -234,7 +234,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CanonicalSessionToken'
       responses:
         '200':
           description: Push session committed successfully
@@ -297,7 +297,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CanonicalSessionToken'
       responses:
         '204':
           description: Push session deleted successfully
@@ -585,13 +585,27 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Scope is not initialized enough for snapshot creation, the replacement source conflicts with durable state, or the previous source was already retired (`scope_uninitialized`, `scope_initializing`, `source_replacement_invalid`, or `source_retired`)
+          description: Scope or replacement state conflicts with snapshot creation, or a materialized snapshot exceeds a configured row, row-byte, or session-byte limit (`scope_uninitialized`, `scope_initializing`, `source_replacement_invalid`, `source_retired`, or `snapshot_session_limit_exceeded`)
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: '#/components/schemas/ErrorResponse'
                   - $ref: '#/components/schemas/SourceRetiredResponse'
+                  - $ref: '#/components/schemas/SnapshotSessionLimitResponse'
+        '429':
+          description: Snapshot build admission capacity is exhausted (`snapshot_build_capacity`); retry according to `Retry-After`.
+          headers:
+            Retry-After:
+              description: Positive delta-seconds before the next admission attempt.
+              required: true
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Authentication required
         '503':
@@ -634,6 +648,16 @@ paths:
             minimum: 1
             default: 1000
             maximum: 5000
+        - name: max_bytes
+          in: query
+          required: false
+          description: Exact sum of full SnapshotRow JSON wire bytes allowed in this chunk. Defaults to 4194304 and is capped at 16777216.
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            default: 4194304
+            maximum: 16777216
       responses:
         '200':
           description: Snapshot chunk retrieved successfully
@@ -642,7 +666,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SnapshotChunkResponse'
         '400':
-          description: Invalid snapshot chunk request (`snapshot_chunk_invalid` for non-positive `max_rows` or invalid cursors)
+          description: Invalid snapshot chunk request, or `snapshot_chunk_too_small` with `required_byte_count` when the next single row cannot fit.
           content:
             application/json:
               schema:
@@ -663,6 +687,19 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '410':
           description: Snapshot session expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Snapshot chunk admission capacity is exhausted (`snapshot_chunk_capacity`); retry according to `Retry-After`.
+          headers:
+            Retry-After:
+              description: Positive delta-seconds before the next admission attempt.
+              required: true
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -743,7 +780,7 @@ components:
       in: header
       required: true
       schema:
-        type: string
+        $ref: '#/components/schemas/SourceID'
       description: |
         Current sync source identity for this authenticated request. This header is sync transport
         metadata, not authentication. Direct protocol callers provide it explicitly; higher-level
@@ -754,6 +791,13 @@ components:
       scheme: bearer
       bearerFormat: JWT
   schemas:
+    SourceID:
+      type: string
+      minLength: 1
+      pattern: '^[!-~]+$'
+      description: Exact non-empty visible-ASCII sync source token. Values are accepted and compared without normalization.
+      example: device-a
+
     SyncKey:
       type: object
       additionalProperties: true
@@ -781,7 +825,7 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE in HTTP JSON. Hidden server columns such as _sync_scope_id are excluded. For bundle-hash verification, omitted DELETE payload normalizes to logical JSON null before hashing. Non-key binary payload fields use standard base64. Exact BIGINT and arbitrary-precision decimal columns use schema-typed JSON strings; approximate REAL/float columns use finite binary64 JSON numbers.
+          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE in HTTP JSON. Hidden server columns such as _sync_scope_id are excluded. For bundle-hash verification, omitted DELETE payload normalizes to logical JSON null before hashing. Non-key binary payload fields use standard base64. PostgreSQL SMALLINT, INTEGER, BIGINT, NUMERIC, DECIMAL, REAL, and DOUBLE PRECISION values use JSON strings. Floating strings use the canonical finite RFC 8785 binary64 spelling. Boolean values use JSON Booleans on committed server output.
 
     Bundle:
       type: object
@@ -791,7 +835,7 @@ components:
           type: integer
           format: int64
         source_id:
-          type: string
+          $ref: '#/components/schemas/SourceID'
         source_bundle_id:
           type: integer
           format: int64
@@ -810,8 +854,17 @@ components:
     CanonicalRequestHash:
       type: string
       pattern: '^[0-9a-f]{64}$'
-      description: Lowercase hex SHA-256 of the immutable original push rows. The logical hash input uses RFC 8785 JCS, decimal strings for row ordinal and base row version, and schema-typed JSON strings for exact BIGINT and decimal payload values. The server independently recomputes and stores this hash so an ambiguous retry can prove that an already-committed source tuple belongs to the same request.
+      description: Lowercase hex SHA-256 of the immutable original push rows. The logical hash input uses RFC 8785 JCS, decimal strings for row ordinal and base row version, and JSON strings for all integer, decimal, and floating business values. The server independently recomputes and stores this hash so an ambiguous retry can prove that an already-committed source tuple belongs to the same request.
       example: f9952b89b7b7ce1f4a2b9a3ea31ee7e8ca05d19bb6cb2cd400c8d18a1043fc83
+
+    CanonicalSessionToken:
+      type: string
+      format: uuid
+      minLength: 36
+      maxLength: 36
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      description: Exact lowercase dashed UUID used for `push_id` and `initialization_id`. Recipients must not trim, normalize, or case-fold this token.
+      example: 11111111-1111-4111-8111-111111111111
 
     PushRequestRow:
       type: object
@@ -833,7 +886,7 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64. Exact BIGINT and arbitrary-precision decimal columns use schema-typed JSON strings; approximate REAL/float columns use JSON numbers restricted to finite binary64/JCS values.
+          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64. PostgreSQL SMALLINT, INTEGER, BIGINT, NUMERIC, DECIMAL, REAL, and DOUBLE PRECISION values require JSON strings. Floating strings must use the canonical finite RFC 8785 binary64 spelling. PostgreSQL Boolean accepts a JSON Boolean or the strict SQLite ingress strings "0"/"1". Invalid values are rejected before durable push-chunk staging or business mutation.
 
     PushSessionCreateRequest:
       type: object
@@ -850,8 +903,7 @@ components:
         canonical_request_hash:
           $ref: '#/components/schemas/CanonicalRequestHash'
         initialization_id:
-          type: string
-          description: Required when this push session is seeding an uninitialized scope under an active initialization lease.
+          $ref: '#/components/schemas/CanonicalSessionToken'
 
     ConnectRequest:
       type: object
@@ -869,8 +921,7 @@ components:
           type: string
           enum: [remote_authoritative, initialize_local, initialize_empty, retry_later]
         initialization_id:
-          type: string
-          description: Exclusive initialization lease token to carry through the first seed push when `resolution = initialize_local`.
+          $ref: '#/components/schemas/CanonicalSessionToken'
         lease_expires_at:
           type: string
           format: date-time
@@ -890,7 +941,7 @@ components:
       required: [push_id, status, planned_row_count, next_expected_row_ordinal, canonical_request_hash]
       properties:
         push_id:
-          type: string
+          $ref: '#/components/schemas/CanonicalSessionToken'
         status:
           type: string
           enum: [staging]
@@ -915,7 +966,7 @@ components:
           type: integer
           format: int64
         source_id:
-          type: string
+          $ref: '#/components/schemas/SourceID'
         source_bundle_id:
           type: integer
           format: int64
@@ -947,7 +998,7 @@ components:
       required: [push_id, next_expected_row_ordinal]
       properties:
         push_id:
-          type: string
+          $ref: '#/components/schemas/CanonicalSessionToken'
         next_expected_row_ordinal:
           type: integer
           format: int64
@@ -960,7 +1011,7 @@ components:
           type: integer
           format: int64
         source_id:
-          type: string
+          $ref: '#/components/schemas/SourceID'
         source_bundle_id:
           type: integer
           format: int64
@@ -1002,7 +1053,7 @@ components:
         payload:
           type: object
           additionalProperties: true
-          description: Full-row after-image for one current row. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64. Exact BIGINT and arbitrary-precision decimal columns use schema-typed JSON strings; approximate REAL/float columns use finite binary64 JSON numbers.
+          description: Full-row after-image for one current row. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64. PostgreSQL SMALLINT, INTEGER, BIGINT, NUMERIC, DECIMAL, REAL, and DOUBLE PRECISION values use JSON strings with canonical finite RFC 8785 binary64 spelling for floats. Boolean values use JSON Booleans.
 
     SnapshotSessionCreateRequest:
       type: object
@@ -1015,10 +1066,10 @@ components:
       required: [previous_source_id, new_source_id, reason]
       properties:
         previous_source_id:
-          type: string
+          $ref: '#/components/schemas/SourceID'
           description: Must match the authenticated `Oversync-Source-ID`.
         new_source_id:
-          type: string
+          $ref: '#/components/schemas/SourceID'
           description: Fresh replacement writer identity reserved for the rotated rebuild.
         reason:
           type: string
@@ -1032,7 +1083,7 @@ components:
           type: integer
           format: int64
         source_id:
-          type: string
+          $ref: '#/components/schemas/SourceID'
         source_bundle_id:
           type: integer
           format: int64
@@ -1057,7 +1108,7 @@ components:
 
     SnapshotSession:
       type: object
-      required: [snapshot_id, snapshot_bundle_seq, row_count, expires_at]
+      required: [snapshot_id, snapshot_bundle_seq, row_count, byte_count, expires_at]
       properties:
         snapshot_id:
           type: string
@@ -1076,7 +1127,7 @@ components:
 
     SnapshotChunkResponse:
       type: object
-      required: [snapshot_id, snapshot_bundle_seq, rows, next_row_ordinal, has_more]
+      required: [snapshot_id, snapshot_bundle_seq, rows, next_row_ordinal, has_more, byte_count]
       properties:
         snapshot_id:
           type: string
@@ -1092,9 +1143,21 @@ components:
           format: int64
         has_more:
           type: boolean
+        byte_count:
+          type: integer
+          format: int64
+          description: Exact sum of persisted full SnapshotRow JSON wire-byte counts in this chunk.
 
     BundleCapabilitiesLimits:
       type: object
+      required:
+        - default_rows_per_snapshot_chunk
+        - max_rows_per_snapshot_chunk
+        - default_bytes_per_snapshot_chunk
+        - max_bytes_per_snapshot_chunk
+        - max_bytes_per_snapshot_row
+        - max_concurrent_snapshot_builds
+        - max_concurrent_snapshot_chunk_requests
       properties:
         max_rows_per_bundle:
           type: integer
@@ -1119,9 +1182,11 @@ components:
           description: Maximum chunk size the server will honor for one committed-bundle row fetch.
         default_rows_per_snapshot_chunk:
           type: integer
+          minimum: 1
           description: Default chunk size the server uses when `max_rows` is omitted on snapshot chunk fetch.
         max_rows_per_snapshot_chunk:
           type: integer
+          minimum: 1
           description: Maximum chunk size the server will honor for one snapshot chunk fetch.
         snapshot_session_ttl_seconds:
           type: integer
@@ -1133,7 +1198,30 @@ components:
         max_bytes_per_snapshot_session:
           type: integer
           format: int64
-          description: Maximum total payload size in bytes the server will allow when materializing one frozen snapshot session.
+          description: Maximum sum of complete encoded SnapshotRow UTF-8 JSON wire bytes the server will allow when materializing one frozen snapshot session. This includes schema, table, key, row_version, payload, and JSON framing for each row, but excludes inter-row commas and the enclosing response object.
+        default_bytes_per_snapshot_chunk:
+          type: integer
+          format: int64
+          minimum: 1
+        max_bytes_per_snapshot_chunk:
+          type: integer
+          format: int64
+          minimum: 1
+        max_bytes_per_snapshot_row:
+          type: integer
+          format: int64
+          minimum: 1
+        snapshot_materialization_batch_rows:
+          type: integer
+        snapshot_materialization_batch_bytes:
+          type: integer
+          format: int64
+        max_concurrent_snapshot_builds:
+          type: integer
+          minimum: 1
+        max_concurrent_snapshot_chunk_requests:
+          type: integer
+          minimum: 1
         initialization_lease_ttl_seconds:
           type: integer
           description: Server-side lease duration for exclusive first-initializer rights.
@@ -1161,17 +1249,19 @@ components:
           format: int64
           minimum: 1
         source_id:
-          type: string
+          $ref: '#/components/schemas/SourceID'
         source_bundle_id:
           type: integer
           format: int64
 
     CapabilitiesResponse:
       type: object
-      required: [protocol_version, schema_version, features]
+      required: [protocol_version, schema_version, features, bundle_limits]
       properties:
         protocol_version:
           type: string
+          enum: [v1]
+          description: Exact breaking-development protocol generation. Updated clients require v1 and reject non-v1, empty, or unknown values before synchronization work.
           example: v1
         schema_version:
           type: integer
@@ -1212,6 +1302,28 @@ components:
           type: string
         message:
           type: string
+        required_byte_count:
+          type: integer
+          format: int64
+
+    SnapshotSessionLimitResponse:
+      type: object
+      required: [error, message, dimension, actual, limit]
+      properties:
+        error:
+          type: string
+          enum: [snapshot_session_limit_exceeded]
+        message:
+          type: string
+        dimension:
+          type: string
+          enum: [row_count, byte_count, row_byte_count]
+        actual:
+          type: integer
+          format: int64
+        limit:
+          type: integer
+          format: int64
 
     SourceRetiredResponse:
       type: object
@@ -1223,10 +1335,13 @@ components:
         message:
           type: string
         source_id:
-          type: string
+          allOf:
+            - $ref: '#/components/schemas/SourceID'
+          description: Exact source ID used by the failed request. A client must reject the response unless this value exactly matches its request source before changing recovery state.
         replaced_by_source_id:
-          type: string
-          description: Replacement source reserved or activated for the retired source when known.
+          allOf:
+            - $ref: '#/components/schemas/SourceID'
+          description: Optional by omission only and may be omitted when no replacement is known. When present, this is the non-empty replacement source reserved or activated for the retired source. Explicit null and empty values are malformed.
 
     PushConflictResponse:
       type: object

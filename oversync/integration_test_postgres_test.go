@@ -24,6 +24,7 @@ const (
 
 type managedIntegrationPostgresServer struct {
 	containerID string
+	dataDir     string
 	host        string
 	port        string
 }
@@ -94,6 +95,14 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	dataDir, err := os.MkdirTemp("", "go-oversync-postgres-")
+	if err != nil {
+		return nil, fmt.Errorf("create managed PostgreSQL data directory: %w", err)
+	}
+	if err := os.Chmod(dataDir, 0o777); err != nil {
+		_ = os.RemoveAll(dataDir)
+		return nil, fmt.Errorf("prepare managed PostgreSQL data directory: %w", err)
+	}
 
 	containerName := fmt.Sprintf("go-oversync-test-%d-%d", os.Getpid(), time.Now().UnixNano())
 	containerID, err := dockerOutput(ctx,
@@ -103,6 +112,7 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 		"--name", containerName,
 		"--label", "com.mobiletoly.go-oversync.test=true",
 		"--publish", "127.0.0.1::5432",
+		"--mount", "type=bind,source="+dataDir+",target=/var/lib/postgresql/data",
 		"--env", "POSTGRES_USER=postgres",
 		"--env", "POSTGRES_PASSWORD="+managedIntegrationPostgresPassword,
 		"--env", "POSTGRES_DB=postgres",
@@ -113,6 +123,7 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 		managedIntegrationPostgresImage,
 	)
 	if err != nil {
+		_ = os.RemoveAll(dataDir)
 		return nil, err
 	}
 	containerID = strings.TrimSpace(containerID)
@@ -123,6 +134,7 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
 			_, _ = dockerOutput(cleanupCtx, "rm", "--force", containerID)
+			_ = os.RemoveAll(dataDir)
 		}
 	}()
 
@@ -136,6 +148,7 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 	}
 	server := &managedIntegrationPostgresServer{
 		containerID: containerID,
+		dataDir:     dataDir,
 		host:        host,
 		port:        port,
 	}
@@ -158,11 +171,11 @@ func stopManagedIntegrationPostgres() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := dockerOutput(ctx, "rm", "--force", managedIntegrationPostgres.containerID)
-	if err != nil && !strings.Contains(err.Error(), "No such container") {
-		return err
+	_, containerErr := dockerOutput(ctx, "rm", "--force", managedIntegrationPostgres.containerID)
+	if containerErr != nil && strings.Contains(containerErr.Error(), "No such container") {
+		containerErr = nil
 	}
-	return nil
+	return errors.Join(containerErr, os.RemoveAll(managedIntegrationPostgres.dataDir))
 }
 
 func parseDockerPublishedPort(output string) (string, string, error) {

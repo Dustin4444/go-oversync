@@ -8,8 +8,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
 
 	"github.com/mobiletoly/go-oversync/internal/wirevalue"
@@ -19,7 +17,7 @@ func (c *Client) upsertRowInTx(ctx context.Context, tx *sql.Tx, table string, pa
 	return c.upsertRowInTxUsing(ctx, tx, tx, table, payload)
 }
 
-func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, tx *sql.Tx, table string, payload map[string]interface{}) error {
+func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, tx tableInfoQueryer, table string, payload map[string]interface{}) error {
 	tableInfo, err := c.getTableInfoTx(tx, strings.ToLower(table))
 	if err != nil {
 		return fmt.Errorf("failed to get table info for %s: %w", table, err)
@@ -112,98 +110,40 @@ func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, t
 }
 
 func (c *Client) sqliteValueForWireJSON(table string, col ColumnInfo, value any) (any, error) {
-	number, isNumber := value.(json.Number)
-	if kind, configured := c.numericKindForColumn(table, col.Name); configured {
-		switch kind {
-		case wirevalue.NumericKindExactInt64:
-			raw, ok := value.(string)
-			if !ok {
-				return nil, fmt.Errorf("exact-int64 requires a JSON string")
-			}
-			parsed, err := wirevalue.ParseInt64(raw)
-			if err != nil {
-				return nil, fmt.Errorf("invalid exact int64: %w", err)
-			}
-			return parsed, nil
-		case wirevalue.NumericKindExactDecimal:
-			raw, ok := value.(string)
-			if !ok {
-				return nil, fmt.Errorf("exact-decimal requires a JSON string")
-			}
-			if err := wirevalue.ValidateDecimal(raw); err != nil {
-				return nil, fmt.Errorf("invalid exact decimal: %w", err)
-			}
-			return raw, nil
-		case wirevalue.NumericKindApproximate:
-			if !isNumber {
-				return nil, fmt.Errorf("approximate numeric column requires a JSON number")
-			}
-			parsed, err := strconv.ParseFloat(number.String(), 64)
-			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
-				return nil, fmt.Errorf("approximate numeric column requires a finite binary64 value")
-			}
-			return parsed, nil
-		}
-	}
 	if col.IsInteger() {
 		switch typed := value.(type) {
-		case json.Number:
-			parsed, err := strconv.ParseInt(typed.String(), 10, 64)
-			if err != nil || parsed > 9007199254740991 || parsed < -9007199254740991 {
-				return nil, fmt.Errorf("INTEGER outside the JCS exact range requires exact_int64 metadata and a JSON string")
+		case bool:
+			if typed {
+				return int64(1), nil
 			}
-			return parsed, nil
-		case int64:
+			return int64(0), nil
+		case string:
+			if _, err := wirevalue.ParseInt64(typed); err != nil {
+				return nil, fmt.Errorf("invalid canonical signed-64 string: %w", err)
+			}
 			return typed, nil
-		case int:
-			return int64(typed), nil
 		default:
-			return nil, fmt.Errorf("INTEGER requires an exact signed 64-bit integer")
+			return nil, fmt.Errorf("INTEGER requires a canonical signed-64 JSON string or Boolean")
 		}
 	}
 	if col.IsReal() {
-		switch typed := value.(type) {
-		case json.Number:
-			parsed, err := strconv.ParseFloat(typed.String(), 64)
-			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
-				return nil, fmt.Errorf("REAL requires a finite representable value")
-			}
-			return parsed, nil
-		case float64:
-			if math.IsInf(typed, 0) || math.IsNaN(typed) {
-				return nil, fmt.Errorf("REAL requires a finite representable value")
-			}
-			return typed, nil
-		default:
-			return nil, fmt.Errorf("REAL requires a finite numeric value")
+		raw, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("REAL requires a canonical finite binary64 JSON string")
 		}
+		parsed, err := wirevalue.ParseFloat64(raw)
+		if err != nil {
+			return nil, err
+		}
+		return parsed, nil
 	}
-	if isNumber {
+	if _, isNumber := value.(json.Number); isNumber {
 		return nil, fmt.Errorf("JSON number requires a compatible INTEGER or REAL destination")
 	}
 	return value, nil
 }
 
-func (c *Client) updateRowMeta(ctx context.Context, pk, tableName string, serverVersion int64, deleted bool) error {
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin row meta transaction: %w", err)
-	}
-	defer tx.Rollback()
-	if err := c.updateRowMetaInTx(ctx, tx, pk, tableName, serverVersion, deleted); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit row meta transaction: %w", err)
-	}
-	return nil
-}
-
-func (c *Client) updateRowMetaInTx(ctx context.Context, tx *sql.Tx, pk, tableName string, serverVersion int64, deleted bool) error {
-	return c.updateRowMetaInTxUsing(ctx, tx, tx, pk, tableName, serverVersion, deleted)
-}
-
-func (c *Client) updateRowMetaInTxUsing(ctx context.Context, execer execContexter, tx *sql.Tx, pk, tableName string, serverVersion int64, deleted bool) error {
+func (c *Client) updateRowMetaInTxUsing(ctx context.Context, execer execContexter, tx tableInfoQueryer, pk, tableName string, serverVersion int64, deleted bool) error {
 	keyJSON, err := c.syncKeyJSONForPKInTx(tx, tableName, pk)
 	if err != nil {
 		return err
@@ -214,7 +154,7 @@ func (c *Client) updateRowMetaInTxUsing(ctx context.Context, execer execContexte
 	return nil
 }
 
-func (c *Client) syncKeyJSONForPKInTx(tx *sql.Tx, tableName, pk string) (string, error) {
+func (c *Client) syncKeyJSONForPKInTx(tx tableInfoQueryer, tableName, pk string) (string, error) {
 	keyColumns, err := c.syncKeyColumnsForTable(tableName)
 	if err != nil {
 		return "", err
@@ -224,7 +164,7 @@ func (c *Client) syncKeyJSONForPKInTx(tx *sql.Tx, tableName, pk string) (string,
 	}
 	keyJSONBytes, err := json.Marshal(map[string]any{strings.ToLower(keyColumns[0]): pk})
 	if err != nil {
-		return "", fmt.Errorf("failed to encode sync key for %s.%s: %w", tableName, pk, err)
+		return "", fmt.Errorf("failed to encode sync key for table %s column %s: %w", tableName, keyColumns[0], err)
 	}
 	return string(keyJSONBytes), nil
 }
@@ -246,7 +186,7 @@ func (c *Client) updateStructuredRowStateInTxUsing(ctx context.Context, execer e
 			deleted = excluded.deleted,
 			updated_at = excluded.updated_at
 	`, schemaName, tableName, keyJSON, rowVersion, deletedInt); err != nil {
-		return fmt.Errorf("failed to update structured row state for %s.%s %s: %w", schemaName, tableName, keyJSON, err)
+		return fmt.Errorf("failed to update structured row state for %s.%s: %w", schemaName, tableName, err)
 	}
 	return nil
 }

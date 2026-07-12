@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -345,7 +344,7 @@ func TestEndToEnd_ConnectRemoteAuthoritativeEmptyStillReplacesAnonymousLocalRows
 	require.Equal(t, 0, count)
 }
 
-func TestEndToEnd_ConnectResumesSameAttachedUserWithoutNetwork(t *testing.T) {
+func TestEndToEnd_ConnectResumesSameAttachedUserAfterProtocolGate(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_connect_resume_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -364,8 +363,13 @@ func TestEndToEnd_ConnectResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 	}
 	restarted, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
 	require.NoError(t, err)
+	var capabilityRequests atomic.Int64
 	restarted.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return nil, context.DeadlineExceeded
+		if r.URL.Path != "/sync/capabilities" {
+			return nil, fmt.Errorf("unexpected resume request: %s", r.URL.Path)
+		}
+		capabilityRequests.Add(1)
+		return http.DefaultTransport.RoundTrip(r)
 	})}
 	t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 
@@ -375,6 +379,7 @@ func TestEndToEnd_ConnectResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, resumeResult.Status)
 	require.Equal(t, oversqlite.AttachOutcomeResumedAttached, resumeResult.Outcome)
+	require.EqualValues(t, 1, capabilityRequests.Load())
 }
 
 func TestEndToEnd_DetachBlocksWithAttachedDirtyRows(t *testing.T) {
@@ -417,7 +422,13 @@ func TestEndToEnd_ConnectNetworkFailureLeavesAnonymousLocalStateIntact(t *testin
 
 	_, err = client.Attach(ctx, userID)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, context.DeadlineExceeded))
+	var retryErr *oversqlite.RetryExhaustedError
+	require.ErrorAs(t, err, &retryErr)
+	require.Equal(t, "connect_capabilities", retryErr.Operation)
+	require.Equal(t, 3, retryErr.Attempts)
+	require.Nil(t, retryErr.LastErr)
+	require.EqualError(t, err, "oversqlite retry policy exhausted for connect_capabilities after 3 attempts")
+	require.NotErrorIs(t, err, context.DeadlineExceeded)
 
 	status, err := client.PendingSyncStatus(ctx)
 	require.NoError(t, err)

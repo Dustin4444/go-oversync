@@ -19,10 +19,13 @@ Wire-facing `row_version` and `base_row_version` fields are bundle sequence valu
 stores the current version internally as `sync.row_state.bundle_seq` and returns it through the
 existing wire field names.
 
-Oversync uses RFC 8785 JSON Canonicalization Scheme (JCS) for canonical bytes. Exact `BIGINT`
-and arbitrary-precision decimal columns are schema-typed JSON strings; approximate floating-point
-columns remain finite binary64 JSON numbers. `bundle_hash` authenticates the committed logical row
-stream, while `canonical_request_hash` associates that commit with the immutable original upload.
+Oversync uses RFC 8785 JSON Canonicalization Scheme (JCS) for canonical bytes. PostgreSQL `SMALLINT`,
+`INTEGER`, `BIGINT`, `NUMERIC`, `DECIMAL`, `REAL`, and `DOUBLE PRECISION` business values are JSON
+strings on every wire surface. Floating strings use the RFC 8785 shortest finite binary64 spelling;
+negative zero becomes `"0"`. SQLite-affinity clients may upload PostgreSQL Boolean values as the
+strict strings `"0"`/`"1"`; committed rows, pulls, conflicts, and snapshots use JSON Booleans.
+`bundle_hash` authenticates the committed logical row stream, while `canonical_request_hash`
+associates that commit with the immutable original upload.
 Hash-only protocol counters are decimal strings inside the logical hash model. `byte_count` is the
 length of those canonical logical bytes. This is standard JCS plus a typed wire schema, not an
 arbitrary-precision extension to JCS.
@@ -415,6 +418,13 @@ Failure contract:
 - `409 source_retired`
 - `409 scope_uninitialized`
 - `409 scope_initializing`
+- `409 snapshot_session_limit_exceeded` with required `dimension`, `actual`, and `limit` fields
+- `429 snapshot_build_capacity` with required positive delta-seconds `Retry-After`
+
+`snapshot_session_limit_exceeded` applies to `row_count`, `byte_count`, and `row_byte_count`.
+Snapshot byte limits count complete encoded `SnapshotRow` UTF-8 JSON bytes, including schema,
+table, key, row version, payload, and per-row JSON framing; they exclude inter-row commas and the
+enclosing response object.
 
 Structured `source_retired` response:
 
@@ -435,6 +445,7 @@ Query:
 
 - `after_row_ordinal`
 - `max_rows` (optional, defaults to the server capability and is capped by the server capability)
+- `max_bytes` (optional exact full-`SnapshotRow` JSON byte budget, default 4 MiB, capped at 16 MiB)
 
 Response:
 
@@ -456,13 +467,23 @@ Response:
     }
   ],
   "next_row_ordinal": 1,
-  "has_more": true
+  "has_more": true,
+  "byte_count": 241
 }
 ```
 
+If the first eligible row does not fit `max_bytes`, the server returns
+`400 snapshot_chunk_too_small` with its exact `required_byte_count`. Excess concurrent chunk reads
+return `429 snapshot_chunk_capacity` with required positive delta-seconds `Retry-After`.
+
+The Go client handles these two exact capacity codes with a dedicated elapsed-time
+policy (enabled by default, 30-second budget, one-second missing/invalid-header
+fallback) rather than consuming the generic transport retry-attempt budget.
+
 ## DELETE `/sync/snapshot-sessions/{snapshot_id}`
 
-Best-effort explicit cleanup for a completed or abandoned snapshot session.
+Logically retire a completed or abandoned snapshot session. The bounded cleanup worker removes its
+rows and then its empty parent asynchronously.
 
 Response:
 
@@ -472,6 +493,9 @@ Response:
 
 Returns the protocol version, schema version, app name, registered tables, registered table specs,
 feature flags, and bundle limits.
+
+The breaking-development server protocol version is exactly `v1`. Updated clients must reject any other,
+empty, or unknown value before connect, outbox freeze, or remote synchronization work.
 
 Important feature flags:
 
@@ -497,6 +521,13 @@ Important bundle limit fields:
 - `snapshot_session_ttl_seconds`
 - `max_rows_per_snapshot_session`
 - `max_bytes_per_snapshot_session`
+- `default_bytes_per_snapshot_chunk`
+- `max_bytes_per_snapshot_chunk`
+- `max_bytes_per_snapshot_row`
+- `snapshot_materialization_batch_rows`
+- `snapshot_materialization_batch_bytes`
+- `max_concurrent_snapshot_builds`
+- `max_concurrent_snapshot_chunk_requests`
 
 ## GET `/syncx/health`
 

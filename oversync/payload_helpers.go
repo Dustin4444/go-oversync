@@ -5,10 +5,7 @@ package oversync
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"math"
-	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/internal/jcs"
@@ -56,23 +53,12 @@ func (p *PayloadExtractor) StrFieldRequired(key string) (string, error) {
 }
 
 // Int64Field extracts a nullable int64 from the payload.
-// Accepts canonical exact-int64 strings and retained integral json.Number
-// values. It never obtains an authoritative integer through float64.
+// Accepts canonical signed-64 JSON strings. Numeric JSON tokens are not a
+// compatibility representation for synchronized business integers.
 // Returns nil if the field is missing, null, or cannot be converted.
 func (p *PayloadExtractor) Int64Field(key string) *int64 {
 	if v, ok := p.data[key]; ok && v != nil {
-		switch t := v.(type) {
-		case json.Number:
-			n, err := strconv.ParseInt(t.String(), 10, 64)
-			if err == nil {
-				return &n
-			}
-		case float64:
-			if !math.IsInf(t, 0) && !math.IsNaN(t) && math.Trunc(t) == t && t >= -9007199254740991 && t <= 9007199254740991 {
-				n := int64(t)
-				return &n
-			}
-		case string:
+		if t, ok := v.(string); ok {
 			n, err := wirevalue.ParseInt64(t)
 			if err == nil {
 				return &n
@@ -92,22 +78,14 @@ func (p *PayloadExtractor) Int64FieldRequired(key string) (int64, error) {
 }
 
 // Float64Field extracts a nullable float64 from the payload.
-// Accepts both numeric values and numeric strings.
+// Accepts canonical finite binary64 JSON strings. Numeric JSON tokens are not
+// a compatibility representation for synchronized business floats.
 // Returns nil if the field is missing, null, or cannot be converted.
 func (p *PayloadExtractor) Float64Field(key string) *float64 {
 	if v, ok := p.data[key]; ok && v != nil {
-		switch t := v.(type) {
-		case json.Number:
-			n, err := strconv.ParseFloat(t.String(), 64)
-			if err == nil && !math.IsInf(n, 0) && !math.IsNaN(n) {
-				return &n
-			}
-		case string:
-			if t == "" {
-				return nil
-			}
-			n, err := strconv.ParseFloat(t, 64)
-			if err == nil && !math.IsInf(n, 0) && !math.IsNaN(n) {
+		if t, ok := v.(string); ok {
+			n, err := wirevalue.ParseFloat64(t)
+			if err == nil {
 				return &n
 			}
 		}
@@ -125,35 +103,19 @@ func (p *PayloadExtractor) Float64FieldRequired(key string) (float64, error) {
 }
 
 // BoolField extracts a nullable bool from the payload.
-// Accepts bool values, numeric values (0=false, non-zero=true), and string values ("true"/"false", "1"/"0").
+// Accepts JSON Booleans and the strict SQLite ingress strings "0"/"1".
 // Returns nil if the field is missing, null, or cannot be converted.
 func (p *PayloadExtractor) BoolField(key string) *bool {
 	if v, ok := p.data[key]; ok && v != nil {
 		switch t := v.(type) {
 		case bool:
 			return &t
-		case json.Number:
-			n, err := strconv.ParseFloat(t.String(), 64)
-			if err != nil || math.IsInf(n, 0) || math.IsNaN(n) {
-				return nil
-			}
-			b := n != 0
-			return &b
-		case float64:
-			if math.IsInf(t, 0) || math.IsNaN(t) {
-				return nil
-			}
-			b := t != 0
-			return &b
 		case string:
-			if t == "" {
-				return nil
-			}
-			if t == "1" || t == "true" || t == "TRUE" {
+			if t == "1" {
 				v := true
 				return &v
 			}
-			if t == "0" || t == "false" || t == "FALSE" {
+			if t == "0" {
 				v := false
 				return &v
 			}

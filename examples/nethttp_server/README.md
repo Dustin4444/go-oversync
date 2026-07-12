@@ -71,6 +71,12 @@ JWT_SECRET="your-secret-key-change-in-production" \
 go run ./examples/nethttp_server
 ```
 
+Snapshot admission defaults to eight active builds and four active chunk
+requests. Override them with positive integers in
+`OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS` and
+`OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS`; excess requests receive an
+immediate retryable 429 rather than entering an unbounded server queue.
+
 ## Demo auth
 
 ```bash

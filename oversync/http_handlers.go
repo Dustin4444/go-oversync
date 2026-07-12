@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 // HTTPSyncHandlers provides HTTP handlers for the two-way sync API
@@ -103,11 +105,10 @@ func parseChunkQueryParams(r *http.Request, defaultMaxRows int) (chunkQueryParam
 	return params, nil
 }
 
-func (h *HTTPSyncHandlers) writeJSON(w http.ResponseWriter, response any, encodeErrorMessage string, logAttrs ...any) {
+func (h *HTTPSyncHandlers) writeJSON(w http.ResponseWriter, response any, encodeErrorMessage string) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
-		attrs := append([]any{"error", err}, logAttrs...)
-		h.logger.Error(encodeErrorMessage, attrs...)
+		h.logger.Error(encodeErrorMessage, "error_type", fmt.Sprintf("%T", err))
 	}
 }
 
@@ -177,15 +178,15 @@ func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *htt
 		}
 		var retiredErr *SourceRetiredError
 		if errors.As(err, &retiredErr) {
-			h.writeSourceRetired(w, retiredErr)
+			h.writeSourceRetired(w, actor.SourceID, retiredErr)
 			return
 		}
-		h.logger.Error("Failed to create push session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+		h.logger.Error("Failed to create push session", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "push_session_create_failed", "Failed to create push session")
 		return
 	}
 
-	h.writeJSON(w, response, "Failed to encode push session response", "user_id", actor.UserID, "source_id", actor.SourceID)
+	h.writeJSON(w, response, "Failed to encode push session response")
 }
 
 func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http.Request) {
@@ -194,6 +195,10 @@ func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http
 		return
 	}
 	pushID := r.PathValue("push_id")
+	if err := validatePushSessionLookupID(pushID); err != nil {
+		h.writeError(w, http.StatusNotFound, "push_session_not_found", err.Error())
+		return
+	}
 
 	var req PushSessionChunkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -241,12 +246,12 @@ func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http
 			h.writeError(w, http.StatusForbidden, "push_session_forbidden", forbiddenErr.Error())
 			return
 		}
-		h.logger.Error("Failed to upload push chunk", "error", err, "user_id", actor.UserID, "push_id", pushID)
+		h.logger.Error("Failed to upload push chunk", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "push_chunk_failed", "Failed to upload push chunk")
 		return
 	}
 
-	h.writeJSON(w, response, "Failed to encode push chunk response", "user_id", actor.UserID, "push_id", pushID)
+	h.writeJSON(w, response, "Failed to encode push chunk response")
 }
 
 func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *http.Request) {
@@ -303,15 +308,15 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 		}
 		var retiredErr *SourceRetiredError
 		if errors.As(err, &retiredErr) {
-			h.writeSourceRetired(w, retiredErr)
+			h.writeSourceRetired(w, actor.SourceID, retiredErr)
 			return
 		}
-		h.logger.Error("Failed to commit push session", "error", err, "user_id", actor.UserID, "push_id", pushID)
+		h.logger.Error("Failed to commit push session", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "push_session_commit_failed", "Failed to commit push session")
 		return
 	}
 
-	h.writeJSON(w, response, "Failed to encode push session commit response", "user_id", actor.UserID, "push_id", pushID)
+	h.writeJSON(w, response, "Failed to encode push session commit response")
 }
 
 func (h *HTTPSyncHandlers) HandleConnect(w http.ResponseWriter, r *http.Request) {
@@ -336,12 +341,12 @@ func (h *HTTPSyncHandlers) HandleConnect(w http.ResponseWriter, r *http.Request)
 			h.writeError(w, http.StatusBadRequest, "connect_invalid", invalidErr.Error())
 			return
 		}
-		h.logger.Error("Failed to resolve connect lifecycle", "error", err, "user_id", actor.UserID)
+		h.logger.Error("Failed to resolve connect lifecycle", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "connect_failed", "Failed to resolve connect lifecycle")
 		return
 	}
 
-	h.writeJSON(w, response, "Failed to encode connect response", "user_id", actor.UserID)
+	h.writeJSON(w, response, "Failed to encode connect response")
 }
 
 func (h *HTTPSyncHandlers) HandleGetCommittedBundleRows(w http.ResponseWriter, r *http.Request) {
@@ -382,12 +387,12 @@ func (h *HTTPSyncHandlers) HandleGetCommittedBundleRows(w http.ResponseWriter, r
 			h.writeError(w, http.StatusNotFound, "committed_bundle_not_found", notFoundErr.Error())
 			return
 		}
-		h.logger.Error("Failed to get committed bundle rows", "error", err, "user_id", actor.UserID, "bundle_seq", bundleSeq)
+		h.logger.Error("Failed to get committed bundle rows", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "committed_bundle_rows_failed", "Failed to fetch committed bundle rows")
 		return
 	}
 
-	h.writeJSON(w, response, "Failed to encode committed bundle rows response", "user_id", actor.UserID, "bundle_seq", bundleSeq)
+	h.writeJSON(w, response, "Failed to encode committed bundle rows response")
 }
 
 func (h *HTTPSyncHandlers) HandleDeletePushSession(w http.ResponseWriter, r *http.Request) {
@@ -421,7 +426,7 @@ func (h *HTTPSyncHandlers) HandleDeletePushSession(w http.ResponseWriter, r *htt
 			h.writeError(w, http.StatusForbidden, "push_session_forbidden", forbiddenErr.Error())
 			return
 		}
-		h.logger.Error("Failed to delete push session", "error", err, "user_id", actor.UserID, "push_id", pushID)
+		h.logger.Error("Failed to delete push session", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "push_session_delete_failed", "Failed to delete push session")
 		return
 	}
@@ -508,12 +513,12 @@ func (h *HTTPSyncHandlers) HandlePull(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, http.StatusConflict, "scope_initializing", initializingErr.Error())
 			return
 		}
-		h.logger.Error("Failed to process pull", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+		h.logger.Error("Failed to process pull", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "pull_failed", "Failed to process pull")
 		return
 	}
 
-	h.writeJSON(w, response, "Failed to encode pull response", "user_id", actor.UserID, "source_id", actor.SourceID)
+	h.writeJSON(w, response, "Failed to encode pull response")
 }
 
 // HandleWatch streams metadata-only bundle change wakeups as Server-Sent Events.
@@ -616,7 +621,7 @@ func (h *HTTPSyncHandlers) writeWatchSetupError(w http.ResponseWriter, err error
 		h.writeError(w, http.StatusConflict, "scope_initializing", initializingErr.Error())
 		return
 	}
-	h.logger.Error("Failed to subscribe bundle change watch", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+	h.logger.Error("Failed to subscribe bundle change watch", "error_type", fmt.Sprintf("%T", err))
 	h.writeError(w, http.StatusInternalServerError, "bundle_change_watch_failed", "Failed to subscribe bundle change watch")
 }
 
@@ -663,7 +668,7 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 			}
 		} else {
 			var trailing any
-			if err := decoder.Decode(&trailing); err != nil && !errors.Is(err, io.EOF) {
+			if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 				h.writeError(w, http.StatusBadRequest, "snapshot_session_invalid", "Failed to parse snapshot session request")
 				return
 			}
@@ -681,6 +686,17 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 			h.writeError(w, http.StatusBadRequest, "snapshot_session_invalid", invalidErr.Error())
 			return
 		}
+		var capacityErr *SnapshotCapacityError
+		if errors.As(err, &capacityErr) {
+			w.Header().Set("Retry-After", "1")
+			h.writeError(w, http.StatusTooManyRequests, "snapshot_build_capacity", capacityErr.Error())
+			return
+		}
+		var limitErr *SnapshotSessionLimitExceededError
+		if errors.As(err, &limitErr) {
+			h.writeSnapshotSessionLimitExceeded(w, limitErr)
+			return
+		}
 		var replacementErr *SourceReplacementInvalidError
 		if errors.As(err, &replacementErr) {
 			h.writeError(w, http.StatusConflict, "source_replacement_invalid", replacementErr.Error())
@@ -688,7 +704,7 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 		}
 		var retiredErr *SourceRetiredError
 		if errors.As(err, &retiredErr) {
-			h.writeSourceRetired(w, retiredErr)
+			h.writeSourceRetired(w, actor.SourceID, retiredErr)
 			return
 		}
 		var uninitializedErr *ScopeUninitializedError
@@ -701,17 +717,32 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 			h.writeError(w, http.StatusConflict, "scope_initializing", initializingErr.Error())
 			return
 		}
-		h.logger.Error("Failed to create snapshot session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+		h.logger.Error("Failed to create snapshot session", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "snapshot_session_create_failed", "Failed to create snapshot session")
 		return
 	}
 
-	h.writeJSON(w, response, "Failed to encode snapshot session response", "user_id", actor.UserID, "source_id", actor.SourceID)
+	h.writeJSON(w, response, "Failed to encode snapshot session response")
 }
 
-func (h *HTTPSyncHandlers) writeSourceRetired(w http.ResponseWriter, retiredErr *SourceRetiredError) {
-	if retiredErr == nil {
-		h.writeError(w, http.StatusConflict, "source_retired", "source is retired")
+func (h *HTTPSyncHandlers) writeSnapshotSessionLimitExceeded(w http.ResponseWriter, limitErr *SnapshotSessionLimitExceededError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(SnapshotSessionLimitResponse{
+		Error:     "snapshot_session_limit_exceeded",
+		Message:   limitErr.Error(),
+		Dimension: limitErr.Dimension,
+		Actual:    limitErr.Actual,
+		Limit:     limitErr.Limit,
+	})
+}
+
+func (h *HTTPSyncHandlers) writeSourceRetired(w http.ResponseWriter, requestSourceID string, retiredErr *SourceRetiredError) {
+	if retiredErr == nil || sourceid.Validate(requestSourceID) != nil ||
+		sourceid.Validate(retiredErr.SourceID) != nil || retiredErr.SourceID != requestSourceID ||
+		sourceid.ValidateOptional(retiredErr.ReplacedBySourceID) != nil {
+		h.logger.Error("Rejected invalid source retired state")
+		h.writeError(w, http.StatusInternalServerError, "source_retired_invalid", "Source retirement state is invalid")
 		return
 	}
 
@@ -720,8 +751,8 @@ func (h *HTTPSyncHandlers) writeSourceRetired(w http.ResponseWriter, retiredErr 
 
 	response := SourceRetiredResponse{
 		Error:              "source_retired",
-		Message:            retiredErr.Error(),
-		SourceID:           retiredErr.SourceID,
+		Message:            "source is retired",
+		SourceID:           requestSourceID,
 		ReplacedBySourceID: retiredErr.ReplacedBySourceID,
 	}
 	_ = json.NewEncoder(w).Encode(response)
@@ -729,8 +760,6 @@ func (h *HTTPSyncHandlers) writeSourceRetired(w http.ResponseWriter, retiredErr 
 	h.logger.Debug("HTTP source retired response",
 		"status_code", http.StatusConflict,
 		"error_code", "source_retired",
-		"source_id", retiredErr.SourceID,
-		"replaced_by_source_id", retiredErr.ReplacedBySourceID,
 	)
 }
 
@@ -751,8 +780,16 @@ func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http
 	if queryParams.afterRowOrdinal != nil {
 		afterRowOrdinal = *queryParams.afterRowOrdinal
 	}
+	maxBytes := h.service.defaultBytesPerSnapshotChunk()
+	if raw := r.URL.Query().Get("max_bytes"); raw != "" {
+		maxBytes, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", "max_bytes must be an integer")
+			return
+		}
+	}
 
-	response, err := h.service.GetSnapshotChunk(r.Context(), actor, snapshotID, afterRowOrdinal, queryParams.maxRows)
+	response, release, err := h.service.getSnapshotChunkWithLease(r.Context(), actor, snapshotID, afterRowOrdinal, queryParams.maxRows, maxBytes)
 	if err != nil {
 		if h.writeServiceUnavailable(w, err) {
 			return
@@ -760,6 +797,17 @@ func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http
 		var invalidErr *SnapshotChunkInvalidError
 		if errors.As(err, &invalidErr) {
 			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", invalidErr.Error())
+			return
+		}
+		var capacityErr *SnapshotCapacityError
+		if errors.As(err, &capacityErr) {
+			w.Header().Set("Retry-After", "1")
+			h.writeError(w, http.StatusTooManyRequests, "snapshot_chunk_capacity", capacityErr.Error())
+			return
+		}
+		var tooSmallErr *SnapshotChunkTooSmallError
+		if errors.As(err, &tooSmallErr) {
+			h.writeSnapshotChunkTooSmall(w, tooSmallErr)
 			return
 		}
 		var notFoundErr *SnapshotSessionNotFoundError
@@ -777,12 +825,55 @@ func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http
 			h.writeError(w, http.StatusForbidden, "snapshot_session_forbidden", forbiddenErr.Error())
 			return
 		}
-		h.logger.Error("Failed to get snapshot chunk", "error", err, "user_id", actor.UserID, "snapshot_id", snapshotID)
+		h.logger.Error("Failed to get snapshot chunk", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "snapshot_chunk_failed", "Failed to get snapshot chunk")
 		return
 	}
+	defer release()
 
-	h.writeJSON(w, response, "Failed to encode snapshot chunk response", "user_id", actor.UserID, "snapshot_id", snapshotID)
+	h.writeSnapshotChunkJSON(w, response)
+}
+
+func (h *HTTPSyncHandlers) writeSnapshotChunkJSON(w http.ResponseWriter, response *SnapshotChunkResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	logWriteError := func(err error) {
+		h.logger.Error("Failed to encode snapshot chunk response", "error_type", fmt.Sprintf("%T", err))
+	}
+	writeString := func(value string) bool {
+		if _, err := io.WriteString(w, value); err != nil {
+			logWriteError(err)
+			return false
+		}
+		return true
+	}
+
+	if !writeString(`{"snapshot_id":`) {
+		return
+	}
+	encoder := json.NewEncoder(w)
+	if err := encoder.Encode(response.SnapshotID); err != nil {
+		logWriteError(err)
+		return
+	}
+	if !writeString(`,"snapshot_bundle_seq":` + strconv.FormatInt(response.SnapshotBundleSeq, 10) + `,"rows":[`) {
+		return
+	}
+	for i := range response.Rows {
+		if i > 0 && !writeString(",") {
+			return
+		}
+		if err := encoder.Encode(response.Rows[i]); err != nil {
+			logWriteError(err)
+			return
+		}
+	}
+	writeString(`],"next_row_ordinal":` + strconv.FormatInt(response.NextRowOrdinal, 10) + `,"has_more":` + strconv.FormatBool(response.HasMore) + `,"byte_count":` + strconv.FormatInt(response.ByteCount, 10) + `}`)
+}
+
+func (h *HTTPSyncHandlers) writeSnapshotChunkTooSmall(w http.ResponseWriter, err *SnapshotChunkTooSmallError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "snapshot_chunk_too_small", Message: err.Error(), RequiredByteCount: err.RequiredByteCount})
 }
 
 // HandleDeleteSnapshotSession deletes an existing frozen snapshot session.
@@ -812,7 +903,7 @@ func (h *HTTPSyncHandlers) HandleDeleteSnapshotSession(w http.ResponseWriter, r 
 			h.writeError(w, http.StatusForbidden, "snapshot_session_forbidden", forbiddenErr.Error())
 			return
 		}
-		h.logger.Error("Failed to delete snapshot session", "error", err, "user_id", actor.UserID, "snapshot_id", snapshotID)
+		h.logger.Error("Failed to delete snapshot session", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "snapshot_session_delete_failed", "Failed to delete snapshot session")
 		return
 	}
@@ -827,7 +918,7 @@ func (h *HTTPSyncHandlers) HandleStatus(w http.ResponseWriter, r *http.Request) 
 	}
 	response, err := h.service.GetStatus(r.Context())
 	if err != nil {
-		h.logger.Error("Failed to get service status", "error", err)
+		h.logger.Error("Failed to get service status", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "status_failed", "Failed to get service status")
 		return
 	}
@@ -843,7 +934,7 @@ func (h *HTTPSyncHandlers) HandleHealth(w http.ResponseWriter, r *http.Request) 
 	}
 	response, err := h.service.GetStatus(r.Context())
 	if err != nil {
-		h.logger.Error("Failed to get health status", "error", err)
+		h.logger.Error("Failed to get health status", "error_type", fmt.Sprintf("%T", err))
 		h.writeError(w, http.StatusInternalServerError, "health_failed", "Failed to get health status")
 		return
 	}

@@ -7,12 +7,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/mobiletoly/go-oversync/internal/sessionid"
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 const (
@@ -152,6 +153,9 @@ func loadScopeStateForUpdate(ctx context.Context, tx pgx.Tx, userID string) (*sc
 		return nil, fmt.Errorf("load scope_state row: %w", err)
 	}
 	row.InitializerSourceID = initializerSourceID.String
+	if err := sourceid.ValidateOptional(row.InitializerSourceID); err != nil {
+		return nil, fmt.Errorf("persisted scope_state initializer_source_id is invalid: %w", err)
+	}
 	row.InitializationID = initializationID.String
 	if leaseExpiresAt.Valid {
 		row.LeaseExpiresAt = leaseExpiresAt.Time.UTC()
@@ -165,6 +169,9 @@ func loadScopeStateForUpdate(ctx context.Context, tx pgx.Tx, userID string) (*sc
 	}
 	row.State = stateName
 	row.InitializedBySource = initializedBySource.String
+	if err := sourceid.ValidateOptional(row.InitializedBySource); err != nil {
+		return nil, fmt.Errorf("persisted scope_state initialized_by_source_id is invalid: %w", err)
+	}
 	return &row, nil
 }
 
@@ -270,10 +277,10 @@ func requireActiveInitializationLease(ctx context.Context, tx pgx.Tx, userID, so
 	if !row.LeaseExpiresAt.After(time.Now().UTC()) {
 		return nil, &InitializationExpiredError{Message: "initialization lease has expired"}
 	}
-	if strings.TrimSpace(sourceID) == "" || row.InitializerSourceID != sourceID {
+	if err := sourceid.Validate(sourceID); err != nil || row.InitializerSourceID != sourceID {
 		return nil, &InitializationStaleError{Message: "source does not own the active initialization lease"}
 	}
-	if strings.TrimSpace(initializationID) == "" || row.InitializationID != initializationID {
+	if sessionid.Validate(initializationID) != nil || row.InitializationID != initializationID {
 		return nil, &InitializationStaleError{Message: "initialization_id does not match the active initialization lease"}
 	}
 	if !refreshTo.IsZero() {
@@ -290,6 +297,9 @@ func requireActiveInitializationLease(ctx context.Context, tx pgx.Tx, userID, so
 }
 
 func transitionScopeToInitialized(ctx context.Context, tx pgx.Tx, userID, sourceID string) error {
+	if err := sourceid.Validate(sourceID); err != nil {
+		return fmt.Errorf("scope_state initialized source_id is invalid: %w", err)
+	}
 	if err := ensureUserStateBaselineWithExec(ctx, tx, userID); err != nil {
 		return err
 	}
@@ -309,6 +319,9 @@ func transitionScopeToInitialized(ctx context.Context, tx pgx.Tx, userID, source
 }
 
 func transitionScopeToInitializing(ctx context.Context, tx pgx.Tx, userID, sourceID string, leaseTTL time.Duration) (*scopeStateRow, error) {
+	if err := sourceid.Validate(sourceID); err != nil {
+		return nil, fmt.Errorf("scope_state initializer source_id is invalid: %w", err)
+	}
 	if err := ensureUserStateBaselineWithExec(ctx, tx, userID); err != nil {
 		return nil, err
 	}

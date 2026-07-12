@@ -63,10 +63,7 @@ type sourceSequenceChangedError struct {
 	Message string
 }
 
-type SourceReplacementDivergedError struct {
-	LocalReplacement  string
-	RemoteReplacement string
-}
+type SourceReplacementDivergedError struct{}
 
 // RebuildRequiredError reports that normal sync is blocked until the client completes Rebuild.
 type RebuildRequiredError struct{}
@@ -77,9 +74,6 @@ func (e *RebuildRequiredError) Error() string {
 }
 
 func (e *CheckpointAheadError) Error() string {
-	if e != nil && strings.TrimSpace(e.Message) != "" {
-		return e.Message
-	}
 	return "client checkpoint is ahead of current server history"
 }
 
@@ -87,24 +81,11 @@ func (e *CheckpointRecoveryBlockedError) Error() string {
 	if e == nil {
 		return "checkpoint recovery is blocked by pending local work"
 	}
-	message := fmt.Sprintf(
-		"checkpoint recovery is blocked (%s): dirty_rows=%d outbox_rows=%d replay_state=%q",
-		e.Reason,
-		e.DirtyCount,
-		e.OutboundCount,
-		e.ReplayState,
-	)
-	if e.Cause != nil {
-		return message + ": " + e.Cause.Error()
-	}
-	return message
+	return fmt.Sprintf("checkpoint recovery is blocked: reason=%s", e.Reason)
 }
 
 func (e *CheckpointRecoveryBlockedError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.Cause
+	return nil
 }
 
 // SyncOperationInProgressError reports that another sync operation is already active for the client.
@@ -139,17 +120,11 @@ func (e *PendingPushReplayError) Error() string {
 
 // Error implements error.
 func (e *HistoryPrunedError) Error() string {
-	if e.Message != "" {
-		return e.Message
-	}
 	return "server history required for incremental sync has been pruned"
 }
 
 // Error implements error.
 func (e *SourceRecoveryRequiredError) Error() string {
-	if e != nil && strings.TrimSpace(e.Message) != "" {
-		return e.Message
-	}
 	if e != nil {
 		switch e.Code {
 		case SourceRecoveryHistoryPruned:
@@ -166,28 +141,15 @@ func (e *SourceRecoveryRequiredError) Error() string {
 }
 
 func (e *sourceSequenceOutOfOrderError) Error() string {
-	if e != nil && strings.TrimSpace(e.Message) != "" {
-		return e.Message
-	}
 	return "source bundle sequence is out of order"
 }
 
 func (e *sourceSequenceChangedError) Error() string {
-	if e != nil && strings.TrimSpace(e.Message) != "" {
-		return e.Message
-	}
 	return "source bundle sequence changed before commit"
 }
 
 func (e *SourceReplacementDivergedError) Error() string {
-	if e == nil {
-		return "replacement source diverged between local and server recovery state"
-	}
-	return fmt.Sprintf(
-		"replacement source diverged between local and server recovery state: local=%q remote=%q",
-		e.LocalReplacement,
-		e.RemoteReplacement,
-	)
+	return "replacement source diverged between local and server recovery state"
 }
 
 func sourceRecoveryCodeFromReason(reason string) SourceRecoveryCode {
@@ -215,14 +177,16 @@ func (c *Client) reserveReplacementSourceIDInTx(ctx context.Context, tx *sql.Tx,
 	if err != nil {
 		return "", err
 	}
-	replacementSourceID := strings.TrimSpace(operation.ReplacementSourceID)
-	preferred = strings.TrimSpace(preferred)
+	replacementSourceID := operation.ReplacementSourceID
+	if err := validateOptionalSourceID(replacementSourceID); err != nil {
+		return "", err
+	}
+	if err := validateOptionalSourceID(preferred); err != nil {
+		return "", err
+	}
 	switch {
 	case replacementSourceID != "" && preferred != "" && replacementSourceID != preferred:
-		return "", &SourceReplacementDivergedError{
-			LocalReplacement:  replacementSourceID,
-			RemoteReplacement: preferred,
-		}
+		return "", &SourceReplacementDivergedError{}
 	case replacementSourceID != "":
 		if err := ensureSourceState(ctx, tx, replacementSourceID); err != nil {
 			return "", err
@@ -350,19 +314,11 @@ func (c *Client) beginSourceRecoveryLocked(ctx context.Context, code SourceRecov
 	}
 }
 
-func (c *Client) clearSourceRecoveryRequiredInTx(ctx context.Context, tx *sql.Tx) error {
+func (c *Client) clearSourceRecoveryRequiredInTx(ctx context.Context, tx execer) error {
 	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone, ReplacementSourceID: ""}); err != nil {
 		return err
 	}
 	return nil
-}
-
-func (c *Client) sourceRecoveryRequiredLocked(ctx context.Context) (bool, error) {
-	operation, err := loadOperationState(ctx, c.DB)
-	if err != nil {
-		return false, err
-	}
-	return operation.Kind == operationKindSourceRecovery, nil
 }
 
 func (c *Client) pendingChangeCount(ctx context.Context) (int, error) {
@@ -408,7 +364,7 @@ type clearManagedTablesOptions struct {
 	PreserveOutbox bool
 }
 
-func (c *Client) clearManagedTablesInTxWithOptions(ctx context.Context, tx *sql.Tx, options clearManagedTablesOptions) error {
+func (c *Client) clearManagedTablesInTxWithOptions(ctx context.Context, tx sqliteTransaction, options clearManagedTablesOptions) error {
 	managedTables, err := c.loadManagedSyncTablesForUninstall(ctx, tx)
 	if err != nil {
 		return err

@@ -17,10 +17,60 @@ import (
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Path == "/sync/capabilities" {
+		return jsonResponse(oversync.CapabilitiesResponse{
+			ProtocolVersion: requiredProtocolVersion,
+			Features:        map[string]bool{"connect_lifecycle": true},
+		}), nil
+	}
+	return fn(r)
+}
+
+type rawRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn rawRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return fn(r)
 }
 
 func jsonResponse(v any) *http.Response {
+	switch typed := v.(type) {
+	case oversync.CapabilitiesResponse:
+		if typed.Features == nil {
+			typed.Features = map[string]bool{}
+		}
+		if typed.BundleLimits.DefaultRowsPerSnapshotChunk == 0 {
+			typed.BundleLimits.DefaultRowsPerSnapshotChunk = 1000
+			typed.BundleLimits.MaxRowsPerSnapshotChunk = 1000
+			typed.BundleLimits.DefaultBytesPerSnapshotChunk = 4 << 20
+			typed.BundleLimits.MaxBytesPerSnapshotChunk = 8 << 20
+			typed.BundleLimits.MaxBytesPerSnapshotRow = 1 << 20
+			typed.BundleLimits.MaxConcurrentSnapshotBuilds = 2
+			typed.BundleLimits.MaxConcurrentSnapshotChunkRequests = 2
+		}
+		v = typed
+	case oversync.SnapshotSession:
+		if typed.RowCount > 0 && typed.ByteCount == 0 {
+			typed.ByteCount = typed.RowCount
+		}
+		v = typed
+	case *oversync.SnapshotSession:
+		if typed != nil && typed.RowCount > 0 && typed.ByteCount == 0 {
+			copy := *typed
+			copy.ByteCount = copy.RowCount
+			v = &copy
+		}
+	case oversync.SnapshotChunkResponse:
+		if len(typed.Rows) > 0 && typed.ByteCount == 0 {
+			typed.ByteCount = int64(len(typed.Rows))
+		}
+		v = typed
+	case *oversync.SnapshotChunkResponse:
+		if typed != nil && len(typed.Rows) > 0 && typed.ByteCount == 0 {
+			copy := *typed
+			copy.ByteCount = int64(len(copy.Rows))
+			v = &copy
+		}
+	}
 	body, _ := json.Marshal(v)
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -66,10 +116,10 @@ func attachTestClient(t *testing.T, client *Client, userID, sourceID string) Att
 	}
 
 	prevHTTP := client.HTTP
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":

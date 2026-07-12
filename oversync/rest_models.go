@@ -3,7 +3,12 @@
 
 package oversync
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
+)
 
 // REST/JSON models for HTTP API requests and responses
 // These models are used for serialization/deserialization of HTTP requests and responses
@@ -135,7 +140,7 @@ type SnapshotSession struct {
 	SnapshotID        string `json:"snapshot_id"`
 	SnapshotBundleSeq int64  `json:"snapshot_bundle_seq"`
 	RowCount          int64  `json:"row_count"`
-	ByteCount         int64  `json:"byte_count,omitempty"`
+	ByteCount         int64  `json:"byte_count"`
 	ExpiresAt         string `json:"expires_at"`
 }
 
@@ -146,6 +151,7 @@ type SnapshotChunkResponse struct {
 	Rows              []SnapshotRow `json:"rows"`
 	NextRowOrdinal    int64         `json:"next_row_ordinal"`
 	HasMore           bool          `json:"has_more"`
+	ByteCount         int64         `json:"byte_count"`
 }
 
 // Common response models
@@ -154,13 +160,13 @@ const SyncProtocolVersion = "v1"
 
 // CapabilitiesResponse describes the currently supported sync protocol surface.
 type CapabilitiesResponse struct {
-	ProtocolVersion      string                    `json:"protocol_version"`
-	SchemaVersion        int                       `json:"schema_version"`
-	AppName              string                    `json:"app_name,omitempty"`
-	RegisteredTables     []string                  `json:"registered_tables,omitempty"`
-	RegisteredTableSpecs []RegisteredTableSpec     `json:"registered_table_specs,omitempty"`
-	Features             map[string]bool           `json:"features"`
-	BundleLimits         *BundleCapabilitiesLimits `json:"bundle_limits,omitempty"`
+	ProtocolVersion      string                   `json:"protocol_version"`
+	SchemaVersion        int                      `json:"schema_version"`
+	AppName              string                   `json:"app_name,omitempty"`
+	RegisteredTables     []string                 `json:"registered_tables,omitempty"`
+	RegisteredTableSpecs []RegisteredTableSpec    `json:"registered_table_specs,omitempty"`
+	Features             map[string]bool          `json:"features"`
+	BundleLimits         BundleCapabilitiesLimits `json:"bundle_limits"`
 }
 
 // BundleCapabilitiesLimits reports bundle-oriented guardrails in the target contract.
@@ -178,7 +184,89 @@ type BundleCapabilitiesLimits struct {
 	SnapshotSessionTTLSeconds          int   `json:"snapshot_session_ttl_seconds,omitempty"`
 	MaxRowsPerSnapshotSession          int64 `json:"max_rows_per_snapshot_session,omitempty"`
 	MaxBytesPerSnapshotSession         int64 `json:"max_bytes_per_snapshot_session,omitempty"`
+	DefaultBytesPerSnapshotChunk       int64 `json:"default_bytes_per_snapshot_chunk"`
+	MaxBytesPerSnapshotChunk           int64 `json:"max_bytes_per_snapshot_chunk"`
+	MaxBytesPerSnapshotRow             int64 `json:"max_bytes_per_snapshot_row"`
+	SnapshotMaterializationBatchRows   int   `json:"snapshot_materialization_batch_rows"`
+	SnapshotMaterializationBatchBytes  int64 `json:"snapshot_materialization_batch_bytes"`
+	MaxConcurrentSnapshotBuilds        int   `json:"max_concurrent_snapshot_builds"`
+	MaxConcurrentSnapshotChunkRequests int   `json:"max_concurrent_snapshot_chunk_requests"`
 	InitializationLeaseTTLSeconds      int   `json:"initialization_lease_ttl_seconds,omitempty"`
+}
+
+func (limits *BundleCapabilitiesLimits) UnmarshalJSON(data []byte) error {
+	type plainLimits BundleCapabilitiesLimits
+	var decoded plainLimits
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	required := []string{
+		"default_rows_per_snapshot_chunk",
+		"max_rows_per_snapshot_chunk",
+		"default_bytes_per_snapshot_chunk",
+		"max_bytes_per_snapshot_chunk",
+		"max_bytes_per_snapshot_row",
+		"max_concurrent_snapshot_builds",
+		"max_concurrent_snapshot_chunk_requests",
+	}
+	for _, name := range required {
+		value, ok := fields[name]
+		if !ok || string(value) == "null" {
+			return fmt.Errorf("capabilities bundle_limits missing required %s", name)
+		}
+	}
+	for _, name := range []string{
+		"snapshot_materialization_batch_rows",
+		"snapshot_materialization_batch_bytes",
+	} {
+		if value, ok := fields[name]; ok && string(value) == "null" {
+			return fmt.Errorf("capabilities bundle_limits %s must be an integer when present", name)
+		}
+	}
+	*limits = BundleCapabilitiesLimits(decoded)
+	if limits.DefaultRowsPerSnapshotChunk <= 0 || limits.MaxRowsPerSnapshotChunk <= 0 ||
+		limits.DefaultBytesPerSnapshotChunk <= 0 || limits.MaxBytesPerSnapshotChunk <= 0 ||
+		limits.MaxBytesPerSnapshotRow <= 0 || limits.MaxConcurrentSnapshotBuilds <= 0 ||
+		limits.MaxConcurrentSnapshotChunkRequests <= 0 {
+		return fmt.Errorf("capabilities bundle_limits required snapshot limits must be positive")
+	}
+	if limits.DefaultRowsPerSnapshotChunk > limits.MaxRowsPerSnapshotChunk {
+		return fmt.Errorf("capabilities default_rows_per_snapshot_chunk exceeds maximum")
+	}
+	if limits.DefaultBytesPerSnapshotChunk > limits.MaxBytesPerSnapshotChunk {
+		return fmt.Errorf("capabilities default_bytes_per_snapshot_chunk exceeds maximum")
+	}
+	if limits.MaxBytesPerSnapshotRow > limits.MaxBytesPerSnapshotChunk {
+		return fmt.Errorf("capabilities max_bytes_per_snapshot_row exceeds chunk maximum")
+	}
+	return nil
+}
+
+func (response *CapabilitiesResponse) UnmarshalJSON(data []byte) error {
+	type plainResponse CapabilitiesResponse
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"protocol_version", "schema_version", "features", "bundle_limits"} {
+		value, ok := fields[name]
+		if !ok || string(value) == "null" {
+			return fmt.Errorf("capabilities response missing required %s", name)
+		}
+	}
+	var decoded plainResponse
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Features == nil {
+		return fmt.Errorf("capabilities response features must be an object")
+	}
+	*response = CapabilitiesResponse(decoded)
+	return nil
 }
 
 // RegisteredTableSpec describes one registered sync table in the newer contract surface.
@@ -190,8 +278,18 @@ type RegisteredTableSpec struct {
 
 // ErrorResponse represents an error response
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
+	Error             string `json:"error"`
+	Message           string `json:"message"`
+	RequiredByteCount int64  `json:"required_byte_count,omitempty"`
+}
+
+// SnapshotSessionLimitResponse reports a stable snapshot materialization limit failure.
+type SnapshotSessionLimitResponse struct {
+	Error     string `json:"error"`
+	Message   string `json:"message"`
+	Dimension string `json:"dimension"`
+	Actual    int64  `json:"actual"`
+	Limit     int64  `json:"limit"`
 }
 
 type SourceRetiredResponse struct {
@@ -199,6 +297,40 @@ type SourceRetiredResponse struct {
 	Message            string `json:"message"`
 	SourceID           string `json:"source_id"`
 	ReplacedBySourceID string `json:"replaced_by_source_id,omitempty"`
+}
+
+func (response *SourceRetiredResponse) UnmarshalJSON(data []byte) error {
+	type plainResponse SourceRetiredResponse
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"error", "message", "source_id"} {
+		value, ok := fields[name]
+		if !ok || string(value) == "null" {
+			return fmt.Errorf("source_retired response missing required %s", name)
+		}
+	}
+	if replacement, ok := fields["replaced_by_source_id"]; ok && string(replacement) == "null" {
+		return fmt.Errorf("source_retired replaced_by_source_id must be omitted or non-null")
+	}
+	var decoded plainResponse
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Error != "source_retired" {
+		return fmt.Errorf("source_retired response has invalid error code")
+	}
+	if err := sourceid.Validate(decoded.SourceID); err != nil {
+		return fmt.Errorf("source_retired response source_id is invalid: %w", err)
+	}
+	if _, present := fields["replaced_by_source_id"]; present {
+		if err := sourceid.Validate(decoded.ReplacedBySourceID); err != nil {
+			return fmt.Errorf("source_retired response replaced_by_source_id is invalid: %w", err)
+		}
+	}
+	*response = SourceRetiredResponse(decoded)
+	return nil
 }
 
 // PushConflictDetails describes one authoritative row state that rejected a push commit.

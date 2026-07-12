@@ -927,6 +927,7 @@ func TestRebuildKeepSource_RejectsSnapshotResponseMissingBundleSeq(t *testing.T)
 			return jsonResponse(map[string]any{
 				"snapshot_id": "snapshot-missing-bundle-seq",
 				"row_count":   1,
+				"byte_count":  1,
 				"expires_at":  "2030-01-01T00:00:00Z",
 			}), nil
 		case "/sync/snapshot-sessions/snapshot-missing-bundle-seq":
@@ -1396,6 +1397,7 @@ func TestRebuildKeepSource_OneChunkStillStagesBeforeFinalApply(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 	require.Equal(t, 0, count)
 
+	require.NoError(t, client.markCheckpointRecoveryRequiredLocked(ctx, "explicit_rebuild"))
 	require.NoError(t, client.applyStagedSnapshotLocked(ctx, session, snapshotApplyOptions{}))
 	require.Equal(t, 0, snapshotStageCount(t, db))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))

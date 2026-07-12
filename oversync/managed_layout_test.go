@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -166,7 +167,7 @@ func TestBootstrap_ValidatesManagedLayoutManifest(t *testing.T) {
 	require.Equal(t, captureTriggerOID, captureTriggerOIDAfter)
 }
 
-func TestBootstrap_RejectsManagedLayoutDriftAtomically(t *testing.T) {
+func TestBootstrap_ExistingLayoutRejectsManagedDriftWithoutMutation(t *testing.T) {
 	tests := []struct {
 		name string
 		sql  string
@@ -215,11 +216,52 @@ func TestBootstrap_RejectsManagedLayoutDriftAtomically(t *testing.T) {
 			require.Contains(t, err.Error(), syncSchemaLayoutName)
 			require.Contains(t, err.Error(), "expected fingerprint")
 			require.Contains(t, err.Error(), "actual fingerprint")
+			for _, forbidden := range []string{"drop and recreate", "recreate the", "truncate the database", "rewrite the"} {
+				require.NotContains(t, strings.ToLower(err.Error()), forbidden)
+			}
 			require.Equal(t, before, fixture.authoritativeCounts(t))
 			_, err = second.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
 			require.ErrorIs(t, err, errServiceNotReady)
 		})
 	}
+}
+
+func TestBootstrap_ExistingLayoutCancellationLeavesDatabaseUnchanged(t *testing.T) {
+	fixture := newManagedLayoutTestFixture(t, "managed_cancel_")
+	before := fixture.authoritativeCounts(t)
+	service := fixture.newService(t, "managed-layout-cancel")
+
+	lockTx, err := fixture.harness.pool.Begin(fixture.ctx)
+	require.NoError(t, err)
+	_, err = lockTx.Exec(fixture.ctx, `SELECT pg_advisory_xact_lock($1)`, syncBootstrapLockKey)
+	require.NoError(t, err)
+
+	attachCtx, cancel := context.WithCancel(fixture.ctx)
+	done := make(chan error, 1)
+	go func() { done <- service.Bootstrap(attachCtx) }()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		queryErr := fixture.harness.pool.QueryRow(fixture.ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_locks
+				WHERE locktype = 'advisory' AND NOT granted
+			)
+		`).Scan(&waiting)
+		return queryErr == nil && waiting
+	}, 5*time.Second, 10*time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.Equal(t, before, fixture.authoritativeCounts(t))
+	require.NoError(t, service.validateManagedLayout(fixture.ctx, fixture.harness.pool))
+	_, err = service.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
+	require.ErrorIs(t, err, errServiceNotReady)
+
+	require.NoError(t, lockTx.Rollback(fixture.ctx))
+	require.Eventually(t, func() bool {
+		return fixture.harness.pool.Stat().AcquiredConns() == 0
+	}, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, service.Bootstrap(fixture.ctx))
+	require.Equal(t, before, fixture.authoritativeCounts(t))
 }
 
 func TestBootstrap_ManagedLayoutDriftReadinessAndRetry(t *testing.T) {

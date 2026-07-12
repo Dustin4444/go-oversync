@@ -14,11 +14,6 @@ func managedSyncTables() []oversqlite.SyncTable {
 		{
 			TableName:         "typed_rows",
 			SyncKeyColumnName: "id",
-			NumericColumns: map[string]oversqlite.NumericColumnKind{
-				"count_value":  oversqlite.NumericColumnExactInt64,
-				"enabled_flag": oversqlite.NumericColumnExactInt64,
-				"rating":       oversqlite.NumericColumnApproximate,
-			},
 		},
 	}
 }

@@ -24,7 +24,7 @@ func TestAuditCanonicalJSON_PreservesExactNumbers(t *testing.T) {
 	canonical, err := canonicalJSON(raw)
 	require.NoError(t, err)
 	require.Equal(t, `{"decimal":"1234567890.123456789","integer":"9007199254740993"}`, string(canonical),
-		"schema-typed exact numeric strings must survive JCS byte-for-byte")
+		"uniform numeric strings must survive JCS byte-for-byte")
 }
 
 func TestAuditPayloadExtractor_Int64RejectsFractionalNumbers(t *testing.T) {
@@ -41,10 +41,10 @@ func TestAuditRetainedFloor_RejectsZeroCheckpointAfterPruning(t *testing.T) {
 	require.ErrorAs(t, err, &prunedErr, "checkpoint zero cannot reconstruct state once history has been pruned")
 }
 
-func TestAuditActorMiddleware_PreservesExactProtocolTokens(t *testing.T) {
+func TestAuditActorMiddleware_PreservesExactVisibleASCIISourceToken(t *testing.T) {
 	const (
 		userID   = " audit-user "
-		sourceID = " audit-source "
+		sourceID = "audit-source!~"
 	)
 
 	var actor Actor
@@ -60,7 +60,7 @@ func TestAuditActorMiddleware_PreservesExactProtocolTokens(t *testing.T) {
 	request.Header.Set(SourceIDHeader, sourceID)
 	handler.ServeHTTP(httptest.NewRecorder(), request)
 
-	require.Equal(t, userID, actor.UserID, "middleware must not silently normalize user_id")
+	require.Equal(t, "audit-user", actor.UserID, "human-facing user id handling remains unchanged")
 	require.Equal(t, sourceID, actor.SourceID, "middleware must not silently normalize source_id")
 }
 

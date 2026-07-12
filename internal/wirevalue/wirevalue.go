@@ -1,20 +1,14 @@
-// Package wirevalue validates schema-typed exact numeric strings used by the
-// Oversync wire contract.
+// Package wirevalue validates numeric strings used by the Oversync wire
+// contract.
 package wirevalue
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
-)
 
-// NumericKind identifies the representation of one configured numeric column.
-type NumericKind string
-
-const (
-	NumericKindExactInt64   NumericKind = "exact_int64"
-	NumericKindExactDecimal NumericKind = "exact_decimal"
-	NumericKindApproximate  NumericKind = "approximate"
+	"github.com/mobiletoly/go-oversync/internal/jcs"
 )
 
 var decimalPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?(0|[1-9][0-9]*))?$`)
@@ -38,6 +32,37 @@ func ValidateDecimal(raw string) error {
 		return fmt.Errorf("must use canonical finite decimal text")
 	}
 	return nil
+}
+
+// ParseFloat64 validates the canonical RFC 8785 spelling of one finite
+// binary64 value and returns the parsed value.
+func ParseFloat64(raw string) (float64, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("must use canonical finite binary64 text")
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
+		return 0, fmt.Errorf("must use canonical finite binary64 text")
+	}
+	canonical, err := RenderFloat64(value)
+	if err != nil || canonical != raw {
+		return 0, fmt.Errorf("must use canonical finite binary64 text")
+	}
+	return value, nil
+}
+
+// RenderFloat64 returns the RFC 8785/ECMAScript shortest round-trip spelling
+// for one finite binary64 value. Negative zero is normalized to "0".
+func RenderFloat64(value float64) (string, error) {
+	if math.IsInf(value, 0) || math.IsNaN(value) {
+		return "", fmt.Errorf("must be a finite binary64 value")
+	}
+	raw := strconv.FormatFloat(value, 'g', -1, 64)
+	canonical, err := jcs.Canonicalize([]byte(raw))
+	if err != nil {
+		return "", fmt.Errorf("render canonical binary64 text: %w", err)
+	}
+	return string(canonical), nil
 }
 
 func isNegativeDecimalZero(raw string) bool {

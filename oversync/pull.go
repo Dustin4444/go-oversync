@@ -55,7 +55,7 @@ func (s *SyncService) ProcessPull(
 		var prunedErr *HistoryPrunedError
 		if errors.As(err, &prunedErr) {
 			if recordErr := s.recordHistoryPrunedError(ctx); recordErr != nil {
-				s.logger.Warn("Failed to record history_pruned event", "error", recordErr, "user_id", actor.UserID, "source_id", actor.SourceID)
+				s.logger.Warn("Failed to record history_pruned event", "error_type", fmt.Sprintf("%T", recordErr))
 			}
 		}
 		return nil, err
@@ -174,37 +174,6 @@ func (s *SyncService) processPullQuerier(
 		Bundles:         bundles,
 		HasMore:         hasMore,
 	}, nil
-}
-
-func userHighestBundleSeqQuerier(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, userID string) (int64, error) {
-	var maxSeq int64
-	err := q.QueryRow(ctx, `
-		SELECT next_bundle_seq - 1
-		FROM sync.user_state
-		WHERE user_id = @user_id
-	`, pgx.NamedArgs{"user_id": userID}).Scan(&maxSeq)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("query user highest bundle seq: %w", err)
-	}
-	return maxSeq, nil
-}
-
-func enforceRetainedBundleFloorQuerier(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, userID string, providedSeq int64) error {
-	state, err := loadRetainedHistoryStateByUserID(ctx, q, userID)
-	if err != nil {
-		return err
-	}
-	if state == nil {
-		return nil
-	}
-	return enforceRetainedBundleFloor(userID, providedSeq, state.RetainedFloor)
 }
 
 func (s *SyncService) recordHistoryPrunedError(ctx context.Context) error {

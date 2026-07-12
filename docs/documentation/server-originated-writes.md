@@ -164,6 +164,12 @@ already use for synced data:
 - `GET /sync/pull`
 - snapshot rebuild after `history_pruned`
 
+The transaction and durability contract is unchanged across service restarts. Existing-layout
+Bootstrap validates managed definitions and then trusts PostgreSQL's committed business and sync
+rows; it does not replay or rewrite a supported `ExecWrite(...)` or `WithinSyncBundle(...)` commit.
+Ordinary direct registered-table DML without either supported bundle context remains rejected, as
+does every registered-table `TRUNCATE`.
+
 For executable end-to-end examples, see:
 
 - [examples/nethttp_server/server/scope_manager_sync_test.go](/Users/pochkin/Projects/my/go-oversync/examples/nethttp_server/server/scope_manager_sync_test.go)

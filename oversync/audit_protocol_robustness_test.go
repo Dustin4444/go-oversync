@@ -19,8 +19,8 @@ import (
 
 // Existing audit owners intentionally remain authoritative for overlapping
 // Phase 5 evidence:
-//   - TestAuditActorMiddleware_PreservesExactProtocolTokens covers whitespace
-//     normalization of exact scope and source identities.
+//   - TestAuditActorMiddleware_PreservesExactVisibleASCIISourceToken covers
+//     exact valid source identities.
 //   - TestAuditHTTPCreatePushSession_RejectsUnknownFields,
 //     TestAuditHTTPCreatePushSession_RejectsTrailingJSONDocument, and
 //     TestAuditHTTPCreatePushSession_RejectsUnsupportedContentType cover the
@@ -385,7 +385,7 @@ func TestAuditProtocolGreen_PushParserRejectsMalformedIdentifiersAndSyncKeys(t *
 			row := newAuditProtocolValidRow()
 			test.mutate(&row)
 
-			_, err := service.preparePushRows([]PushRequestRow{row})
+			_, err := service.preparePushRowsWithOptions([]PushRequestRow{row}, false)
 			var validationErr *PushValidationError
 			require.ErrorAs(t, err, &validationErr)
 		})
@@ -433,7 +433,7 @@ func TestAuditProtocolContract_PushParserRejectsUnknownColumnsBeforeStaging(t *t
 	row := newAuditProtocolValidRow()
 	row.Payload = json.RawMessage(`{"id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","name":"audit","unknown_column":true}`)
 
-	_, err := service.preparePushRows([]PushRequestRow{row})
+	_, err := service.preparePushRowsWithOptions([]PushRequestRow{row}, false)
 	require.Error(t, err, "columns absent from the discovered registered-table shape must fail before staging")
 }
 

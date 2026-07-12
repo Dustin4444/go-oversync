@@ -55,19 +55,24 @@ layout is already marked ready.
 The `sync` schema is reserved. Bootstrap also validates every managed table, column, constraint,
 index, sequence, function, and reserved registered-table trigger before readiness. A coherent
 marked layout is not rewritten. Drift fails with a typed `managed sync layout mismatch`; stop all
-server instances, restore the exact object (or use the coordinated recreation procedure below), and
-retry. Do not run mixed server versions during repair.
+server instances, investigate the reported definition delta, and restore a reviewed compatible
+backup or follow a separately reviewed operator procedure. Do not run mixed server versions.
 
 Nullable identities fail before sync metadata or registered-trigger mutation even when the table is
 empty. Stop writers, resolve existing NULL values through application policy, add the reported
 `NOT NULL` constraints, and retry. Coordinate the migration before starting corrected servers;
 older binaries do not enforce it. HTTP/wire, checkpoint, pull, and snapshot semantics are unchanged.
 
-Do not migrate or repair an incompatible database in place. Stop all server and client processes,
-recreate PostgreSQL with permanent logged business tables, recreate every Go, KMP, and Dart client
-database, and deploy compatible versions together. This reset discards business rows, sync
-history, staged sessions, checkpoints, outboxes, and offline work; mixed-version operation is
-unsupported.
+For a fresh managed layout, Bootstrap locks registered tables and atomically adopts existing
+business rows before readiness. Once that transaction has committed, ordinary restarts use a
+trusted-database attachment path. Attachment revalidates registered declarations and exact managed
+definitions but reads no business rows or managed operational state, takes no explicit data locks,
+and performs no DML, DDL, adoption, hashing, or repair.
+
+Normal direct registered-table `INSERT`, `UPDATE`, and `DELETE` without bundle context remain
+rejected, as does every registered-table `TRUNCATE`. Privileged guard bypass and direct edits to
+managed rows are unsupported. Bootstrap does not detect or repair those data mutations; restore a
+known coherent backup or use a separately reviewed operator procedure.
 
 Recommended pattern:
 

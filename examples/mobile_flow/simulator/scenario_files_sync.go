@@ -172,7 +172,7 @@ func (s *FilesSyncScenario) Verify(ctx context.Context, verifier *DatabaseVerifi
 	logger.Info("🔍 Verifying files sync scenario")
 
 	// Verify files were synced to server (3 remaining after deletion)
-	filesCount, err := verifier.CountRows("business.files")
+	filesCount, err := verifier.CountUserRecords(ctx, "business.files", s.config.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to count files: %w", err)
 	}
@@ -183,7 +183,7 @@ func (s *FilesSyncScenario) Verify(ctx context.Context, verifier *DatabaseVerifi
 
 	// Verify file reviews were synced to server
 	// The first file had 2 reviews (indices 0 and 4), so we should have 4 remaining reviews
-	reviewsCount, err := verifier.CountRows("business.file_reviews")
+	reviewsCount, err := verifier.CountUserRecords(ctx, "business.file_reviews", s.config.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to count file reviews: %w", err)
 	}

@@ -4,12 +4,14 @@ package oversync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +37,9 @@ type auditScalabilityOperationSample struct {
 // and ten measured samples. Scales above the smallest point additionally require
 // OVERSYNC_AUDIT_FULL_SCALE=1.
 func BenchmarkAuditScalabilityConcurrentPushes(b *testing.B) {
+	if os.Getenv(auditScalabilityFullScaleEnv) != "" && strings.EqualFold(os.Getenv("GITHUB_ACTIONS"), "true") {
+		b.Fatalf("full-scale audit benchmarks are local-only and must not run in GitHub Actions")
+	}
 	topologies := []struct {
 		name           string
 		distinctScopes bool
@@ -251,6 +256,498 @@ func BenchmarkAuditScalabilityBootstrapRegisteredTables(b *testing.B) {
 			auditReportScalabilityAllocations(b, allocatedBytes, mallocs, workUnits, "table")
 		})
 	}
+}
+
+type auditPopulatedBootstrapScenario struct {
+	name         string
+	scopeCount   int
+	rowsPerScope int
+	historyShape string
+	pristine     bool
+}
+
+type auditPopulatedBootstrapFixture struct {
+	ctx       context.Context
+	setupPool *pgxpool.Pool
+	pool      *pgxpool.Pool
+	tracer    *adoptionQueryTracer
+	config    *ServiceConfig
+	scenario  auditPopulatedBootstrapScenario
+	totalRows int
+	spoolDir  string
+}
+
+type auditTemporaryUsage struct {
+	bytes int64
+	files int64
+}
+
+type auditPopulatedBootstrapEvidence struct {
+	postgresTemp auditTemporaryUsage
+	spoolBytes   int64
+	spoolCreated int64
+	spoolBefore  auditTemporaryUsage
+	spoolAfter   auditTemporaryUsage
+}
+
+func BenchmarkAuditScalabilityBootstrapPopulatedScopes(b *testing.B) {
+	scenarios := []auditPopulatedBootstrapScenario{
+		{name: "coherent_small", scopeCount: 10, rowsPerScope: 50, historyShape: "retained"},
+		{name: "coherent_pruned_medium", scopeCount: 100, rowsPerScope: 500, historyShape: "pruned"},
+		{name: "coherent_mixed_medium", scopeCount: 100, rowsPerScope: 500, historyShape: "mixed"},
+		{name: "coherent_reference", scopeCount: 500, rowsPerScope: 700, historyShape: "retained_pruned"},
+		{name: "pristine_adoption_medium", scopeCount: 100, rowsPerScope: 500, historyShape: "pristine", pristine: true},
+	}
+	for _, scenario := range scenarios {
+		b.Run(scenario.name, func(b *testing.B) {
+			auditRequireScalabilityProfile(b, scenario.scopeCount, 10)
+			fixture := newAuditPopulatedBootstrapFixture(b, scenario)
+			var queryTotals adoptionQueryCounts
+			var evidenceTotals auditPopulatedBootstrapEvidence
+			latencies, allocatedBytes, mallocs := auditRunFixedScalabilitySamples(b, func(measured bool) auditScalabilityOperationSample {
+				sample, counts, evidence := fixture.runBootstrapSample(b, measured)
+				if measured {
+					queryTotals.total += counts.total
+					queryTotals.business += counts.business
+					queryTotals.scopeEnvelope += counts.scopeEnvelope
+					queryTotals.currentRow += counts.currentRow
+					queryTotals.currentRowStatements += counts.currentRowStatements
+					queryTotals.history += counts.history
+					queryTotals.historyStatements += counts.historyStatements
+					queryTotals.persistence += counts.persistence
+					evidenceTotals.postgresTemp.bytes += evidence.postgresTemp.bytes
+					evidenceTotals.postgresTemp.files += evidence.postgresTemp.files
+					evidenceTotals.spoolBytes += evidence.spoolBytes
+					evidenceTotals.spoolCreated += evidence.spoolCreated
+					evidenceTotals.spoolBefore.bytes += evidence.spoolBefore.bytes
+					evidenceTotals.spoolBefore.files += evidence.spoolBefore.files
+					evidenceTotals.spoolAfter.bytes += evidence.spoolAfter.bytes
+					evidenceTotals.spoolAfter.files += evidence.spoolAfter.files
+				}
+				return sample
+			})
+
+			measuredElapsed := auditDurationSum(latencies)
+			rowWorkUnits := float64(fixture.totalRows * auditScalabilitySamples)
+			scopeWorkUnits := float64(scenario.scopeCount * auditScalabilitySamples)
+			auditReportScalabilityMetrics(b, latencies, latencies, rowWorkUnits, measuredElapsed, "rows/s")
+			b.ReportMetric(scopeWorkUnits/measuredElapsed.Seconds(), "scopes/s")
+			auditReportScalabilityAllocations(b, allocatedBytes, mallocs, rowWorkUnits, "row")
+			b.ReportMetric(float64(queryTotals.total)/auditScalabilitySamples, "total-queries/op")
+			b.ReportMetric(float64(queryTotals.business)/auditScalabilitySamples, "business-queries/op")
+			b.ReportMetric(float64(queryTotals.scopeEnvelope)/auditScalabilitySamples, "scope-envelope-queries/op")
+			b.ReportMetric(float64(queryTotals.currentRow)/auditScalabilitySamples, "current-row-queries/op")
+			b.ReportMetric(float64(queryTotals.currentRowStatements)/auditScalabilitySamples, "current-row-statements/op")
+			b.ReportMetric(float64(queryTotals.history)/auditScalabilitySamples, "history-queries/op")
+			b.ReportMetric(float64(queryTotals.historyStatements)/auditScalabilitySamples, "history-statements/op")
+			b.ReportMetric(float64(queryTotals.persistence)/auditScalabilitySamples, "persistence-queries/op")
+			b.ReportMetric(float64(fixture.totalRows), "observed-business-rows/op")
+			b.ReportMetric(float64(scenario.scopeCount), "observed-scopes/op")
+			b.ReportMetric(float64(evidenceTotals.postgresTemp.bytes)/auditScalabilitySamples, "postgres-temp-bytes/op")
+			b.ReportMetric(float64(evidenceTotals.postgresTemp.files)/auditScalabilitySamples, "postgres-temp-files/op")
+			b.ReportMetric(float64(evidenceTotals.spoolBytes)/auditScalabilitySamples, "owned-spool-bytes/op")
+			b.ReportMetric(float64(evidenceTotals.spoolCreated)/auditScalabilitySamples, "owned-spool-files/op")
+			b.ReportMetric(float64(evidenceTotals.spoolBefore.files)/auditScalabilitySamples, "owned-spool-files-before/op")
+			b.ReportMetric(float64(evidenceTotals.spoolAfter.files)/auditScalabilitySamples, "owned-spool-files-after/op")
+			b.ReportMetric(float64(evidenceTotals.spoolAfter.bytes)/auditScalabilitySamples, "owned-spool-bytes-after/op")
+		})
+	}
+}
+
+func BenchmarkAuditScalabilityBootstrapExistingLayout(b *testing.B) {
+	scenarios := []auditPopulatedBootstrapScenario{
+		{name: "empty", scopeCount: 0, rowsPerScope: 0, historyShape: "retained"},
+		{name: "reference_500_scopes_350000_rows", scopeCount: 500, rowsPerScope: 700, historyShape: "retained_pruned"},
+	}
+	for _, scenario := range scenarios {
+		b.Run(scenario.name, func(b *testing.B) {
+			auditRequireScalabilityProfile(b, scenario.scopeCount, 0)
+			b.StopTimer()
+			fixture := newAuditPopulatedBootstrapFixture(b, scenario)
+			fixture.tracer.businessSchema = fixture.config.RegisteredTables[0].Schema
+			var totalAllocated, totalMallocs uint64
+			var totalDuration time.Duration
+			var totalQueries int
+			for range b.N {
+				sample, counts, evidence := fixture.runBootstrapSample(b, true)
+				if counts.business != 0 || counts.scopeEnvelope != 0 || counts.currentRow != 0 || counts.history != 0 || counts.persistence != 0 {
+					b.Fatalf("existing attachment queried row data or persistence state: %+v", counts)
+				}
+				if counts.explicitDataLocks != 0 || counts.dml != 0 || counts.ddl != 0 {
+					b.Fatalf("existing attachment locked or mutated data: %+v", counts)
+				}
+				if len(counts.unknown) != 0 {
+					b.Fatalf("unclassified existing-attachment SQL: %q", counts.unknown)
+				}
+				if evidence.spoolCreated != 0 || evidence.spoolBytes != 0 || evidence.spoolAfter.files != 0 || evidence.spoolAfter.bytes != 0 {
+					b.Fatalf("existing attachment used adoption spools: %+v", evidence)
+				}
+				if evidence.postgresTemp != (auditTemporaryUsage{}) {
+					b.Fatalf("existing attachment created PostgreSQL temporary files: %+v", evidence.postgresTemp)
+				}
+				totalAllocated += sample.allocatedBytes
+				totalMallocs += sample.mallocs
+				totalDuration += sample.duration
+				totalQueries += counts.total
+			}
+			operations := float64(b.N)
+			b.ReportMetric(float64(totalDuration.Nanoseconds())/operations, "attach-ns/op")
+			b.ReportMetric(float64(totalAllocated)/operations, "allocated-bytes/op")
+			b.ReportMetric(float64(totalMallocs)/operations, "mallocs/op")
+			b.ReportMetric(float64(totalQueries)/operations, "total-queries/op")
+			b.ReportMetric(0, "owned-spool-bytes/op")
+			b.ReportMetric(0, "owned-spool-files/op")
+			b.ReportMetric(0, "postgres-temp-bytes/op")
+			b.ReportMetric(0, "postgres-temp-files/op")
+		})
+	}
+}
+
+func newAuditPopulatedBootstrapFixture(
+	b *testing.B,
+	scenario auditPopulatedBootstrapScenario,
+) *auditPopulatedBootstrapFixture {
+	b.Helper()
+	base := newAuditDatabaseBenchmarkFixture(b, "populated_"+scenario.name)
+	if err := base.svc.Close(context.Background()); err != nil {
+		b.Fatalf("close populated benchmark setup service: %v", err)
+	}
+	if err := resetTestSyncSchema(base.ctx, base.pool); err != nil {
+		b.Fatalf("reset sync schema for populated benchmark: %v", err)
+	}
+
+	schemaName := fmt.Sprintf(
+		"audit_populated_%s_%d",
+		scenario.name,
+		managedIntegrationDatabaseSequence.Add(1),
+	)
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	if _, err := base.pool.Exec(base.ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent)); err != nil {
+		b.Fatalf("create populated benchmark schema: %v", err)
+	}
+	b.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := dropTestSchema(cleanupCtx, base.pool, schemaName); err != nil {
+			b.Errorf("drop populated benchmark schema: %v", err)
+		}
+	})
+
+	const tableCount = 8
+	registeredTables := make([]RegisteredTable, tableCount)
+	for tableIndex := range tableCount {
+		tableName := fmt.Sprintf("table_%02d", tableIndex)
+		tableIdent := pgx.Identifier{schemaName, tableName}.Sanitize()
+		if _, err := base.pool.Exec(base.ctx, fmt.Sprintf(`
+			CREATE TABLE %s (
+				_sync_scope_id TEXT NOT NULL,
+				id TEXT NOT NULL,
+				payload TEXT NOT NULL,
+				PRIMARY KEY (_sync_scope_id, id)
+			)
+		`, tableIdent)); err != nil {
+			b.Fatalf("create populated benchmark table %d: %v", tableIndex, err)
+		}
+		registeredTables[tableIndex] = RegisteredTable{
+			Schema:         schemaName,
+			Table:          tableName,
+			SyncKeyColumns: []string{"id"},
+		}
+	}
+
+	for tableIndex := range tableCount {
+		rowsForTable := scenario.rowsPerScope / tableCount
+		if tableIndex < scenario.rowsPerScope%tableCount {
+			rowsForTable++
+		}
+		tableName := fmt.Sprintf("table_%02d", tableIndex)
+		tableIdent := pgx.Identifier{schemaName, tableName}.Sanitize()
+		if _, err := base.pool.Exec(base.ctx, fmt.Sprintf(`
+			INSERT INTO %s (_sync_scope_id, id, payload)
+			SELECT
+				'scope-' || lpad(scope_index::text, 6, '0'),
+				'key-%02d-' || lpad(row_index::text, 6, '0'),
+				repeat('p', 64) || '-' || scope_index::text || '-' || row_index::text
+			FROM generate_series(0, $1 - 1) AS scopes(scope_index)
+			CROSS JOIN generate_series(0, $2 - 1) AS rows(row_index)
+		`, tableIdent, tableIndex), scenario.scopeCount, rowsForTable); err != nil {
+			b.Fatalf("seed populated benchmark table %d: %v", tableIndex, err)
+		}
+	}
+
+	config := &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "oversync-audit-populated-" + scenario.name,
+		RegisteredTables:          registeredTables,
+	}
+	if !scenario.pristine {
+		setupService, err := NewRuntimeService(base.pool, config, integrationTestLogger(slog.LevelWarn))
+		if err != nil {
+			b.Fatalf("create populated benchmark setup service: %v", err)
+		}
+		if err := setupService.Bootstrap(base.ctx); err != nil {
+			b.Fatalf("bootstrap populated benchmark setup: %v", err)
+		}
+		if scenario.historyShape == "mixed" {
+			auditSeedPopulatedBenchmarkTombstones(b, base.ctx, setupService, schemaName, scenario.scopeCount)
+		}
+		if err := setupService.Close(context.Background()); err != nil {
+			b.Fatalf("close coherent populated benchmark setup service: %v", err)
+		}
+		switch scenario.historyShape {
+		case "pruned":
+			auditPrunePopulatedBenchmarkBaselines(b, base.ctx, base.pool, false)
+		case "retained_pruned":
+			auditPrunePopulatedBenchmarkBaselines(b, base.ctx, base.pool, true)
+		}
+	}
+
+	tracer := &adoptionQueryTracer{}
+	poolConfig, err := pgxpool.ParseConfig(base.pool.Config().ConnString())
+	if err != nil {
+		b.Fatalf("parse populated benchmark pool config: %v", err)
+	}
+	poolConfig.ConnConfig.Tracer = tracer
+	poolConfig.ConnConfig.RuntimeParams["application_name"] = "oversync-populated-bootstrap-benchmark"
+	pool, err := pgxpool.NewWithConfig(base.ctx, poolConfig)
+	if err != nil {
+		b.Fatalf("create populated benchmark traced pool: %v", err)
+	}
+	if err := pool.Ping(base.ctx); err != nil {
+		pool.Close()
+		b.Fatalf("ping populated benchmark traced pool: %v", err)
+	}
+	b.Cleanup(pool.Close)
+	totalRows := 0
+	for _, table := range registeredTables {
+		var tableRows int
+		if err := base.pool.QueryRow(base.ctx, fmt.Sprintf(
+			"SELECT count(*) FROM %s",
+			pgx.Identifier{table.Schema, table.Table}.Sanitize(),
+		)).Scan(&tableRows); err != nil {
+			b.Fatalf("count observed populated benchmark rows for %s.%s: %v", table.Schema, table.Table, err)
+		}
+		totalRows += tableRows
+	}
+	if scenario.historyShape == "mixed" && totalRows != 49_900 {
+		b.Fatalf("mixed populated benchmark must observe 49,900 business rows after tombstones, got %d", totalRows)
+	}
+
+	return &auditPopulatedBootstrapFixture{
+		ctx:       base.ctx,
+		setupPool: base.pool,
+		pool:      pool,
+		tracer:    tracer,
+		config:    config,
+		scenario:  scenario,
+		totalRows: totalRows,
+		spoolDir:  b.TempDir(),
+	}
+}
+
+func auditSeedPopulatedBenchmarkTombstones(
+	b *testing.B,
+	ctx context.Context,
+	service *SyncService,
+	schemaName string,
+	scopeCount int,
+) {
+	b.Helper()
+	for scopeIndex := range scopeCount {
+		actor := Actor{
+			UserID:   fmt.Sprintf("scope-%06d", scopeIndex),
+			SourceID: fmt.Sprintf("benchmark-writer-%06d", scopeIndex),
+		}
+		row := PushRequestRow{
+			Schema:         schemaName,
+			Table:          "table_00",
+			Key:            SyncKey{"id": "key-00-000000"},
+			Op:             OpDelete,
+			BaseRowVersion: 1,
+		}
+		requestHash, err := computeCanonicalPushRequestHash([]PushRequestRow{row})
+		if err != nil {
+			b.Fatalf("hash populated benchmark tombstone %d: %v", scopeIndex, err)
+		}
+		response, err := service.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
+			SourceBundleID:       1,
+			PlannedRowCount:      1,
+			CanonicalRequestHash: requestHash,
+		})
+		if err != nil {
+			b.Fatalf("create populated benchmark tombstone session %d: %v", scopeIndex, err)
+		}
+		if _, err := service.UploadPushChunk(ctx, actor, response.PushID, &PushSessionChunkRequest{
+			StartRowOrdinal: 0,
+			Rows:            []PushRequestRow{row},
+		}); err != nil {
+			b.Fatalf("upload populated benchmark tombstone %d: %v", scopeIndex, err)
+		}
+		if _, err := service.CommitPushSession(ctx, actor, response.PushID); err != nil {
+			b.Fatalf("commit populated benchmark tombstone %d: %v", scopeIndex, err)
+		}
+	}
+}
+
+func auditPrunePopulatedBenchmarkBaselines(
+	b *testing.B,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	halfOnly bool,
+) {
+	b.Helper()
+	condition := "TRUE"
+	if halfOnly {
+		condition = "users.user_pk % 2 = 0"
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		DELETE FROM sync.bundle_log AS bundles
+		USING sync.user_state AS users
+		WHERE bundles.user_pk = users.user_pk
+		  AND bundles.bundle_seq = 1
+		  AND %s
+	`, condition)); err != nil {
+		b.Fatalf("delete populated benchmark baseline history: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		UPDATE sync.user_state AS users
+		SET retained_bundle_floor = 1
+		WHERE %s
+	`, condition)); err != nil {
+		b.Fatalf("advance populated benchmark retained floor: %v", err)
+	}
+}
+
+func (f *auditPopulatedBootstrapFixture) runBootstrapSample(
+	b *testing.B,
+	measured bool,
+) (auditScalabilityOperationSample, adoptionQueryCounts, auditPopulatedBootstrapEvidence) {
+	b.Helper()
+	if f.scenario.pristine {
+		if err := resetTestSyncSchema(f.ctx, f.setupPool); err != nil {
+			b.Fatalf("reset pristine populated benchmark sync schema: %v", err)
+		}
+	}
+	config := *f.config
+	service, err := NewRuntimeService(f.pool, &config, integrationTestLogger(slog.LevelWarn))
+	if err != nil {
+		b.Fatalf("create populated benchmark service: %v", err)
+	}
+	service.adoptionSpoolDir = f.spoolDir
+	var evidence auditPopulatedBootstrapEvidence
+	createdSpools := make(map[string]struct{})
+	var spoolCleanupErr error
+	if measured {
+		evidence.spoolBefore = auditOwnedDirectoryUsage(b, f.spoolDir)
+		service.adoptionHooks = &adoptionTestHooks{
+			onSpoolCreated: func(_ int, path string) {
+				createdSpools[path] = struct{}{}
+				evidence.spoolCreated++
+			},
+			onSpoolRemoved: func(_ int, path string, bytes int64, cleanupErr error) {
+				delete(createdSpools, path)
+				evidence.spoolBytes += bytes
+				spoolCleanupErr = errors.Join(spoolCleanupErr, cleanupErr)
+			},
+		}
+	}
+	var beforePostgres auditTemporaryUsage
+	if measured {
+		beforePostgres = f.postgresTempUsage(b)
+	}
+	f.tracer.reset()
+	var beforeMemory runtime.MemStats
+	if measured {
+		runtime.ReadMemStats(&beforeMemory)
+		b.StartTimer()
+	}
+	startedAt := time.Now()
+	err = service.Bootstrap(f.ctx)
+	elapsed := time.Since(startedAt)
+	counts := f.tracer.counts()
+	var afterMemory runtime.MemStats
+	if measured {
+		b.StopTimer()
+		runtime.ReadMemStats(&afterMemory)
+		afterPostgres := f.postgresTempUsage(b)
+		evidence.postgresTemp, err = auditTemporaryUsageDelta(beforePostgres, afterPostgres)
+		if err != nil {
+			b.Fatalf("calculate PostgreSQL temporary usage delta: %v", err)
+		}
+		evidence.spoolAfter = auditOwnedDirectoryUsage(b, f.spoolDir)
+		if spoolCleanupErr != nil {
+			b.Fatalf("clean populated benchmark owned spool: %v", spoolCleanupErr)
+		}
+		if len(createdSpools) != 0 || evidence.spoolAfter.files != 0 || evidence.spoolAfter.bytes != 0 {
+			b.Fatalf("populated benchmark leaked owned spools: tracked=%d files=%d bytes=%d", len(createdSpools), evidence.spoolAfter.files, evidence.spoolAfter.bytes)
+		}
+	}
+	if closeErr := service.Close(context.Background()); closeErr != nil {
+		b.Fatalf("close populated benchmark service: %v", closeErr)
+	}
+	if err != nil {
+		b.Fatalf("bootstrap populated benchmark sample: %v", err)
+	}
+	return auditScalabilitySampleWithMemory(elapsed, measured, beforeMemory, afterMemory), counts, evidence
+}
+
+func (f *auditPopulatedBootstrapFixture) postgresTempUsage(b *testing.B) auditTemporaryUsage {
+	b.Helper()
+	if _, err := f.pool.Exec(f.ctx, `SELECT pg_stat_force_next_flush()`); err != nil {
+		b.Fatalf("flush populated benchmark PostgreSQL statistics: %v", err)
+	}
+	var usage auditTemporaryUsage
+	if err := f.pool.QueryRow(f.ctx, `
+		SELECT temp_bytes, temp_files
+		FROM pg_stat_database
+		WHERE datname = current_database()
+	`).Scan(&usage.bytes, &usage.files); err != nil {
+		b.Fatalf("read populated benchmark PostgreSQL temporary usage: %v", err)
+	}
+	return usage
+}
+
+func auditTemporaryUsageDelta(before, after auditTemporaryUsage) (auditTemporaryUsage, error) {
+	if after.bytes < before.bytes || after.files < before.files {
+		return auditTemporaryUsage{}, fmt.Errorf("temporary usage counters moved backwards: before=%+v after=%+v", before, after)
+	}
+	return auditTemporaryUsage{bytes: after.bytes - before.bytes, files: after.files - before.files}, nil
+}
+
+func TestAuditTemporaryUsageDelta(t *testing.T) {
+	delta, err := auditTemporaryUsageDelta(
+		auditTemporaryUsage{bytes: 10, files: 2},
+		auditTemporaryUsage{bytes: 42, files: 5},
+	)
+	if err != nil {
+		t.Fatalf("calculate temporary usage delta: %v", err)
+	}
+	if delta != (auditTemporaryUsage{bytes: 32, files: 3}) {
+		t.Fatalf("unexpected temporary usage delta: %+v", delta)
+	}
+	if _, err := auditTemporaryUsageDelta(
+		auditTemporaryUsage{bytes: 42, files: 5},
+		auditTemporaryUsage{bytes: 10, files: 2},
+	); err == nil {
+		t.Fatal("expected backwards counters to be rejected")
+	}
+}
+
+func auditOwnedDirectoryUsage(b *testing.B, dir string) auditTemporaryUsage {
+	b.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		b.Fatalf("read populated benchmark owned spool directory: %v", err)
+	}
+	usage := auditTemporaryUsage{files: int64(len(entries))}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			b.Fatalf("stat populated benchmark owned spool %s: %v", entry.Name(), err)
+		}
+		usage.bytes += info.Size()
+	}
+	return usage
 }
 
 func BenchmarkAuditScalabilityExpiredSessionCleanup(b *testing.B) {
@@ -631,7 +1128,13 @@ func auditRunExpiredCleanupProfileSample(
 	case "push":
 		err = cleanupExpiredPushSessionsQuerier(fixture.ctx, fixture.pool)
 	case "snapshot":
-		err = cleanupExpiredSnapshotSessionsQuerier(fixture.ctx, fixture.pool)
+		for {
+			var result snapshotCleanupBatchResult
+			result, err = fixture.svc.cleanupSnapshotBatch(fixture.ctx)
+			if err != nil || result.candidateSessions == 0 {
+				break
+			}
+		}
 	default:
 		b.Fatalf("unknown cleanup profile kind %q", cleanupKind)
 	}
@@ -731,14 +1234,15 @@ func auditSeedExpiredSessions(
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO sync.snapshot_session_rows (
 					snapshot_id, row_ordinal, table_id, key_bytes,
-					bundle_seq, payload_wire
+					bundle_seq, payload_wire, wire_byte_count
 				)
 				SELECT md5('audit-expired-snapshot-' || item::text)::uuid,
 					0,
 					$1,
 					decode(md5('audit-expired-snapshot-key-' || item::text), 'hex'),
 					0,
-					'{}'::json
+					'{}'::json,
+					2
 				FROM generate_series(1, $2) AS item
 			`, tableID, sessionCount); err != nil {
 				return err
@@ -882,6 +1386,9 @@ func auditRequireScalabilityProfile(b *testing.B, scale, smallestScale int) {
 	b.Helper()
 	if b.N != 1 {
 		b.Fatalf("fixed-sample scalability profiles require -benchtime=1x (benchmark N=%d)", b.N)
+	}
+	if scale > smallestScale && strings.EqualFold(os.Getenv("GITHUB_ACTIONS"), "true") {
+		b.Fatalf("full-scale audit benchmarks are local-only and must not run in GitHub Actions")
 	}
 	if scale > smallestScale && os.Getenv(auditScalabilityFullScaleEnv) != "1" {
 		b.Skipf("scale %d requires %s=1", scale, auditScalabilityFullScaleEnv)

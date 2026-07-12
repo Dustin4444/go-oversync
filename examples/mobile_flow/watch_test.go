@@ -54,6 +54,13 @@ func newWatchMobileClient(t *testing.T, cfg *oversqlite.Config, watchSupported b
 		switch r.URL.Path {
 		case "/sync/capabilities":
 			return watchJSONResponse(oversync.CapabilitiesResponse{
+				ProtocolVersion: oversync.SyncProtocolVersion,
+				BundleLimits: oversync.BundleCapabilitiesLimits{
+					DefaultRowsPerSnapshotChunk: 1, MaxRowsPerSnapshotChunk: 1,
+					DefaultBytesPerSnapshotChunk: 1024, MaxBytesPerSnapshotChunk: 1024,
+					MaxBytesPerSnapshotRow: 1024, MaxConcurrentSnapshotBuilds: 8,
+					MaxConcurrentSnapshotChunkRequests: 4,
+				},
 				Features: map[string]bool{
 					"connect_lifecycle":   true,
 					"bundle_change_watch": watchSupported,

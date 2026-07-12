@@ -27,15 +27,17 @@ import (
 
 // ServerConfig holds configuration for the server
 type ServerConfig struct {
-	DatabaseURL                string
-	JWTSecret                  string
-	Logger                     *slog.Logger
-	AppName                    string
-	BusinessSchema             string
-	StageMetrics               oversync.StageMetricsRecorder
-	InitializationLeaseTTL     time.Duration
-	EnableEmptyFirstDeferral   bool
-	EmptyFirstDeferralDuration time.Duration
+	DatabaseURL                        string
+	JWTSecret                          string
+	Logger                             *slog.Logger
+	AppName                            string
+	BusinessSchema                     string
+	StageMetrics                       oversync.StageMetricsRecorder
+	InitializationLeaseTTL             time.Duration
+	MaxConcurrentSnapshotBuilds        int
+	MaxConcurrentSnapshotChunkRequests int
+	EnableEmptyFirstDeferral           bool
+	EmptyFirstDeferralDuration         time.Duration
 	// BeforeBootstrap is a test/conformance hook that runs after the application
 	// schema exists and before Oversync observes it. Production callers should
 	// leave it nil.
@@ -194,15 +196,28 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 
 	// Configure sync service with registered tables and handlers
 	serviceConfig := &oversync.ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
-		StageMetrics:              config.StageMetrics,
-		InitializationLeaseTTL:    config.InitializationLeaseTTL,
+		MaxSupportedSchemaVersion:          1,
+		AppName:                            appName,
+		StageMetrics:                       config.StageMetrics,
+		InitializationLeaseTTL:             config.InitializationLeaseTTL,
+		MaxConcurrentSnapshotBuilds:        config.MaxConcurrentSnapshotBuilds,
+		MaxConcurrentSnapshotChunkRequests: config.MaxConcurrentSnapshotChunkRequests,
 		BundleChangeWatch: oversync.BundleChangeWatchConfig{
 			Enabled: true,
 		},
 		RegisteredTables: RegisteredTablesForBusinessSchema(businessSchema),
 	}
+	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(
+		serviceConfig.MaxConcurrentSnapshotBuilds,
+		serviceConfig.MaxConcurrentSnapshotChunkRequests,
+	)
+	if err != nil {
+		pool.Close()
+		cancel()
+		return nil, err
+	}
+	serviceConfig.MaxConcurrentSnapshotBuilds = builds
+	serviceConfig.MaxConcurrentSnapshotChunkRequests = chunks
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
 		serviceConfig.LogStageTimings = true
 	}
@@ -564,6 +579,30 @@ func configuredPoolSizeFromEnv() (maxConns int32, minConns int32, err error) {
 		return 0, 0, fmt.Errorf("OVERSYNC_DB_POOL_MIN_CONNS cannot exceed OVERSYNC_DB_POOL_MAX_CONNS")
 	}
 	return maxConns, minConns, nil
+}
+
+func configuredSnapshotConcurrencyFromEnv(builds, chunks int) (int, int, error) {
+	parse := func(name string, current int) (int, error) {
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			return current, nil
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return 0, fmt.Errorf("%s must be a positive integer", name)
+		}
+		return parsed, nil
+	}
+	var err error
+	builds, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", builds)
+	if err != nil {
+		return 0, 0, err
+	}
+	chunks, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", chunks)
+	if err != nil {
+		return 0, 0, err
+	}
+	return builds, chunks, nil
 }
 
 // Close shuts down the server components and cleans up resources

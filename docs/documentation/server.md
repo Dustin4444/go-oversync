@@ -59,6 +59,11 @@ Row-bearing server tables store compact internal identifiers (`user_pk`, `table_
 and `op_code`). Wire responses reconstruct visible `schema`, `table`, structured `key`, operation
 strings, and payloads from `sync.table_catalog` and the stored row data.
 
+Registered PostgreSQL integer, decimal, and floating business columns use canonical JSON strings
+under `jcs_uniform_numeric_strings_v1`. Floating strings use the shortest finite RFC 8785 binary64
+spelling; Boolean columns emit JSON Booleans. Bootstrap schema discovery owns this mapping, so
+clients do not advertise or configure per-column numeric kinds.
+
 ## Main Flows
 
 ### First Connect
@@ -107,6 +112,10 @@ Pull and committed-bundle replay are only guaranteed above `retained_bundle_floo
 below that floor are outside the retained-history contract even if physical pruning has not deleted
 them yet. Snapshot creation reads live business tables plus `sync.row_state` from one PostgreSQL
 transaction snapshot and fails closed if they disagree.
+Materialization uses deterministic keyset pages and bounded PostgreSQL `COPY` batches. Snapshot
+chunk reads are bounded by both row count and exact full-row JSON wire bytes. Non-blocking build
+and chunk admission limits reject excess concurrency with HTTP `429` before opening a transaction.
+Expired or explicitly retired sessions are reclaimed by each service's bounded cleanup worker.
 
 ### Bundle Change Watch
 
@@ -161,28 +170,23 @@ and retry bootstrap. This coordinated migration is required before corrected bin
 older binaries can still accept nullable declarations; wire, checkpoint, pull, and snapshot meaning
 does not change.
 
-Bootstrap atomically adopts supported registered tables that already contain authoritative rows.
-It locks every registered root and current partition against writes, installs the managed capture
-and TRUNCATE triggers, and creates one sequence-1 adoption baseline bundle per populated scope in
-the same PostgreSQL transaction. The baseline records the state observed at adoption time; it does
-not claim to recreate earlier modification history. Connect, pull, push, and snapshot operations
-return `503 service_unavailable` until that transaction commits. A populated adopted scope then
-connects as `remote_authoritative`, and pull or snapshot exposes the same positive row versions and
-checkpoint.
+When no managed layout exists, Bootstrap atomically adopts supported registered tables that already
+contain authoritative rows. It locks every registered root and current partition against writes,
+installs the managed capture and TRUNCATE triggers, and creates one sequence-1 adoption baseline
+bundle per populated scope in the same PostgreSQL transaction. The baseline records the state
+observed at adoption time; it does not claim to recreate earlier modification history. Connect,
+pull, push, and snapshot operations return `503 service_unavailable` until that transaction commits.
 
-For the first H2 start of an existing populated deployment, back up PostgreSQL, stop every old
+For the one-time adoption of an existing populated deployment, back up PostgreSQL, stop every old
 Oversync server and managed writer, start the upgraded server and wait for healthy readiness, then
-restore client traffic. Mixed old/new server operation during adoption is unsupported. Bootstrap
-never updates or deletes the authoritative rows. If existing `sync.*` state is partial or
-contradicts the business rows, bootstrap rejects it atomically with a populated-table adoption
-diagnostic; restore a coherent backup or use a separately reviewed repair rather than deleting
-rows or metadata ad hoc.
+restore client traffic. Mixed old/new server operation during adoption is unsupported. Fresh
+adoption never updates or deletes authoritative business rows and retains exact post-persistence
+validation of row identity, payloads, history, hashes, counters, watermarks, and sessions.
 
-An unsupported registered schema requires a destructive reset, not an `ALTER TABLE` repair or rolling
-migration. Stop all server and client processes, recreate PostgreSQL with permanent logged business
-tables, recreate every client database, and deploy compatible server and client versions together.
-This procedure discards business rows, sync history, staged sessions, checkpoints, outboxes, and
-offline work; mixed-version operation is unsupported.
+An unsupported registered schema or managed definition is rejected without modifying the database.
+Stop affected instances and restore a reviewed compatible backup or follow a separately reviewed
+operator procedure. Oversync does not provide migration, repair, or rolling-upgrade behavior for
+that database; mixed-version operation is unsupported.
 
 Registered tables also have an unconditional statement-level `BEFORE TRUNCATE` guard. PostgreSQL
 returns SQLSTATE `55000` with the registered `schema.table`; bundle context and `CASCADE` do not
@@ -198,27 +202,29 @@ views, sequences, functions, rules, indexes, constraints, columns, or non-intern
 On application registered tables, only the three Oversync-reserved trigger names are managed;
 application triggers and indexes with other names remain supported.
 
-Every `Bootstrap()` validates the marker and exact table catalog, then compares the complete
-PostgreSQL 17.10 semantic manifest for `server_postgres_sync_v1`. Validation covers relation
+Every existing-layout `Bootstrap()` validates registered declarations, the marker and exact table
+catalog, then compares the complete PostgreSQL 17.10 semantic manifest for
+`server_postgres_sync_v1`. Validation covers relation
 persistence/partition/RLS/replica identity, every column and default, PK/UNIQUE/CHECK/FK semantics,
 constraint-backed and explicit indexes, identity and metric sequences, exact managed-function body
 hashes and attributes, and the root/descendant trigger definitions and arguments. Expected and
 actual facts are sorted and length-delimited before SHA-256 fingerprinting; field differences, not
 hash equality alone, decide acceptance.
 
-A coherent marked layout performs no managed DDL during bootstrap. Drift therefore fails closed
-with `UnsupportedSchemaError` before populated-state adoption or readiness and preserves business
-rows, sync rows, bundles, checkpoints, functions, and triggers. Diagnostics start with
+A coherent marked layout takes the trusted-database attachment path. It reads no registered business
+rows or managed operational-state rows, takes no explicit business or managed data locks, and
+performs no DML, DDL, adoption, canonicalization, hashing, cleanup, or repair. Drift fails closed
+with `UnsupportedSchemaError` before readiness and preserves business rows, sync rows, bundles,
+checkpoints, functions, and triggers. Diagnostics start with
 `managed sync layout mismatch`, name the layout and both fingerprints, and include a bounded sorted
 set of missing, unexpected, or changed attributes.
 
-Operational recovery is: stop all Oversync instances, inspect the reported attributes, restore the
-exact object while every service remains stopped, and retry. If exact restoration cannot be proven
-without rewriting authoritative rows or manufacturing history, use the inherited C2/C3 coordinated
-recreation boundary instead: recreate PostgreSQL and every client database and discard the old
-state. Deploy one server version across all instances; an older binary can silently recreate
-functions or triggers and must not run during repair. This validation adds no wire, checkpoint,
-snapshot, bundle, or client durable-state version.
+This fast path trusts PostgreSQL's committed durability. Ordinary direct registered-table DML
+without bundle context and every registered-table `TRUNCATE` remain rejected, but privileged guard
+bypass or direct managed-row edits are unsupported. Bootstrap does not detect or repair those data
+mutations. Stop all Oversync instances and restore a known coherent backup or follow a separately
+reviewed operator procedure. This validation adds no wire, checkpoint, snapshot, bundle, or client
+durable-state version.
 
 ## Auth Contract
 

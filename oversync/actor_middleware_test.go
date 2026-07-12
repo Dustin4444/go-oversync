@@ -26,7 +26,7 @@ func TestActorMiddleware_InjectsActorFromContextAndHeader(t *testing.T) {
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/pull", nil)
-	req.Header.Set(SourceIDHeader, " source-1 ")
+	req.Header.Set(SourceIDHeader, "source-1")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -67,6 +67,10 @@ func TestActorMiddleware_FailsClosedWhenSourceHeaderIsMissingOrInvalid(t *testin
 	}{
 		{name: "missing"},
 		{name: "blank", headerValue: "   "},
+		{name: "leading space", headerValue: " source-1"},
+		{name: "trailing space", headerValue: "source-1 "},
+		{name: "control", headerValue: "source\x01id"},
+		{name: "unicode", headerValue: "söurce"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

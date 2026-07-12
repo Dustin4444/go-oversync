@@ -20,6 +20,7 @@ import (
 
 	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/internal/protocolhash"
+	"github.com/mobiletoly/go-oversync/internal/sessionid"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -64,9 +65,6 @@ type committedRemoteReplayPrunedError struct {
 }
 
 func (e *committedRemoteReplayPrunedError) Error() string {
-	if e != nil && strings.TrimSpace(e.Message) != "" {
-		return e.Message
-	}
 	return "committed remote bundle replay is no longer retained; keep-source rebuild is required"
 }
 
@@ -87,6 +85,15 @@ func (c *Client) PushPending(ctx context.Context) (PushReport, error) {
 		return PushReport{}, err
 	}
 	defer c.writeMu.Unlock()
+	if err := c.ensureConnectedSessionLocked(ctx, "PushPending()"); err != nil {
+		return PushReport{}, err
+	}
+	if err := c.ensurePushPreconditionsLocked(ctx, false); err != nil {
+		return PushReport{}, err
+	}
+	if err := c.validateProtocolGateLocked(ctx, "push_capabilities"); err != nil {
+		return PushReport{}, err
+	}
 	return c.pushPendingLocked(ctx, 0)
 }
 
@@ -99,25 +106,8 @@ func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) 
 }
 
 func (c *Client) pushPendingLockedWithRecovery(ctx context.Context, conflictRetryCount int, allowCheckpointRecovery bool) (PushReport, error) {
-	if err := c.ensureConnectedSessionLocked(ctx, "PushPending()"); err != nil {
+	if err := c.ensurePushPreconditionsLocked(ctx, allowCheckpointRecovery); err != nil {
 		return PushReport{}, err
-	}
-	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
-	if err != nil {
-		return PushReport{}, err
-	}
-	if sourceRecoveryErr != nil {
-		return PushReport{}, sourceRecoveryErr
-	}
-	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
-		return PushReport{}, err
-	}
-	rebuildRequired, err := c.rebuildRequired(ctx)
-	if err != nil {
-		return PushReport{}, err
-	}
-	if rebuildRequired && !allowCheckpointRecovery {
-		return PushReport{}, &RebuildRequiredError{}
 	}
 	if atomicLoadPaused(&c.uploadPaused) {
 		status, err := c.syncStatusLocked(ctx)
@@ -129,6 +119,32 @@ func (c *Client) pushPendingLockedWithRecovery(ctx context.Context, conflictRetr
 			Status:  status,
 		}, nil
 	}
+
+	return c.pushPendingAfterPreflightLocked(ctx, conflictRetryCount, allowCheckpointRecovery)
+}
+
+func (c *Client) ensurePushPreconditionsLocked(ctx context.Context, allowCheckpointRecovery bool) error {
+	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if sourceRecoveryErr != nil {
+		return sourceRecoveryErr
+	}
+	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
+		return err
+	}
+	rebuildRequired, err := c.rebuildRequired(ctx)
+	if err != nil {
+		return err
+	}
+	if rebuildRequired && !allowCheckpointRecovery {
+		return &RebuildRequiredError{}
+	}
+	return nil
+}
+
+func (c *Client) pushPendingAfterPreflightLocked(ctx context.Context, conflictRetryCount int, allowCheckpointRecovery bool) (PushReport, error) {
 
 	snapshot, err := c.ensurePushOutboundSnapshot(ctx)
 	if err != nil {
@@ -380,10 +396,7 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 		return nil, fmt.Errorf("unexpected push session status %q", sessionResp.Status)
 	}
 
-	pushID := strings.TrimSpace(sessionResp.PushID)
-	if pushID == "" {
-		return nil, fmt.Errorf("push session response missing push_id")
-	}
+	pushID := sessionResp.PushID
 	cleanupPushSession := true
 	defer func() {
 		if cleanupPushSession {
@@ -819,7 +832,7 @@ func (c *Client) collectDirtyRowsForPushInTx(ctx context.Context, tx *sql.Tx) (s
 		return 0, 0, nil, nil, err
 	}
 	if sourceState == nil {
-		return 0, 0, nil, nil, fmt.Errorf("missing source state for %s", attachment.CurrentSourceID)
+		return 0, 0, nil, nil, fmt.Errorf("missing source state for current source")
 	}
 	sourceBundleID = sourceState.NextSourceBundleID
 	baseBundleSeq = attachment.LastBundleSeqSeen
@@ -1040,14 +1053,14 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx *sql.Tx)
 	}, nil
 }
 
-func (c *Client) setBundleApplyModeInTx(ctx context.Context, tx *sql.Tx, enabled bool) error {
+func (c *Client) setBundleApplyModeInTx(ctx context.Context, tx execContexter, enabled bool) error {
 	if err := setApplyMode(ctx, tx, enabled); err != nil {
 		return fmt.Errorf("failed to update _sync_apply_state apply_mode: %w", err)
 	}
 	return nil
 }
 
-func (c *Client) decodeDirtyKeyForPush(tx *sql.Tx, tableName, keyJSON string) (string, oversync.SyncKey, error) {
+func (c *Client) decodeDirtyKeyForPush(tx tableInfoQueryer, tableName, keyJSON string) (string, oversync.SyncKey, error) {
 	keyColumns, err := c.syncKeyColumnsForTable(tableName)
 	if err != nil {
 		return "", nil, err
@@ -1073,12 +1086,12 @@ func (c *Client) decodeDirtyKeyForPush(tx *sql.Tx, tableName, keyJSON string) (s
 	}
 	wirePK, err := c.normalizePKForServerInTx(tx, tableName, pkValue)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to normalize key for push %s.%s: %w", tableName, pkValue, err)
+		return "", nil, fmt.Errorf("failed to normalize key for push table %s column %s: %w", tableName, keyColumns[0], err)
 	}
 	return pkValue, oversync.SyncKey{strings.ToLower(keyColumns[0]): wirePK}, nil
 }
 
-func (c *Client) bundleRowKeyToLocalKey(tx *sql.Tx, tableName string, key oversync.SyncKey) (string, string, error) {
+func (c *Client) bundleRowKeyToLocalKey(tx tableInfoQueryer, tableName string, key oversync.SyncKey) (string, string, error) {
 	keyColumns, err := c.syncKeyColumnsForTable(tableName)
 	if err != nil {
 		return "", "", err
@@ -1167,30 +1180,11 @@ func dirtyMatchesUploadedIntent(current dirtyUploadState, uploaded dirtyRowCaptu
 }
 
 func (c *Client) livePayloadMatchesUploadedIntent(uploaded dirtyRowCapture, livePayload json.RawMessage, liveExists bool) (bool, error) {
-	localPayload := uploaded.LocalPayload
-	if uploaded.Op != oversync.OpDelete && localPayload.Valid {
-		payloadData, err := jcs.DecodeObject([]byte(localPayload.String))
-		if err != nil {
-			return false, fmt.Errorf("decode uploaded local payload for comparison: %w", err)
-		}
-		tableInfo, err := c.getTableInfo(strings.ToLower(uploaded.TableName))
-		if err != nil {
-			return false, fmt.Errorf("get table info for uploaded payload comparison: %w", err)
-		}
-		if err := c.normalizeConfiguredNumericPayloadForWire(uploaded.TableName, payloadData, tableInfo); err != nil {
-			return false, err
-		}
-		normalized, err := jcs.Marshal(payloadData)
-		if err != nil {
-			return false, fmt.Errorf("canonicalize uploaded local payload for comparison: %w", err)
-		}
-		localPayload = sql.NullString{String: string(normalized), Valid: true}
-	}
 	prepared := preparedUploadChange{
 		Table:        uploaded.TableName,
 		Op:           uploaded.Op,
 		LocalPK:      uploaded.LocalPK,
-		LocalPayload: localPayload,
+		LocalPayload: uploaded.LocalPayload,
 	}
 	return liveMatchesUploadedIntent(prepared, livePayload, liveExists)
 }
@@ -1221,7 +1215,7 @@ func (c *Client) applyBundleRowAuthoritativelyInTx(ctx context.Context, tx *sql.
 	return c.applyBundleRowAuthoritativelyInTxUsing(ctx, tx, tx, row, localPK)
 }
 
-func (c *Client) applyBundleRowAuthoritativelyInTxUsing(ctx context.Context, execer execContexter, tx *sql.Tx, row *oversync.BundleRow, localPK string) error {
+func (c *Client) applyBundleRowAuthoritativelyInTxUsing(ctx context.Context, execer execContexter, tx tableInfoQueryer, row *oversync.BundleRow, localPK string) error {
 	switch row.Op {
 	case oversync.OpInsert, oversync.OpUpdate:
 		payload, err := jcs.DecodeObject(row.Payload)
@@ -1269,6 +1263,9 @@ func (c *Client) committedBundleChunkRows() int {
 }
 
 func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedRowCount int64, canonicalRequestHash string) (*oversync.PushSessionCreateResponse, error) {
+	if err := sessionid.ValidateOptional(c.pendingInitializationID); err != nil {
+		return nil, fmt.Errorf("push session initialization_id is invalid")
+	}
 	reqBody, err := json.Marshal(&oversync.PushSessionCreateRequest{
 		SourceBundleID:       sourceBundleID,
 		PlannedRowCount:      plannedRowCount,
@@ -1279,10 +1276,14 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 		return nil, fmt.Errorf("failed to marshal push session request: %w", err)
 	}
 
-	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodPost, buildPushSessionCreateURL(c.BaseURL), reqBody, "application/json")
+	result, err := c.doAuthenticatedBoundedRequest(
+		ctx, "push_session_create", http.MethodPost, buildPushSessionCreateURL(c.BaseURL),
+		reqBody, "application/json", snapshotControlBodyLimit, snapshotControlBodyLimit, nil,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send push session request: %w", err)
 	}
+	body, statusCode := result.body, result.statusCode
 	if statusCode != http.StatusOK {
 		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
 			return nil, initErr
@@ -1291,19 +1292,14 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 			if errorResp, ok := decodeServerErrorResponse(body); ok {
 				switch errorResp.Error {
 				case "history_pruned":
-					return nil, &HistoryPrunedError{
-						Status:  statusCode,
-						Message: errorResp.Message,
-					}
+					return nil, &HistoryPrunedError{Status: statusCode}
 				case "source_sequence_out_of_order":
-					return nil, &sourceSequenceOutOfOrderError{
-						Status:  statusCode,
-						Message: errorResp.Message,
-					}
+					return nil, &sourceSequenceOutOfOrderError{Status: statusCode}
 				case "source_retired":
-					if retiredResp, ok := decodeSourceRetiredResponse(body); ok {
-						return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryRetired, retiredResp.Message, retiredResp.ReplacedBySourceID)
+					if retiredResp, ok := decodeSourceRetiredResponse(body, c.sourceID); ok {
+						return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryRetired, "", retiredResp.ReplacedBySourceID)
 					}
+					return nil, errors.New("invalid source_retired response")
 				}
 			}
 		}
@@ -1313,7 +1309,6 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 		return nil, &retryHTTPError{
 			Operation:  "push_session_create",
 			StatusCode: statusCode,
-			Message:    decodeServerErrorBody(body),
 		}
 	}
 
@@ -1331,15 +1326,22 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 }
 
 func (c *Client) uploadPushChunk(ctx context.Context, pushID string, req *oversync.PushSessionChunkRequest) (*oversync.PushSessionChunkResponse, error) {
+	if err := sessionid.Validate(pushID); err != nil {
+		return nil, fmt.Errorf("push chunk request push_id is invalid")
+	}
 	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal push chunk request: %w", err)
 	}
 
-	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodPost, buildPushSessionChunkURL(c.BaseURL, pushID), reqBody, "application/json")
+	result, err := c.doAuthenticatedBoundedRequest(
+		ctx, "push_chunk_upload", http.MethodPost, buildPushSessionChunkURL(c.BaseURL, pushID),
+		reqBody, "application/json", snapshotControlBodyLimit, snapshotControlBodyLimit, nil,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send push chunk request: %w", err)
 	}
+	body, statusCode := result.body, result.statusCode
 	if statusCode != http.StatusOK {
 		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
 			return nil, initErr
@@ -1350,7 +1352,6 @@ func (c *Client) uploadPushChunk(ctx context.Context, pushID string, req *oversy
 		return nil, &retryHTTPError{
 			Operation:  "push_chunk_upload",
 			StatusCode: statusCode,
-			Message:    decodeServerErrorBody(body),
 		}
 	}
 
@@ -1358,18 +1359,25 @@ func (c *Client) uploadPushChunk(ctx context.Context, pushID string, req *oversy
 	if err := json.Unmarshal(body, &chunkResp); err != nil {
 		return nil, fmt.Errorf("failed to decode push chunk response: %w", err)
 	}
-	if strings.TrimSpace(chunkResp.PushID) != pushID {
-		return nil, fmt.Errorf("push chunk response push_id %q does not match requested %q", chunkResp.PushID, pushID)
+	if err := sessionid.Validate(chunkResp.PushID); err != nil || chunkResp.PushID != pushID {
+		return nil, fmt.Errorf("push chunk response push_id does not match requested session")
 	}
 	atomic.AddInt64(&c.pushStats.chunksUploaded, 1)
 	return &chunkResp, nil
 }
 
 func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversync.PushSessionCommitResponse, error) {
-	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodPost, buildPushSessionCommitURL(c.BaseURL, pushID), nil, "")
+	if err := sessionid.Validate(pushID); err != nil {
+		return nil, fmt.Errorf("push commit request push_id is invalid")
+	}
+	result, err := c.doAuthenticatedBoundedRequest(
+		ctx, "push_session_commit", http.MethodPost, buildPushSessionCommitURL(c.BaseURL, pushID),
+		nil, "", snapshotControlBodyLimit, snapshotControlBodyLimit, nil,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send push commit request: %w", err)
 	}
+	body, statusCode := result.body, result.statusCode
 	if statusCode != http.StatusOK {
 		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
 			return nil, initErr
@@ -1378,14 +1386,12 @@ func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversyn
 			if errorResp, ok := decodeServerErrorResponse(body); ok {
 				switch errorResp.Error {
 				case "source_sequence_changed":
-					return nil, &sourceSequenceChangedError{
-						Status:  statusCode,
-						Message: errorResp.Message,
-					}
+					return nil, &sourceSequenceChangedError{Status: statusCode}
 				case "source_retired":
-					if retiredResp, ok := decodeSourceRetiredResponse(body); ok {
-						return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryRetired, retiredResp.Message, retiredResp.ReplacedBySourceID)
+					if retiredResp, ok := decodeSourceRetiredResponse(body, c.sourceID); ok {
+						return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryRetired, "", retiredResp.ReplacedBySourceID)
 					}
+					return nil, errors.New("invalid source_retired response")
 				}
 			}
 		}
@@ -1395,7 +1401,6 @@ func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversyn
 		return nil, &retryHTTPError{
 			Operation:  "push_session_commit",
 			StatusCode: statusCode,
-			Message:    decodeServerErrorBody(body),
 		}
 	}
 
@@ -1426,23 +1431,24 @@ func (c *Client) handleInitializationLeaseErrorLocked(ctx context.Context, statu
 }
 
 func (c *Client) fetchCommittedBundleChunk(ctx context.Context, bundleSeq int64, afterRowOrdinal *int64, maxRows int) (*oversync.CommittedBundleRowsResponse, error) {
-	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodGet, buildCommittedBundleRowsURL(c.BaseURL, bundleSeq, afterRowOrdinal, maxRows), nil, "")
+	result, err := c.doAuthenticatedBoundedRequest(
+		ctx, "committed_bundle_chunk_fetch", http.MethodGet,
+		buildCommittedBundleRowsURL(c.BaseURL, bundleSeq, afterRowOrdinal, maxRows),
+		nil, "", 64<<20, snapshotControlBodyLimit, nil,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send committed bundle chunk request: %w", err)
 	}
+	body, statusCode := result.body, result.statusCode
 	if statusCode != http.StatusOK {
 		if statusCode == http.StatusConflict {
 			if errorResp, ok := decodeServerErrorResponse(body); ok && errorResp.Error == "history_pruned" {
-				return nil, &HistoryPrunedError{
-					Status:  statusCode,
-					Message: errorResp.Message,
-				}
+				return nil, &HistoryPrunedError{Status: statusCode}
 			}
 		}
 		return nil, &retryHTTPError{
 			Operation:  "committed_bundle_chunk_fetch",
 			StatusCode: statusCode,
-			Message:    decodeServerErrorBody(body),
 		}
 	}
 
@@ -1482,7 +1488,7 @@ func (c *Client) runBeforePushFreezeHook(ctx context.Context) error {
 }
 
 func (c *Client) deletePushSessionBestEffort(ctx context.Context, pushID string) {
-	if strings.TrimSpace(pushID) == "" {
+	if sessionid.Validate(pushID) != nil {
 		return
 	}
 
@@ -1494,7 +1500,9 @@ func (c *Client) deletePushSessionBestEffort(ctx context.Context, pushID string)
 	if err != nil {
 		return
 	}
-	c.applyAuthenticatedSyncHeaders(httpReq, token)
+	if err := c.applyAuthenticatedSyncHeaders(httpReq, token); err != nil {
+		return
+	}
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
@@ -1529,8 +1537,8 @@ func committedPushBundleFromFields(bundleSeq int64, sourceID string, sourceBundl
 	if bundleSeq <= 0 {
 		return nil, fmt.Errorf("bundle_seq must be positive")
 	}
-	if sourceID == "" {
-		return nil, fmt.Errorf("source_id must be non-empty")
+	if err := validateSourceID(sourceID); err != nil {
+		return nil, fmt.Errorf("source_id is invalid: %w", err)
 	}
 	if sourceBundleID <= 0 {
 		return nil, fmt.Errorf("source_bundle_id must be positive")
@@ -1558,10 +1566,13 @@ func validatePushSessionCreateResponse(resp *oversync.PushSessionCreateResponse,
 	if resp == nil {
 		return fmt.Errorf("push session response missing body")
 	}
+	if err := validateSourceID(sourceID); err != nil {
+		return err
+	}
 	switch resp.Status {
 	case "staging":
-		if strings.TrimSpace(resp.PushID) == "" {
-			return fmt.Errorf("push session response missing push_id")
+		if err := sessionid.Validate(resp.PushID); err != nil {
+			return fmt.Errorf("push session response push_id is invalid")
 		}
 		if resp.PlannedRowCount != plannedRowCount {
 			return fmt.Errorf("push session response planned_row_count %d does not match requested %d", resp.PlannedRowCount, plannedRowCount)
@@ -1570,11 +1581,14 @@ func validatePushSessionCreateResponse(resp *oversync.PushSessionCreateResponse,
 			return fmt.Errorf("push session response next_expected_row_ordinal %d must be 0", resp.NextExpectedRowOrdinal)
 		}
 	case "already_committed":
+		if err := validateSourceID(resp.SourceID); err != nil {
+			return fmt.Errorf("push session already_committed response source_id is invalid: %w", err)
+		}
 		if resp.SourceBundleID != sourceBundleID {
 			return fmt.Errorf("push session already_committed response source_bundle_id %d does not match requested %d", resp.SourceBundleID, sourceBundleID)
 		}
 		if resp.SourceID != sourceID {
-			return fmt.Errorf("push session already_committed response source_id %q does not match client %q", resp.SourceID, sourceID)
+			return fmt.Errorf("push session already_committed response source_id does not match client source")
 		}
 		if resp.CanonicalRequestHash != canonicalRequestHash {
 			return fmt.Errorf("push session already_committed response canonical_request_hash %q does not match prepared hash %q", resp.CanonicalRequestHash, canonicalRequestHash)
@@ -1589,12 +1603,15 @@ func validatePushSessionCreateResponse(resp *oversync.PushSessionCreateResponse,
 }
 
 func validatePushSessionCommitResponse(resp *oversync.PushSessionCommitResponse, sourceID string) error {
+	if err := validateSourceID(sourceID); err != nil {
+		return err
+	}
 	committed, err := committedPushBundleFromCommitResponse(resp)
 	if err != nil {
 		return err
 	}
 	if committed.SourceID != sourceID {
-		return fmt.Errorf("push commit response source_id %q does not match client %q", committed.SourceID, sourceID)
+		return fmt.Errorf("push commit response source_id does not match client source")
 	}
 	return nil
 }
@@ -1606,11 +1623,17 @@ func validateCommittedBundleRowsResponse(resp *oversync.CommittedBundleRowsRespo
 	if committed == nil {
 		return fmt.Errorf("committed bundle metadata is required")
 	}
+	if err := validateSourceID(committed.SourceID); err != nil {
+		return fmt.Errorf("committed bundle metadata source_id is invalid: %w", err)
+	}
+	if err := validateSourceID(resp.SourceID); err != nil {
+		return fmt.Errorf("committed bundle chunk response source_id is invalid: %w", err)
+	}
 	if resp.BundleSeq != committed.BundleSeq {
 		return fmt.Errorf("committed bundle chunk response bundle_seq %d does not match expected %d", resp.BundleSeq, committed.BundleSeq)
 	}
 	if resp.SourceID != committed.SourceID {
-		return fmt.Errorf("committed bundle chunk response source_id %q does not match expected %q", resp.SourceID, committed.SourceID)
+		return fmt.Errorf("committed bundle chunk response source_id does not match committed source")
 	}
 	if resp.SourceBundleID != committed.SourceBundleID {
 		return fmt.Errorf("committed bundle chunk response source_bundle_id %d does not match expected %d", resp.SourceBundleID, committed.SourceBundleID)

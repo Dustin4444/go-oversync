@@ -164,8 +164,12 @@ CREATE TABLE IF NOT EXISTS %s (
 	name TEXT NOT NULL,
 	note TEXT NULL,
 	count_value BIGINT NULL,
-	enabled_flag BIGINT NOT NULL,
+	small_count SMALLINT NULL,
+	medium_count INTEGER NULL,
+	exact_amount NUMERIC(30,10) NULL,
+	enabled_flag BOOLEAN NOT NULL,
 	rating DOUBLE PRECISION NULL,
+	float4_value REAL NULL,
 	data BYTEA NULL,
 	created_at TIMESTAMPTZ NULL,
 	PRIMARY KEY (_sync_scope_id, id)

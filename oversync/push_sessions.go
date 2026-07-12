@@ -13,10 +13,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mobiletoly/go-oversync/internal/protocolhash"
+	"github.com/mobiletoly/go-oversync/internal/sessionid"
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 func nullableUUIDString(value string) any {
-	if strings.TrimSpace(value) == "" {
+	if value == "" {
 		return nil
 	}
 	return value
@@ -40,38 +42,31 @@ type PushCommitInvalidError struct {
 
 func (e *PushCommitInvalidError) Error() string { return e.Message }
 
-type PushSessionNotFoundError struct {
-	PushID string
-}
+type PushSessionNotFoundError struct{}
 
 func (e *PushSessionNotFoundError) Error() string {
-	return fmt.Sprintf("push session %s was not found", e.PushID)
+	return "push session was not found"
 }
 
-type PushSessionExpiredError struct {
-	PushID string
-}
+type PushSessionExpiredError struct{}
 
 func (e *PushSessionExpiredError) Error() string {
-	return fmt.Sprintf("push session %s has expired; start a new push session", e.PushID)
+	return "push session has expired; start a new push session"
 }
 
-type PushSessionForbiddenError struct {
-	PushID string
-}
+type PushSessionForbiddenError struct{}
 
 func (e *PushSessionForbiddenError) Error() string {
-	return fmt.Sprintf("push session %s does not belong to the authenticated user", e.PushID)
+	return "push session does not belong to the authenticated user"
 }
 
 type PushChunkOutOfOrderError struct {
-	PushID   string
 	Expected int64
 	Actual   int64
 }
 
 func (e *PushChunkOutOfOrderError) Error() string {
-	return fmt.Sprintf("push session %s expected start_row_ordinal %d, got %d", e.PushID, e.Expected, e.Actual)
+	return fmt.Sprintf("push session expected start_row_ordinal %d, got %d", e.Expected, e.Actual)
 }
 
 type CommittedBundleChunkInvalidError struct {
@@ -96,13 +91,7 @@ type SourceTupleHistoryPrunedError struct {
 }
 
 func (e *SourceTupleHistoryPrunedError) Error() string {
-	return fmt.Sprintf(
-		"source tuple (%s, %d) for user %s is older than retained duplicate history; max committed source_bundle_id is %d",
-		e.SourceID,
-		e.SourceBundleID,
-		e.UserID,
-		e.MaxCommittedSourceBundleIDHint,
-	)
+	return "source history is no longer retained"
 }
 
 type SourceSequenceOutOfOrderError struct {
@@ -113,13 +102,7 @@ type SourceSequenceOutOfOrderError struct {
 }
 
 func (e *SourceSequenceOutOfOrderError) Error() string {
-	return fmt.Sprintf(
-		"source %s for user %s expected next source_bundle_id %d, got %d",
-		e.SourceID,
-		e.UserID,
-		e.Expected,
-		e.Actual,
-	)
+	return "source sequence is out of order"
 }
 
 type SourceSequenceChangedError struct {
@@ -130,13 +113,7 @@ type SourceSequenceChangedError struct {
 }
 
 func (e *SourceSequenceChangedError) Error() string {
-	return fmt.Sprintf(
-		"source %s for user %s changed expected next source_bundle_id from staged %d to %d before commit",
-		e.SourceID,
-		e.UserID,
-		e.Actual,
-		e.Expected,
-	)
+	return "source sequence changed before commit"
 }
 
 type committedBundleMeta struct {
@@ -182,7 +159,9 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 	if !isCanonicalSHA256(req.CanonicalRequestHash) {
 		return nil, &PushSessionInvalidError{Message: "canonical_request_hash must be 64 lowercase hexadecimal characters"}
 	}
-	req.InitializationID = strings.TrimSpace(req.InitializationID)
+	if err := sessionid.ValidateOptional(req.InitializationID); err != nil {
+		return nil, &PushSessionInvalidError{Message: "initialization_id must be a canonical lowercase dashed UUID"}
+	}
 
 	conn, releaseConn, err := s.acquireUserUploadConn(ctx, actor.UserID)
 	if err != nil {
@@ -322,6 +301,9 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 	if err := actor.validate(true); err != nil {
 		return nil, err
 	}
+	if err := validatePushSessionLookupID(pushID); err != nil {
+		return nil, err
+	}
 	if req == nil {
 		return nil, &PushChunkInvalidError{Message: "push chunk request is required"}
 	}
@@ -362,10 +344,10 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 				return err
 			}
 			if session.UserID != actor.UserID {
-				return &PushSessionForbiddenError{PushID: pushID}
+				return &PushSessionForbiddenError{}
 			}
 			if time.Now().UTC().After(session.ExpiresAt) {
-				return &PushSessionExpiredError{PushID: pushID}
+				return &PushSessionExpiredError{}
 			}
 			if session.InitializationID != "" {
 				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
@@ -375,10 +357,13 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 			}
 
 			if req.StartRowOrdinal != session.NextExpectedRowOrdinal {
-				return &PushChunkOutOfOrderError{PushID: pushID, Expected: session.NextExpectedRowOrdinal, Actual: req.StartRowOrdinal}
+				return &PushChunkOutOfOrderError{Expected: session.NextExpectedRowOrdinal, Actual: req.StartRowOrdinal}
 			}
 			if req.StartRowOrdinal+int64(len(preparedRows)) > session.PlannedRowCount {
 				return &PushChunkInvalidError{Message: "chunk exceeds planned_row_count"}
+			}
+			if err := preflightPushPayloadDestinations(ctx, tx, preparedRows); err != nil {
+				return err
 			}
 
 			rowsData := make([][]any, 0, len(preparedRows))
@@ -436,6 +421,44 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 	return resp, nil
 }
 
+func preflightPushPayloadDestinations(ctx context.Context, tx pgx.Tx, rows []pushPreparedRow) error {
+	rowsByTable := make(map[string][]pushPreparedRow)
+	for _, row := range rows {
+		if row.op == OpDelete {
+			continue
+		}
+		tableKey := Key(row.schema, row.table)
+		rowsByTable[tableKey] = append(rowsByTable[tableKey], row)
+	}
+
+	tableKeys := make([]string, 0, len(rowsByTable))
+	for tableKey := range rowsByTable {
+		tableKeys = append(tableKeys, tableKey)
+	}
+	sort.Strings(tableKeys)
+
+	for _, tableKey := range tableKeys {
+		tableRows := rowsByTable[tableKey]
+		payloadArray, err := marshalPayloadJSONArray(tableRows, "")
+		if err != nil {
+			return fmt.Errorf("marshal destination preflight payload for %s: %w", tableKey, err)
+		}
+		tableIdent := pgx.Identifier{tableRows[0].schema, tableRows[0].table}.Sanitize()
+		stmt := fmt.Sprintf(
+			`SELECT count(*) FROM jsonb_populate_recordset(NULL::%s, $1::jsonb)`,
+			tableIdent,
+		)
+		var convertedRows int64
+		if err := tx.QueryRow(ctx, stmt, payloadArray).Scan(&convertedRows); err != nil {
+			return &PushChunkInvalidError{Message: fmt.Sprintf(
+				"payload for %s contains a value invalid for its PostgreSQL destination type (category=destination_type_invalid)",
+				tableKey,
+			)}
+		}
+	}
+	return nil
+}
+
 func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID string) (_ *PushSessionCommitResponse, err error) {
 	done, err := s.beginOperation()
 	if err != nil {
@@ -464,10 +487,10 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 				return err
 			}
 			if session.UserID != actor.UserID {
-				return &PushSessionForbiddenError{PushID: pushID}
+				return &PushSessionForbiddenError{}
 			}
 			if time.Now().UTC().After(session.ExpiresAt) {
-				return &PushSessionExpiredError{PushID: pushID}
+				return &PushSessionExpiredError{}
 			}
 
 			rows, err := s.loadPushSessionPreparedRows(ctx, tx, pushID)
@@ -740,21 +763,32 @@ func (s *SyncService) DeletePushSession(ctx context.Context, actor Actor, pushID
 			return err
 		}
 		if session.UserID != actor.UserID {
-			return &PushSessionForbiddenError{PushID: pushID}
+			return &PushSessionForbiddenError{}
 		}
 		if time.Now().UTC().After(session.ExpiresAt) {
-			return &PushSessionExpiredError{PushID: pushID}
+			return &PushSessionExpiredError{}
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM sync.push_sessions WHERE push_id = $1::uuid`, pushID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM sync.push_sessions WHERE push_id = $1::uuid`, session.PushID); err != nil {
 			return fmt.Errorf("delete push session: %w", err)
 		}
 		return nil
 	})
 }
 
+func validatePushSessionLookupID(pushID string) error {
+	if err := sessionid.Validate(pushID); err != nil {
+		return &PushSessionNotFoundError{}
+	}
+	return nil
+}
+
 func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*pushSessionState, error) {
-	if _, err := uuid.Parse(strings.TrimSpace(pushID)); err != nil {
-		return nil, &PushSessionNotFoundError{PushID: pushID}
+	if err := validatePushSessionLookupID(pushID); err != nil {
+		return nil, err
+	}
+	parsedPushID, err := uuid.Parse(pushID)
+	if err != nil {
+		return nil, &PushSessionNotFoundError{}
 	}
 
 	var session pushSessionState
@@ -774,7 +808,7 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 		JOIN sync.user_state us ON us.user_pk = ps.user_pk
 		WHERE ps.push_id = $1::uuid
 		FOR UPDATE
-	`, pushID).Scan(
+	`, parsedPushID).Scan(
 		&session.PushID,
 		&session.UserPK,
 		&session.UserID,
@@ -787,14 +821,23 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 		&session.ExpiresAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, &PushSessionNotFoundError{PushID: pushID}
+			return nil, &PushSessionNotFoundError{}
 		}
 		return nil, fmt.Errorf("query push session: %w", err)
+	}
+	if err := sourceid.Validate(session.SourceID); err != nil {
+		return nil, fmt.Errorf("persisted push_sessions source_id is invalid: %w", err)
+	}
+	if err := sessionid.ValidateOptional(session.InitializationID); err != nil {
+		return nil, fmt.Errorf("persisted push_sessions initialization_id is invalid: %w", err)
 	}
 	return &session, nil
 }
 
 func loadCommittedPushMetadataBySourceTuple(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string, sourceBundleID int64) (*committedBundleMeta, error) {
+	if err := sourceid.Validate(sourceID); err != nil {
+		return nil, fmt.Errorf("committed bundle lookup source_id is invalid: %w", err)
+	}
 	var meta committedBundleMeta
 	var bundleHash []byte
 	if err := tx.QueryRow(ctx, `
@@ -811,6 +854,9 @@ func loadCommittedPushMetadataBySourceTuple(ctx context.Context, tx pgx.Tx, user
 		}
 		return nil, fmt.Errorf("query committed push metadata: %w", err)
 	}
+	if err := sourceid.Validate(meta.SourceID); err != nil {
+		return nil, fmt.Errorf("persisted bundle_log source_id is invalid: %w", err)
+	}
 	meta.BundleHash = renderBundleHash(bundleHash)
 	return &meta, nil
 }
@@ -826,7 +872,7 @@ func loadNextExpectedSourceBundleIDForUpdate(ctx context.Context, tx pgx.Tx, use
 func loadNextExpectedSourceBundleIDWithLock(ctx context.Context, tx pgx.Tx, userPK int64, userID, sourceID string, forUpdate bool, failure string) (int64, int64, error) {
 	state, err := loadSourceStateRow(ctx, tx, userPK, sourceID, forUpdate)
 	if err != nil {
-		return 0, 0, fmt.Errorf("%s %s: %w", failure, sourceID, err)
+		return 0, 0, fmt.Errorf("%s: %w", failure, err)
 	}
 	if state == nil {
 		return 1, 0, nil
@@ -867,6 +913,9 @@ func loadCommittedBundleMeta(ctx context.Context, tx pgx.Tx, userID string, bund
 			return nil, &CommittedBundleNotFoundError{BundleSeq: bundleSeq}
 		}
 		return nil, fmt.Errorf("query committed bundle metadata: %w", err)
+	}
+	if err := sourceid.Validate(meta.SourceID); err != nil {
+		return nil, fmt.Errorf("persisted bundle_log source_id is invalid: %w", err)
 	}
 	meta.BundleHash = renderBundleHash(bundleHash)
 	return &meta, nil

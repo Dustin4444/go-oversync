@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	sc "github.com/mobiletoly/go-oversync/examples/samplesync_server/server"
 )
@@ -49,14 +50,21 @@ func main() {
 	logger.Info("  POST /dummy-signin        - Dummy signin to obtain JWT (user)")
 	logger.Info("Sync source: send Oversync-Source-ID on authenticated /sync/* requests")
 
-	// Create HTTP server with custom timeout settings
-	server := &http.Server{
-		Addr:    addr,
-		Handler: comps.Handler,
-	}
+	server := newHTTPServer(addr, comps.Handler)
 
 	if err := server.ListenAndServe(); err != nil {
 		logger.Error("http server failed", "error", err)
 		os.Exit(1)
+	}
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+		// WriteTimeout remains zero because /sync/watch is a long-lived SSE stream.
 	}
 }

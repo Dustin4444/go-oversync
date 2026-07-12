@@ -6,6 +6,8 @@ package oversync
 import (
 	"context"
 	"fmt"
+
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 type actorContextKey struct{}
@@ -20,8 +22,12 @@ func (a Actor) validate(requireSource bool) error {
 	if a.UserID == "" {
 		return fmt.Errorf("actor user_id is required")
 	}
-	if requireSource && a.SourceID == "" {
-		return fmt.Errorf("actor source_id is required")
+	if requireSource {
+		if err := sourceid.Validate(a.SourceID); err != nil {
+			return fmt.Errorf("actor source_id is invalid: %w", err)
+		}
+	} else if err := sourceid.ValidateOptional(a.SourceID); err != nil {
+		return fmt.Errorf("actor source_id is invalid: %w", err)
 	}
 	return nil
 }

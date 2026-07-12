@@ -233,9 +233,11 @@ func runScenario(ctx context.Context, sim *simulator.Simulator, scenarioName str
 // runParallelSimulation runs scenarios for multiple users in parallel
 func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenarioName string, numUsers int) error {
 	startTime := time.Now()
+	runID := fmt.Sprintf("%d-%d", os.Getpid(), startTime.UnixNano())
 	baseCfg.Logger.Info("🚀 Starting parallel multi-user simulation",
 		"users", numUsers,
 		"scenario", scenarioName,
+		"run_id", runID,
 		"server", baseCfg.ServerURL)
 
 	// Create a shared database verifier to avoid connection pool exhaustion
@@ -265,7 +267,7 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 		go func(userIndex int) {
 			defer wg.Done()
 
-			userID := fmt.Sprintf("parallel-user-%03d", userIndex)
+			userID := fmt.Sprintf("parallel-%s-user-%03d", runID, userIndex)
 			userStartTime := time.Now()
 
 			// Create user-specific configuration with shared verifier
@@ -280,7 +282,7 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 			}
 
 			// Create user-specific simulator with parallel user config
-			deviceID := fmt.Sprintf("device-%03d", userIndex)
+			deviceID := fmt.Sprintf("parallel-%s-device-%03d", runID, userIndex)
 			sim, err := simulator.NewSimulatorWithUserConfigAndVerifier(userCfg, userID, deviceID, sharedVerifier)
 			if err != nil {
 				results <- userResult{userID: userID, duration: 0, err: fmt.Errorf("failed to create simulator: %w", err)}

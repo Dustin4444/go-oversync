@@ -42,6 +42,18 @@ Run locally
 2. Set environment variables and start the server:
    `DATABASE_URL="postgres://postgres:postgres@localhost:5432/samplesync?sslmode=disable" JWT_SECRET="dev-secret" go run ./examples/samplesync_server`
 
+Concurrency
+
+- Snapshot admission defaults to eight active builds and four active chunk requests.
+- Override the limits with positive integers in
+  `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS` and
+  `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS`.
+- Requests above the active snapshot limit receive a retryable HTTP 429 response instead of
+  entering an unbounded server queue. Supported clients honor `Retry-After` and retry within
+  their configured capacity-wait budget.
+- The PostgreSQL pool allows 20 connections in this local sample. Snapshot concurrency limits
+  bound the memory-heavy work; they do not limit connected users or devices.
+
 Client settings
 
 - Base URL: `http://localhost:8080` (desktop/iOS) or `http://10.0.2.2:8080` (Android emulator)

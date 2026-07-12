@@ -14,6 +14,10 @@ import (
 
 const syncBootstrapLockKey int64 = 0x6f76657273796e63
 
+// Kept as an internal compatibility seam. Existing-layout attachment deliberately does not call
+// this helper because attachment takes no managed data locks.
+var _ = lockExistingManagedLayoutRelations
+
 const (
 	syncSchemaProtocolLabel       = "v1"
 	syncSchemaLayoutName          = "server_postgres_sync_v1"
@@ -131,7 +135,7 @@ ORDER BY namespace.nspname, relation.relname
 		))
 	}
 	return unsupportedSchemaf(
-		"registered tables must use permanent logged PostgreSQL storage (relpersistence=\"p\"); recreate the database with permanent tables; unsupported relations: %s",
+		"registered tables must use permanent logged PostgreSQL storage (relpersistence=\"p\"); unsupported relations: %s",
 		strings.Join(details, "; "),
 	)
 }
@@ -299,7 +303,7 @@ func validateExistingSyncLayout(ctx context.Context, q syncCatalogQuerier, expec
 			return false, nil
 		}
 		return false, unsupportedSchemaf(
-			"existing sync schema uses unsupported layout; drop and recreate the sync schema for layout %q",
+			"existing sync schema uses an unsupported layout for %q",
 			syncSchemaLayoutName,
 		)
 	}
@@ -339,30 +343,11 @@ func persistSyncLayoutMetadata(ctx context.Context, tx pgx.Tx, expectedCatalog [
 	return nil
 }
 
-// initializeSchemaInTx classifies the existing layout and creates the managed
-// schema objects for a fresh layout. It returns true only when fresh objects
-// were created; marker rows and registered-table triggers are deliberately
+// createFreshSyncLayoutInTx creates managed schema objects after Bootstrap has
+// classified the database as fresh and locked and revalidated every registered
+// table declaration. Marker rows and registered-table triggers are deliberately
 // persisted by Bootstrap after semantic self-validation.
-func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) (bool, error) {
-	if err := validateRegisteredTablePersistence(ctx, tx, s.config.RegisteredTables); err != nil {
-		return false, err
-	}
-	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx, tx); err != nil {
-		return false, err
-	}
-	expectedCatalog, err := s.expectedTableCatalogRows()
-	if err != nil {
-		return false, err
-	}
-
-	ready, err := validateExistingSyncLayout(ctx, tx, expectedCatalog)
-	if err != nil {
-		return false, err
-	}
-	if ready {
-		return false, nil
-	}
-
+func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) error {
 	migrations := []string{
 		// Create dedicated sync schema
 		/*language=postgresql*/ `CREATE SCHEMA IF NOT EXISTS sync`,
@@ -553,6 +538,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) (bool
 			key_bytes BYTEA NOT NULL,
 			bundle_seq BIGINT NOT NULL,
 			payload_wire JSON NOT NULL,
+			wire_byte_count BIGINT NOT NULL,
 			PRIMARY KEY (snapshot_id, row_ordinal),
 			CONSTRAINT snapshot_session_rows_logical_row_key UNIQUE (snapshot_id, table_id, key_bytes)
 		)`,
@@ -824,7 +810,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) (bool
 	for i, migration := range migrations {
 		s.logger.Debug("Running sync migration", "step", i+1, "total", len(migrations))
 		if _, err := tx.Exec(ctx, migration); err != nil {
-			return false, fmt.Errorf("sync migration %d failed: %w", i+1, err)
+			return fmt.Errorf("sync migration %d failed: %w", i+1, err)
 		}
 	}
 
@@ -832,17 +818,17 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) (bool
 		`CREATE INDEX IF NOT EXISTS bcs_tx_user_ordinal_idx ON sync.bundle_capture_stage(txid, user_pk, capture_ordinal)`,
 		`CREATE INDEX IF NOT EXISTS rs_user_live_snapshot_idx ON sync.row_state(user_pk, table_id, key_bytes) WHERE deleted = FALSE`,
 		`CREATE INDEX IF NOT EXISTS ps_expires_at_idx ON sync.push_sessions(expires_at)`,
-		`CREATE INDEX IF NOT EXISTS ss_expires_at_idx ON sync.snapshot_sessions(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS ss_expires_at_idx ON sync.snapshot_sessions(expires_at, snapshot_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ssr_snapshot_table_key_idx ON sync.snapshot_session_rows(snapshot_id, table_id, key_bytes)`,
 	}
 	for _, stmt := range bootstrapIndexes {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
-			return false, fmt.Errorf("bundle bootstrap index creation failed: %w", err)
+			return fmt.Errorf("bundle bootstrap index creation failed: %w", err)
 		}
 	}
 	s.logger.Info("Sync schema initialized successfully", "migrations", len(migrations))
 
-	return true, nil
+	return nil
 }
 
 // discoverSchemaRelationships analyzes registered tables and builds dependency graph

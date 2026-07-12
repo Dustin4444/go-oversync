@@ -1,7 +1,6 @@
 package oversync
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 
@@ -28,22 +27,6 @@ func (s *SyncService) syncKeyInfoForTable(schemaName, tableName string) (registe
 		return registeredTableRuntimeInfo{}, &PushValidationError{Message: fmt.Sprintf("table %s.%s is not configured for sync", schemaName, tableName)}
 	}
 	return info, nil
-}
-
-func (s *SyncService) syncKeyColumnForTable(schemaName, tableName string) (string, error) {
-	info, err := s.syncKeyInfoForTable(schemaName, tableName)
-	if err != nil {
-		return "", err
-	}
-	return info.syncKeyColumn, nil
-}
-
-func (s *SyncService) syncKeyTypeForTable(schemaName, tableName string) (string, error) {
-	info, err := s.syncKeyInfoForTable(schemaName, tableName)
-	if err != nil {
-		return "", err
-	}
-	return info.syncKeyType, nil
 }
 
 func (s *SyncService) tableIDForTable(schemaName, tableName string) (int32, error) {
@@ -182,32 +165,10 @@ func wireSyncKeyFromBytes(info registeredTableRuntimeInfo, keyBytes []byte) (Syn
 	return SyncKey{info.syncKeyColumn: keyString}, nil
 }
 
-func keyBytesEqual(a, b []byte) bool {
-	return bytes.Equal(a, b)
-}
-
 func appendInt32BigEndian(dst []byte, value int32) []byte {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(value))
 	return append(dst, buf[:]...)
-}
-
-func syncKeyArray(rows []pushPreparedRow) any {
-	if len(rows) == 0 {
-		return nil
-	}
-	if rows[0].keyType == syncKeyTypeUUID {
-		values := make([]uuid.UUID, len(rows))
-		for i, row := range rows {
-			values[i] = row.keyValue.(uuid.UUID)
-		}
-		return values
-	}
-	values := make([]string, len(rows))
-	for i, row := range rows {
-		values[i] = row.keyValue.(string)
-	}
-	return values
 }
 
 func stripHiddenOwnerColumn(payloadObject map[string]any) bool {

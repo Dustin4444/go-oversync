@@ -111,3 +111,17 @@ func TestConfiguredPoolSizeFromEnv_RejectsInvalidValues(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+func TestConfiguredSnapshotConcurrencyFromEnv(t *testing.T) {
+	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", "8")
+	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", "12")
+
+	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(0, 0)
+	require.NoError(t, err)
+	require.Equal(t, 8, builds)
+	require.Equal(t, 12, chunks)
+
+	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", "0")
+	_, _, err = configuredSnapshotConcurrencyFromEnv(0, 0)
+	require.ErrorContains(t, err, "positive integer")
+}

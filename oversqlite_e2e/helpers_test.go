@@ -18,7 +18,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
-	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -57,9 +56,13 @@ const typedRowsDDL = `
 		id TEXT PRIMARY KEY NOT NULL,
 		name TEXT NOT NULL,
 		note TEXT NULL,
-		count_value INTEGER NULL,
-		enabled_flag INTEGER NOT NULL,
-		rating REAL NULL,
+	count_value INTEGER NULL,
+	small_count INTEGER NULL,
+	medium_count INTEGER NULL,
+	exact_amount TEXT NULL,
+	enabled_flag INTEGER NOT NULL,
+	rating REAL NULL,
+	float4_value REAL NULL,
 		data BLOB NULL,
 		created_at TEXT NULL
 	)
@@ -373,15 +376,6 @@ func mustBeginTx(t *testing.T, db *sql.DB) *sql.Tx {
 	return tx
 }
 
-func jsonResponse(v any) *http.Response {
-	body, _ := json.Marshal(v)
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(bytes.NewReader(body)),
-	}
-}
-
 func errorJSONResponse(status int, v any) *http.Response {
 	body, _ := json.Marshal(v)
 	return &http.Response{
@@ -395,22 +389,7 @@ func syncTables(names ...string) []oversqlite.SyncTable {
 	tables := make([]oversqlite.SyncTable, 0, len(names))
 	for _, name := range names {
 		table := oversqlite.SyncTable{TableName: name, SyncKeyColumnName: "id"}
-		if name == "typed_rows" {
-			table.NumericColumns = map[string]oversqlite.NumericColumnKind{
-				"count_value":  oversqlite.NumericColumnExactInt64,
-				"enabled_flag": oversqlite.NumericColumnExactInt64,
-				"rating":       oversqlite.NumericColumnApproximate,
-			}
-		}
 		tables = append(tables, table)
-	}
-	return tables
-}
-
-func registeredTables(schema string, names ...string) []oversync.RegisteredTable {
-	tables := make([]oversync.RegisteredTable, 0, len(names))
-	for _, name := range names {
-		tables = append(tables, oversync.RegisteredTable{Schema: schema, Table: name, SyncKeyColumns: []string{"id"}})
 	}
 	return tables
 }

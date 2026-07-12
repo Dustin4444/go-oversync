@@ -31,21 +31,6 @@ func mustPushUserBundle(t *testing.T, ctx context.Context, svc *SyncService, act
 	return bundle
 }
 
-func mustDeleteUserBundle(t *testing.T, ctx context.Context, svc *SyncService, actor Actor, schemaName string, sourceBundleID int64, rowID uuid.UUID, baseRowVersion int64) *Bundle {
-	t.Helper()
-
-	bundle, err := pushRowsViaSession(t, ctx, svc, actor, sourceBundleID, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpDelete,
-		BaseRowVersion: baseRowVersion,
-	}})
-	require.NoError(t, err)
-	require.NotNil(t, bundle)
-	return bundle
-}
-
 func TestProcessPull_FreezesStableBundleSeqAndPagesByBundleCount(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)

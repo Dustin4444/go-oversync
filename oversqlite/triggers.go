@@ -219,6 +219,10 @@ func buildJsonObjectExprHexAware(tableInfo *TableInfo, prefix string) string {
 		if col.IsBlob() {
 			// Preserve NULL blobs as JSON null instead of collapsing them to empty hex text.
 			expr = fmt.Sprintf("CASE WHEN %s.%s IS NULL THEN NULL ELSE lower(hex(%s.%s)) END", prefix, col.Name, prefix, col.Name)
+		} else if col.IsInteger() {
+			expr = fmt.Sprintf("CASE WHEN %s.%s IS NULL THEN NULL ELSE CAST(%s.%s AS TEXT) END", prefix, col.Name, prefix, col.Name)
+		} else if col.IsReal() {
+			expr = fmt.Sprintf("CASE WHEN %s.%s IS NULL THEN NULL ELSE printf('%%!.17g', %s.%s) END", prefix, col.Name, prefix, col.Name)
 		} else {
 			// Use column value directly for non-BLOB columns
 			expr = fmt.Sprintf("%s.%s", prefix, col.Name)
@@ -236,6 +240,9 @@ func buildKeyJSONObjectExprHexAware(tableInfo *TableInfo, keyColumn, prefix stri
 		name := strings.ToLower(col.Name)
 		if col.IsBlob() {
 			return fmt.Sprintf("json_object('%s', CASE WHEN %s.%s IS NULL THEN NULL ELSE lower(hex(%s.%s)) END)", name, prefix, col.Name, prefix, col.Name)
+		}
+		if col.IsInteger() {
+			return fmt.Sprintf("json_object('%s', CAST(%s.%s AS TEXT))", name, prefix, col.Name)
 		}
 		return fmt.Sprintf("json_object('%s', %s.%s)", name, prefix, col.Name)
 	}

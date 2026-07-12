@@ -2,6 +2,8 @@ module github.com/mobiletoly/go-oversync/examples/mobile_flow
 
 go 1.25.0
 
+toolchain go1.25.12
+
 replace github.com/mobiletoly/go-oversync => ../..
 
 require (
@@ -13,6 +15,7 @@ require (
 )
 
 require (
+	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

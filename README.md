@@ -55,6 +55,15 @@ SQLiteNow KMP is the mobile companion for Kotlin Multiplatform apps. This reposi
 Go/PostgreSQL sync server foundation and includes a Go SQLite client SDK for Go-based clients and
 simulators.
 
+## Numeric Wire Contract
+
+The active breaking-development contract is `jcs_uniform_numeric_strings_v1`. PostgreSQL integer,
+decimal, and floating business values are canonical JSON strings on every wire surface. Floating
+strings use the shortest finite RFC 8785 binary64 spelling and normalize negative zero to `"0"`.
+SQLite clients may upload Boolean affinity as strict `"0"`/`"1"` strings; authoritative committed
+output uses JSON Booleans. Numeric behavior comes from PostgreSQL schema discovery and SQLite
+affinity, not per-column client configuration.
+
 ## Quick Start
 
 Install the module:
@@ -81,7 +90,7 @@ Run an implemented simulator scenario:
 
 ```bash
 cd examples/mobile_flow
-go run . --scenario=fresh-install --cleanup=false
+go run . --scenario=fresh-install
 ```
 
 ## Server Integration
@@ -229,11 +238,10 @@ The SQLite client is likewise fail-closed:
 
 See `docs/getting-started.md` and `docs/documentation/server.md` for the full table requirements.
 
-Oversync does not provide an in-place migration for deployments outside this supported envelope.
-To reset one, stop every server and client, recreate PostgreSQL with permanent logged business
-tables, recreate every client database, and deploy compatible server and client versions together.
-This procedure discards business history, sync state, checkpoints, outboxes, and offline work;
-mixed-version operation is unsupported.
+Oversync does not provide an in-place migration or automated repair for deployments outside this
+supported envelope. Stop affected instances and restore a reviewed, compatible database backup or
+follow a separately reviewed operator procedure; do not make ad hoc changes while Oversync is
+running. Mixed-version operation is unsupported.
 
 Nullable identity declarations use a data-preserving operator migration rather than the destructive
 reset above. Stop all writers and mixed-version instances, resolve existing NULL owner/key values
@@ -242,30 +250,32 @@ root/descendant or SQLite visible key, then retry bootstrap/initialization. Corr
 change the wire, checkpoint, or snapshot contract, but older binaries do not enforce this invariant.
 
 Registered-table `TRUNCATE` is always rejected with PostgreSQL SQLSTATE `55000`, including through
-`CASCADE`, direct current-partition targets, and `WithinSyncBundle`. Administrative reset requires
-the same stopped-process recreation of PostgreSQL and every client database; Oversync exposes no
+`CASCADE`, direct current-partition targets, and `WithinSyncBundle`. Ordinary direct
+`INSERT`/`UPDATE`/`DELETE` without an Oversync bundle context is also rejected. Oversync exposes no
 runtime reset endpoint or bundle-context escape hatch.
 
-Supported populated registered tables are adopted during `Bootstrap()` without rewriting their
-business rows. Bootstrap locks registered writes and commits trigger installation plus one
-replayable baseline bundle per populated scope atomically. Runtime operations remain unavailable
-until bootstrap succeeds; inconsistent partial sync metadata fails closed. Existing populated
-deployments require a coordinated stop, backup, upgraded bootstrap, readiness check, and restart—do
-not run old and new server versions together during first adoption.
+Supported populated registered tables are adopted only while creating a fresh managed layout,
+without rewriting their business rows. Bootstrap locks registered writes and commits trigger
+installation plus one replayable baseline bundle per populated scope atomically. Runtime operations
+remain unavailable until bootstrap succeeds. Existing populated deployments require a coordinated
+stop, backup, upgraded bootstrap, and readiness check for that one-time adoption.
 
-The PostgreSQL `sync` namespace is reserved for Oversync. Every startup validates the complete
-`server_postgres_sync_v1` semantic layout—tables and columns, constraints and indexes, sequences,
-managed functions, and reserved registered-table/partition triggers—before adoption or readiness.
-A healthy marked layout is read-only during bootstrap, so managed function and trigger OIDs remain
-stable. Missing, extra, disabled, invalid, or altered managed objects return a typed
-`UnsupportedSchemaError` with expected/actual fingerprints and bounded field differences; bootstrap
-does not recreate or repair them.
+The PostgreSQL `sync` namespace is reserved for Oversync. After the fresh transaction has committed,
+later `Bootstrap()` calls use a trusted-database attachment path: they revalidate registered-table
+declarations, the marker/catalog, and the complete `server_postgres_sync_v1` semantic definition,
+then publish readiness without reading business rows or managed operational state. Attachment takes
+no explicit data locks and performs no DML, DDL, adoption, canonicalization, hashing, cleanup, or
+repair. Missing, extra, disabled, invalid, or altered managed definitions return a typed
+`UnsupportedSchemaError` with expected/actual fingerprints and bounded field differences.
 
-For a managed-layout rejection, stop every old and new server instance before changing DDL. Restore
-the exact reported object while services remain stopped, or use the already-approved C2/C3
-whole-database recreation procedure when exact repair is not trustworthy, then retry bootstrap.
-Do not run an older binary during repair because it can recreate managed functions or triggers.
-H4 changes no HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable state.
+This fast path trusts PostgreSQL's committed durable data. It does not audit or repair business or
+managed row values after privileged trigger bypass or direct managed-state edits. Such intervention
+is unsupported; restore a known coherent backup or use a separately reviewed operator procedure.
+
+For a managed-layout rejection, stop every server instance and investigate the reported definition
+delta. Oversync does not mutate the rejected database or prescribe an in-place repair. Do not run a
+different binary against it while the discrepancy is unresolved. This contract changes no
+HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable state.
 
 ## Packages
 

@@ -163,6 +163,34 @@ func TestApplyBundleRowAuthoritativelyInTx_BlobUUIDPK_ServerSendsUUIDString(t *t
 	require.Equal(t, int64(12), gotServerVersion)
 }
 
+func TestSnapshotReachableBlobKeyErrorsRedactRawPrimaryKey(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	_, err = db.Exec(`CREATE TABLE files (id BLOB PRIMARY KEY NOT NULL, name TEXT NOT NULL)`)
+	require.NoError(t, err)
+	client, err := NewClient(db, "http://example.invalid", tokenProviderForTests, DefaultConfig("main", []SyncTable{{TableName: "files", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	defer client.Close()
+
+	tx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	const sensitiveKey = "snapshot-sensitive-invalid-blob-key"
+
+	_, _, err = client.decodeDirtyKeyForPush(tx, "files", `{"id":"`+sensitiveKey+`"}`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "table files column id")
+	require.NotContains(t, err.Error(), sensitiveKey)
+
+	_, err = client.convertPKForQueryInTx(tx, "files", sensitiveKey)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "table files column id")
+	require.NotContains(t, err.Error(), sensitiveKey)
+}
+
 func TestApplyBundleRowAuthoritativelyInTx_UpsertPreservesChildrenForBlobPKTables(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)

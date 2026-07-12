@@ -17,24 +17,31 @@ import (
 )
 
 func (c *Client) startDownloaderLoop(ctx context.Context) {
-	if c.shouldUseBundleChangeWatch(ctx) {
+	useWatch, err := c.shouldUseBundleChangeWatch(ctx)
+	if err != nil {
+		if isProtocolVersionMismatch(err) {
+			c.logger.Error("automatic downloads stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
+			return
+		}
+	}
+	if useWatch {
 		c.watchAwareDownloaderLoop(ctx)
 		return
 	}
 	c.downloaderLoop(ctx)
 }
 
-func (c *Client) shouldUseBundleChangeWatch(ctx context.Context) bool {
+func (c *Client) shouldUseBundleChangeWatch(ctx context.Context) (bool, error) {
 	if c == nil || c.config == nil || c.config.BundleChangeWatchMode != BundleChangeWatchAuto {
-		return false
+		return false, nil
 	}
 	if err := c.beginWatchSetupSyncOperation(ctx); err != nil {
-		return false
+		return false, err
 	}
 	connected := c.ensureConnectedSessionLocked(ctx, "Start() bundle change watch") == nil
 	c.writeMu.Unlock()
 	if !connected {
-		return false
+		return false, nil
 	}
 	return c.serverSupportsBundleChangeWatch(ctx)
 }
@@ -54,16 +61,23 @@ func (c *Client) beginWatchSetupSyncOperation(ctx context.Context) error {
 	}
 }
 
-func (c *Client) serverSupportsBundleChangeWatch(ctx context.Context) bool {
-	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "watch_capabilities", http.MethodGet, strings.TrimRight(c.BaseURL, "/")+"/sync/capabilities", nil, "")
-	if err != nil || statusCode != http.StatusOK {
-		return false
+func (c *Client) serverSupportsBundleChangeWatch(ctx context.Context) (bool, error) {
+	result, err := c.doAuthenticatedBoundedRequestWithRetry(
+		ctx, "watch_capabilities", http.MethodGet,
+		strings.TrimRight(c.BaseURL, "/")+"/sync/capabilities", nil, "",
+		snapshotCapabilitiesBodyLimit, snapshotControlBodyLimit, nil, nil,
+	)
+	if err != nil || result.statusCode != http.StatusOK {
+		return false, nil
 	}
 	var caps oversync.CapabilitiesResponse
-	if err := json.Unmarshal(body, &caps); err != nil {
-		return false
+	if err := json.Unmarshal(result.body, &caps); err != nil {
+		return false, nil
 	}
-	return caps.Features != nil && caps.Features["bundle_change_watch"]
+	if err := requireSupportedProtocolVersion(caps.ProtocolVersion); err != nil {
+		return false, err
+	}
+	return caps.Features != nil && caps.Features["bundle_change_watch"], nil
 }
 
 func (c *Client) normalizedWatchFallbackInterval() time.Duration {
@@ -119,17 +133,25 @@ func (c *Client) watchAwareDownloaderLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
+			if isProtocolVersionMismatch(err) {
+				c.logger.Error("bundle change watch loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
+				return
+			}
 			if isBundleChangeWatchForbidden(err) {
 				c.logger.Warn("bundle change watch disabled for client", "error", err)
 				c.downloaderLoop(ctx)
 				return
 			}
-			c.logger.Warn("bundle change watch stream stopped", "error", err)
+			c.logger.Warn("bundle change watch stream stopped", "error_type", fmt.Sprintf("%T", err))
 			backoffErr := err
 			var streamPullErr *bundleChangeWatchPullError
 			if !errors.As(err, &streamPullErr) {
 				if _, pullErr := c.PullToStable(ctx); pullErr != nil {
 					if ctx.Err() != nil {
+						return
+					}
+					if isProtocolVersionMismatch(pullErr) {
+						c.logger.Error("bundle change watch loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", pullErr))
 						return
 					}
 					backoffErr = pullErr
@@ -172,7 +194,16 @@ func (e *bundleChangeWatchPullError) Unwrap() error {
 	return e.err
 }
 
-var errBundleChangeWatchForbidden = errors.New("bundle change watch forbidden")
+const (
+	bundleChangeWatchMaxLineBytes  = 1 << 20
+	bundleChangeWatchMaxEventBytes = 1 << 20
+)
+
+var (
+	errBundleChangeWatchForbidden     = errors.New("bundle change watch forbidden")
+	errBundleChangeWatchLineTooLarge  = errors.New("bundle change watch line exceeds byte limit")
+	errBundleChangeWatchEventTooLarge = errors.New("bundle change watch event exceeds byte limit")
+)
 
 func isBundleChangeWatchForbidden(err error) bool {
 	return errors.Is(err, errBundleChangeWatchForbidden)
@@ -238,7 +269,10 @@ func (c *Client) openBundleChangeWatch(ctx context.Context, afterBundleSeq int64
 	if afterBundleSeq < 0 {
 		return nil, fmt.Errorf("after_bundle_seq must be >= 0")
 	}
-	sourceID := c.refreshCurrentSourceIDForWatch(ctx)
+	sourceID, err := c.refreshCurrentSourceIDForWatch(ctx)
+	if err != nil {
+		return nil, err
+	}
 	endpoint := strings.TrimRight(c.BaseURL, "/") + "/sync/watch?after_bundle_seq=" + strconv.FormatInt(afterBundleSeq, 10)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -248,7 +282,10 @@ func (c *Client) openBundleChangeWatch(ctx context.Context, afterBundleSeq int64
 	if err != nil {
 		return nil, err
 	}
-	applyAuthenticatedSyncHeadersWithSourceID(req, token, sourceID)
+	if err := applyAuthenticatedSyncHeadersWithSourceID(req, token, sourceID); err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -256,49 +293,67 @@ func (c *Client) openBundleChangeWatch(ctx context.Context, afterBundleSeq int64
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := readDecodedBodyBounded(ctx, "bundle_change_watch", resp, snapshotControlBodyLimit)
+		if readErr != nil {
+			return nil, readErr
+		}
 		if resp.StatusCode == http.StatusForbidden {
 			if errorResp, ok := decodeServerErrorResponse(body); ok && errorResp.Error == "bundle_change_watch_forbidden" {
-				return nil, fmt.Errorf("%w: %s", errBundleChangeWatchForbidden, decodeServerErrorBody(body))
+				return nil, errBundleChangeWatchForbidden
 			}
 		}
 		return nil, &retryHTTPError{
 			Operation:  "bundle_change_watch",
 			StatusCode: resp.StatusCode,
-			Message:    decodeServerErrorBody(body),
 		}
 	}
 	return resp, nil
 }
 
-func (c *Client) refreshCurrentSourceIDForWatch(ctx context.Context) string {
+func (c *Client) refreshCurrentSourceIDForWatch(ctx context.Context) (string, error) {
 	if c == nil {
-		return ""
+		return "", nil
 	}
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return strings.TrimSpace(c.sourceID)
+		if validateErr := validateOptionalSourceID(c.sourceID); validateErr != nil {
+			return "", validateErr
+		}
+		return c.sourceID, nil
 	}
 	defer c.writeMu.Unlock()
 	attachment, err := loadAttachmentState(ctx, c.DB)
-	if err == nil && strings.TrimSpace(attachment.CurrentSourceID) != "" {
+	if err != nil {
+		return "", err
+	}
+	if attachment.CurrentSourceID != "" {
 		c.sourceID = attachment.CurrentSourceID
 	}
-	return strings.TrimSpace(c.sourceID)
+	if err := validateOptionalSourceID(c.sourceID); err != nil {
+		return "", err
+	}
+	return c.sourceID, nil
 }
 
 func parseBundleChangeWatchStream(ctx context.Context, r io.Reader, events chan<- oversync.BundleChangeEvent) error {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 1024), bundleChangeWatchMaxLineBytes+2)
 
 	var eventName string
 	var data strings.Builder
+	eventBytes := 0
 	for scanner.Scan() {
 		line := scanner.Text()
+		if len(line) > bundleChangeWatchMaxLineBytes {
+			return errBundleChangeWatchLineTooLarge
+		}
 		if line == "" {
 			if eventName == "bundle" {
 				var event oversync.BundleChangeEvent
 				if err := json.Unmarshal([]byte(data.String()), &event); err != nil {
 					return fmt.Errorf("decode bundle watch event: %w", err)
+				}
+				if err := validateOptionalSourceID(event.SourceID); err != nil {
+					return fmt.Errorf("bundle watch event source_id is invalid: %w", err)
 				}
 				select {
 				case events <- event:
@@ -308,8 +363,14 @@ func parseBundleChangeWatchStream(ctx context.Context, r io.Reader, events chan<
 			}
 			eventName = ""
 			data.Reset()
+			eventBytes = 0
 			continue
 		}
+		lineBytes := len(line) + 1
+		if lineBytes > bundleChangeWatchMaxEventBytes-eventBytes {
+			return errBundleChangeWatchEventTooLarge
+		}
+		eventBytes += lineBytes
 		if strings.HasPrefix(line, ":") {
 			continue
 		}

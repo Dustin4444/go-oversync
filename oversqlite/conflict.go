@@ -88,7 +88,7 @@ func (e *PushConflictError) Error() string {
 	if e == nil {
 		return "push conflict"
 	}
-	return fmt.Sprintf("push commit conflict: HTTP %d - %s", e.Status, decodeServerErrorBody([]byte(e.RawBody)))
+	return fmt.Sprintf("push commit conflict: HTTP %d error=push_conflict", e.Status)
 }
 
 // Conflict returns the structured conflict details when available.
@@ -144,9 +144,10 @@ func decodePushConflictError(status int, body []byte) *PushConflictError {
 	if response.Error != "push_conflict" || response.Conflict == nil {
 		return nil
 	}
+	response.Message = ""
 	return &PushConflictError{
 		Status:   status,
-		RawBody:  string(body),
+		RawBody:  "",
 		Response: response,
 	}
 }

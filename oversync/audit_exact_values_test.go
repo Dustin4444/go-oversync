@@ -164,7 +164,7 @@ func TestAuditExactValuesCharacterization_CommittedBundleHashDeterminism(t *test
 	require.NotEqual(t, wantHash, reversedHash, "authoritative row order must contribute to the bundle hash")
 }
 
-// Contract regressions assert JCS plus schema-typed exact numeric strings.
+// Contract regressions assert JCS plus uniform numeric strings.
 
 func TestAuditExactValuesContract_CanonicalJSONPreservesTypedInt64Bounds(t *testing.T) {
 	tests := []struct {
@@ -299,7 +299,7 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 		var fields map[string]json.RawMessage
 		require.NoError(t, json.Unmarshal(payload, &fields))
 		assert.Equal(t, `"`+bigintMax+`"`, string(fields["bigint_value"]), "%s BIGINT value must remain an exact typed string", channel)
-		assert.Equal(t, `"`+preciseDecimal+`"`, string(fields["decimal_value"]), "%s NUMERIC value must remain an exact typed string", channel)
+		assert.Equal(t, `"`+preciseDecimal+`"`, string(fields["decimal_value"]), "%s NUMERIC value must remain an exact string", channel)
 		assert.Equal(t, `"`+rowID.String()+`"`, string(fields["id"]), "%s row id must remain stable", channel)
 	}
 
@@ -335,7 +335,7 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 		t.Run("snapshot", func(t *testing.T) {
 			session, err := service.CreateSnapshotSession(ctx, reader)
 			require.NoError(t, err)
-			chunk, err := service.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+			chunk, err := service.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 			require.NoError(t, err)
 			require.Len(t, chunk.Rows, 1)
 			assertExactPayload(t, "snapshot payload", chunk.Rows[0].Payload, rowID)
@@ -367,7 +367,7 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 
 	t.Run("exact typed database values", func(t *testing.T) {
 		rowID := uuid.New()
-		writer := Actor{UserID: "audit-typed-numeric-" + suffix, SourceID: "writer"}
+		writer := Actor{UserID: "audit-uniform-numeric-" + suffix, SourceID: "writer"}
 		// Quoted numeric lexemes isolate the outbound path: PostgreSQL accepts
 		// them when populating typed BIGINT/NUMERIC columns, after which bundle,
 		// pull, and snapshot payloads originate from exact database values.

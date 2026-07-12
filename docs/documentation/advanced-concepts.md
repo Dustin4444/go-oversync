@@ -50,22 +50,24 @@ resolver code.
 - use parsed time comparison in custom merge logic such as `updated_at` conflict policies
 - do not treat legacy formats such as `yyyy:mm:dd hh:mm:ss` as the canonical synced form
 
-## Canonical JSON and numeric columns
+## Canonical JSON and numeric values
 
-Canonical protocol bytes use RFC 8785 JCS. Oversync does not extend JCS with arbitrary-precision
-JSON numbers. Instead, schema discovery and client `numericColumns` metadata define the wire type:
+Canonical protocol bytes use RFC 8785 JCS plus `jcs_uniform_numeric_strings_v1`. PostgreSQL
+`SMALLINT`, `INTEGER`, `BIGINT`, `NUMERIC`, `DECIMAL`, `REAL`, and `DOUBLE PRECISION` business
+values are JSON strings on every wire surface. Floating strings use the shortest finite RFC 8785
+binary64 spelling and normalize negative zero to `"0"`. SQLite clients upload `INTEGER` and finite
+`REAL` affinity as those canonical strings; exact decimals remain SQLite `TEXT` strings.
 
-- PostgreSQL `BIGINT` / SQLite `INTEGER` exact values use canonical signed-64-bit JSON strings.
-- PostgreSQL `NUMERIC` / SQLite `TEXT` exact decimals use validated JSON strings and preserve the
-  authoritative PostgreSQL spelling.
-- Explicit approximate float/REAL columns use finite binary64 JSON numbers.
-- Native JSON/JSONB numbers are supported only inside that binary64/JCS domain; exact nested values
-  must be modeled as strings by the application schema.
+SQLite Boolean affinity may upload only the strict strings `"0"` and `"1"`. PostgreSQL commits,
+conflicts, pulls, and snapshots emit JSON Booleans. Numeric behavior comes from PostgreSQL schema
+discovery and SQLite affinity; clients do not configure per-column numeric maps.
 
-Exact strings are rejected before business or SQLite mutation if their grammar, range, or declared
-affinity is unsupported. `bundle_hash` authenticates server-committed rows. The separately stored
-`canonical_request_hash` proves that an ambiguous `already_committed` response belongs to the
-client's frozen original request even when legitimate server mutation changed committed payloads.
+Invalid signed-64, decimal, binary64, or Boolean wire values are rejected before durable staging,
+business mutation, or SQLite mutation. Native JSON/JSONB numbers remain inside the ordinary JCS
+binary64 domain; exact nested values must be modeled as strings by the application schema.
+`bundle_hash` authenticates server-committed rows. The separately stored `canonical_request_hash`
+proves that an ambiguous `already_committed` response belongs to the client's frozen original
+request even when legitimate server mutation changed committed payloads.
 
 ## Push
 

@@ -71,8 +71,7 @@ func TestSyncService_GetCapabilities(t *testing.T) {
 	if caps.Features["push_sessions"] {
 		t.Fatalf("expected legacy push_sessions capability flag to be absent: %#v", caps.Features)
 	}
-	if caps.BundleLimits == nil ||
-		caps.BundleLimits.MaxRowsPerBundle != 250 ||
+	if caps.BundleLimits.MaxRowsPerBundle != 250 ||
 		caps.BundleLimits.MaxBytesPerBundle != 4096 ||
 		caps.BundleLimits.MaxBundlesPerPull != defaultMaxBundlesPerPull ||
 		caps.BundleLimits.DefaultRowsPerPushChunk != defaultRowsPerPushChunk ||
@@ -92,8 +91,13 @@ func TestSyncService_GetCapabilities(t *testing.T) {
 func TestHTTPSyncHandlers_HandleCapabilities(t *testing.T) {
 	svc := &SyncService{
 		config: &ServiceConfig{
-			MaxSupportedSchemaVersion: 2,
-			AppName:                   "handler-test",
+			MaxSupportedSchemaVersion:          2,
+			AppName:                            "handler-test",
+			MaxConcurrentSnapshotBuilds:        defaultMaxConcurrentSnapshotBuilds,
+			MaxConcurrentSnapshotChunkRequests: defaultMaxConcurrentSnapshotChunkRequests,
+			DefaultBytesPerSnapshotChunk:       defaultBytesPerSnapshotChunk,
+			MaxBytesPerSnapshotChunk:           defaultMaxBytesPerSnapshotChunk,
+			MaxBytesPerSnapshotRow:             defaultMaxBytesPerSnapshotRow,
 		},
 		logger: slog.Default(),
 	}
@@ -126,8 +130,13 @@ func TestHTTPSyncHandlers_HandleCapabilities(t *testing.T) {
 func TestHTTPSyncHandlers_HandleCapabilitiesAppliesActorWatchPolicy(t *testing.T) {
 	svc := &SyncService{
 		config: &ServiceConfig{
-			MaxSupportedSchemaVersion: 2,
-			AppName:                   "handler-watch-policy-test",
+			MaxSupportedSchemaVersion:          2,
+			AppName:                            "handler-watch-policy-test",
+			MaxConcurrentSnapshotBuilds:        defaultMaxConcurrentSnapshotBuilds,
+			MaxConcurrentSnapshotChunkRequests: defaultMaxConcurrentSnapshotChunkRequests,
+			DefaultBytesPerSnapshotChunk:       defaultBytesPerSnapshotChunk,
+			MaxBytesPerSnapshotChunk:           defaultMaxBytesPerSnapshotChunk,
+			MaxBytesPerSnapshotRow:             defaultMaxBytesPerSnapshotRow,
 			BundleChangeWatch: BundleChangeWatchConfig{
 				Enabled: true,
 			},

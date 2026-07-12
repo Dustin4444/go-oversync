@@ -170,7 +170,7 @@ func TestBinaryWire_SnapshotChunkCanonicalizesByteaPayload(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, bundle.BundleSeq, session.SnapshotBundleSeq)
 
-	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.Equal(t, "files", chunk.Rows[0].Table)

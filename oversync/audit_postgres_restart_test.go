@@ -32,7 +32,7 @@ const (
 type auditRestartPostgres struct {
 	containerID   string
 	containerName string
-	volumeName    string
+	dataDir       string
 	server        *managedIntegrationPostgresServer
 
 	cleanupOnce sync.Once
@@ -51,31 +51,33 @@ func newAuditRestartPostgres(t *testing.T) *auditRestartPostgres {
 
 	suffix := fmt.Sprintf("%d-%s", os.Getpid(), strings.ReplaceAll(uuid.NewString(), "-", "")[:12])
 	containerName := "go-oversync-audit-restart-" + suffix
-	volumeName := containerName + "-data"
+	dataDir, err := os.MkdirTemp("", "go-oversync-audit-restart-postgres-")
+	if err != nil {
+		t.Fatalf("create restart-audit PostgreSQL data directory: %v", err)
+	}
+	if err := os.Chmod(dataDir, 0o777); err != nil {
+		_ = os.RemoveAll(dataDir)
+		t.Fatalf("prepare restart-audit PostgreSQL data directory: %v", err)
+	}
 	portReservation, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		_ = os.RemoveAll(dataDir)
 		t.Fatalf("reserve restart-audit PostgreSQL host port: %v", err)
 	}
 	host, port, err := net.SplitHostPort(portReservation.Addr().String())
 	if err != nil {
 		_ = portReservation.Close()
+		_ = os.RemoveAll(dataDir)
 		t.Fatalf("parse reserved restart-audit PostgreSQL host port: %v", err)
 	}
 	if err := portReservation.Close(); err != nil {
+		_ = os.RemoveAll(dataDir)
 		t.Fatalf("release reserved restart-audit PostgreSQL host port: %v", err)
-	}
-
-	if _, err := dockerOutput(ctx,
-		"volume", "create",
-		"--label", auditRestartPostgresLabel,
-		volumeName,
-	); err != nil {
-		t.Fatalf("create restart-audit PostgreSQL volume: %v", err)
 	}
 
 	harness := &auditRestartPostgres{
 		containerName: containerName,
-		volumeName:    volumeName,
+		dataDir:       dataDir,
 		server: &managedIntegrationPostgresServer{
 			host: host,
 			port: port,
@@ -112,7 +114,7 @@ func (p *auditRestartPostgres) startContainer(ctx context.Context) error {
 		"--name", p.containerName,
 		"--label", auditRestartPostgresLabel,
 		"--publish", net.JoinHostPort(p.server.host, p.server.port)+":5432",
-		"--mount", "type=volume,source="+p.volumeName+",target=/var/lib/postgresql/data",
+		"--mount", "type=bind,source="+p.dataDir+",target=/var/lib/postgresql/data",
 		"--env", "POSTGRES_USER=postgres",
 		"--env", "POSTGRES_PASSWORD="+managedIntegrationPostgresPassword,
 		"--env", "POSTGRES_DB=postgres",
@@ -173,14 +175,14 @@ func (p *auditRestartPostgres) crashAndRestart(t *testing.T) time.Duration {
 	removeCtx, cancelRemove := context.WithTimeout(context.Background(), 30*time.Second)
 	_, err = dockerOutput(removeCtx, "rm", "--force", p.containerID)
 	cancelRemove()
-	require.NoError(t, err, "remove SIGKILLed restart-audit PostgreSQL container while retaining its named volume")
+	require.NoError(t, err, "remove SIGKILLed restart-audit PostgreSQL container while retaining its test-owned data directory")
 	p.containerID = ""
 	p.server.containerID = ""
 
 	startCtx, cancelStart := context.WithTimeout(context.Background(), 30*time.Second)
 	err = p.startContainer(startCtx)
 	cancelStart()
-	require.NoError(t, err, "recreate restart-audit PostgreSQL against the same named data volume")
+	require.NoError(t, err, "recreate restart-audit PostgreSQL against the same test-owned data directory")
 
 	readyCtx, cancelReady := context.WithTimeout(context.Background(), 90*time.Second)
 	err = p.server.waitUntilReady(readyCtx)
@@ -206,9 +208,9 @@ func (p *auditRestartPostgres) cleanup() error {
 				cleanupErrors = append(cleanupErrors, fmt.Errorf("remove container: %w", err))
 			}
 		}
-		if p.volumeName != "" {
-			if _, err := dockerOutput(ctx, "volume", "rm", "--force", p.volumeName); err != nil && !auditDockerResourceMissing(err) {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("remove named data volume: %w", err))
+		if p.dataDir != "" {
+			if err := os.RemoveAll(p.dataDir); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("remove test-owned data directory: %w", err))
 			}
 		}
 		p.cleanupErr = errors.Join(cleanupErrors...)
@@ -577,6 +579,100 @@ func TestAuditPostgresRestart_LoggedStateStagingPoolAndListenerRecover(t *testin
 	require.Equal(t, int64(2), liveRowStateCount)
 	require.Equal(t, int64(2), maxSourceBundleID)
 	requireAuditMetadataIntegrity(t, ctx, pool)
+}
+
+func loadAuditFastAttachDurableState(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	schemaName string,
+) map[string]string {
+	t.Helper()
+	relations := []string{pgx.Identifier{schemaName, "users"}.Sanitize()}
+	for _, tableName := range []string{
+		"user_state", "scope_state", "source_state", "row_state", "bundle_capture_stage", "bundle_log", "bundle_rows",
+		"push_sessions", "push_session_rows", "snapshot_sessions", "snapshot_session_rows", "meta", "table_catalog",
+	} {
+		relations = append(relations, pgx.Identifier{"sync", tableName}.Sanitize())
+	}
+	state := make(map[string]string, len(relations))
+	for _, relation := range relations {
+		var encoded string
+		require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+			SELECT COALESCE(jsonb_agg(to_jsonb(snapshot) ORDER BY to_jsonb(snapshot)::text)::text, '[]')
+			FROM %s AS snapshot
+		`, relation)).Scan(&encoded))
+		state[relation] = encoded
+	}
+	return state
+}
+
+func TestAuditPostgresRestart_FastAttachPreservesCommittedSupportedWrite(t *testing.T) {
+	ctx := context.Background()
+	postgres := newAuditRestartPostgres(t)
+	pool := newAuditRestartPool(t, postgres.databaseURL())
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	schemaName := "audit_fast_attach_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	config := &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "audit-postgres-fast-attach",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}
+	service, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+	require.NoError(t, err)
+	require.NoError(t, service.Bootstrap(ctx))
+
+	actor := Actor{UserID: "fast-attach-owner-" + suffix, SourceID: "reader"}
+	mustInitializeEmptyScope(t, ctx, service, actor.UserID, "seed")
+	rowID := uuid.New()
+	tableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
+	require.NoError(t, service.WithinSyncBundle(ctx, Actor{UserID: actor.UserID}, BundleSource{SourceID: "server-writer", SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, execErr := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s (id, name, email)
+			VALUES ($1, 'Durable Ω', 'durable@example.com')
+		`, tableIdent), rowID)
+		return execErr
+	}))
+
+	pullBefore, err := service.ProcessPull(ctx, actor, 0, 10, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), pullBefore.StableBundleSeq)
+	require.Len(t, pullBefore.Bundles, 1)
+	require.Len(t, pullBefore.Bundles[0].Rows, 1)
+	pullBeforeJSON, err := json.Marshal(pullBefore)
+	require.NoError(t, err)
+	snapshotBefore, err := service.CreateSnapshotSession(ctx, actor)
+	require.NoError(t, err)
+	snapshotRowsBefore, snapshotSeqBefore := collectSnapshotChunkRows(t, ctx, service, actor, snapshotBefore.SnapshotID, 10)
+	require.Equal(t, pullBefore.StableBundleSeq, snapshotSeqBefore)
+	require.Len(t, snapshotRowsBefore, 1)
+	require.Equal(t, rowID.String(), snapshotRowsBefore[0].Key["id"])
+	require.NoError(t, service.DeleteSnapshotSession(ctx, actor, snapshotBefore.SnapshotID))
+	durableBefore := loadAuditFastAttachDurableState(t, ctx, pool, schemaName)
+	require.NoError(t, service.Close(ctx))
+
+	postgres.crashAndRestart(t)
+	requireAuditRestartPoolReady(t, pool)
+	restarted, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = restarted.Close(context.Background()) })
+	require.NoError(t, restarted.Bootstrap(ctx))
+	require.Equal(t, durableBefore, loadAuditFastAttachDurableState(t, ctx, pool, schemaName))
+
+	pullAfter, err := restarted.ProcessPull(ctx, actor, 0, 10, 0)
+	require.NoError(t, err)
+	pullAfterJSON, err := json.Marshal(pullAfter)
+	require.NoError(t, err)
+	require.JSONEq(t, string(pullBeforeJSON), string(pullAfterJSON))
+	snapshotAfter, err := restarted.CreateSnapshotSession(ctx, actor)
+	require.NoError(t, err)
+	snapshotRowsAfter, snapshotSeqAfter := collectSnapshotChunkRows(t, ctx, restarted, actor, snapshotAfter.SnapshotID, 10)
+	require.Equal(t, snapshotSeqBefore, snapshotSeqAfter)
+	require.Equal(t, snapshotRowsBefore, snapshotRowsAfter)
+	require.NoError(t, restarted.DeleteSnapshotSession(ctx, actor, snapshotAfter.SnapshotID))
 }
 
 func TestAuditPostgresRestart_InFlightCommitRollsBackAndSamePushIDRetriesOnce(t *testing.T) {

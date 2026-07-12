@@ -21,7 +21,10 @@ The current architecture has four main pieces:
 ## How It Works
 
 1. Your server registers the PostgreSQL tables that participate in sync.
-2. `Bootstrap()` validates the server schema and prepares the sync metadata/runtime topology.
+2. `Bootstrap()` validates the server schema and prepares the sync metadata/runtime topology. A
+   fresh layout atomically adopts populated registered tables; a committed existing layout attaches
+   after declaration and managed-definition validation without scanning business or operational
+   sync rows.
 3. The SQLite client runs `Open()` on launch, then `Attach(userID)` after sign-in.
 4. The SQLite client tracks local writes in `_sync_dirty_rows` with triggers.
    After `Detach()`, those triggers stay active so offline anonymous writes continue to enqueue
@@ -86,6 +89,18 @@ at the HTTP boundary.
 `sync.bundle_log` is the durable committed-bundle metadata and accepted-push replay source. Bundle
 history is retained only above each user's `retained_bundle_floor`; below that floor, clients
 recover through snapshot rebuild rather than best-effort historical replay.
+
+## Bootstrap Trust Boundary
+
+Fresh layout creation and populated-table adoption are one fail-closed PostgreSQL transaction with
+exact post-persistence validation. After that transaction commits, restart attachment trusts
+PostgreSQL's durable row state and validates only registered declarations plus the exact managed
+definition. It does not scan, rewrite, backfill, hash, reconcile, or repair business or operational
+sync rows.
+
+Registered-table guards still reject ordinary direct DML without a bundle context and reject every
+`TRUNCATE`. Privileged trigger bypass and direct managed-row edits are outside the supported trust
+boundary; Bootstrap does not detect or repair them.
 
 ## Server-Originated Writes
 

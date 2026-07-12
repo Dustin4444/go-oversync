@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -58,6 +60,10 @@ func (c *Client) uploaderLoop(ctx context.Context) {
 		}
 
 		if _, err := c.PushPending(ctx); err != nil {
+			if isProtocolVersionMismatch(err) {
+				c.logger.Error("upload loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
+				return
+			}
 			if IsLifecyclePreconditionError(err) {
 				c.logger.Warn("upload loop blocked by lifecycle state", "error", err)
 				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
@@ -102,6 +108,10 @@ func (c *Client) downloaderLoop(ctx context.Context) {
 		}
 
 		if _, err := c.PullToStable(ctx); err != nil {
+			if isProtocolVersionMismatch(err) {
+				c.logger.Error("download loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
+				return
+			}
 			if IsLifecyclePreconditionError(err) {
 				c.logger.Warn("download loop blocked by lifecycle state", "error", err)
 				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
@@ -216,7 +226,7 @@ func (c *Client) processPayloadForUpload(tableName, payloadStr string) (json.Raw
 	if tableInfo.PrimaryKey != nil {
 		pkColLower = strings.ToLower(tableInfo.PrimaryKey.Name)
 	}
-	if err := c.normalizeConfiguredNumericPayloadForWire(tableName, payloadData, tableInfo); err != nil {
+	if err := normalizeNumericPayloadForWire(payloadData, tableInfo); err != nil {
 		return nil, err
 	}
 	for _, col := range tableInfo.Columns {
@@ -271,39 +281,40 @@ func (c *Client) processPayloadForUpload(tableName, payloadStr string) (json.Raw
 	return processedBytes, nil
 }
 
-func (c *Client) normalizeConfiguredNumericPayloadForWire(tableName string, payloadData map[string]any, tableInfo *TableInfo) error {
+func normalizeNumericPayloadForWire(payloadData map[string]any, tableInfo *TableInfo) error {
 	for _, col := range tableInfo.Columns {
 		colNameLower := strings.ToLower(col.Name)
 		if payloadData[colNameLower] == nil {
 			continue
 		}
-		kind, configured := c.numericKindForColumn(tableName, col.Name)
-		if !configured {
-			continue
-		}
-		switch kind {
-		case wirevalue.NumericKindExactInt64:
-			var raw string
-			switch value := payloadData[colNameLower].(type) {
-			case string:
-				raw = value
-			case json.Number:
-				raw = value.String()
-			default:
-				return fmt.Errorf("exact-int64 column %s must be a SQLite integer or canonical string", col.Name)
-			}
-			if _, err := wirevalue.ParseInt64(raw); err != nil {
-				return fmt.Errorf("invalid exact int64 in column %s: %w", col.Name, err)
-			}
-			payloadData[colNameLower] = raw
-		case wirevalue.NumericKindExactDecimal:
+		if col.IsInteger() {
 			raw, ok := payloadData[colNameLower].(string)
 			if !ok {
-				return fmt.Errorf("exact-decimal column %s must be a JSON string", col.Name)
+				return fmt.Errorf("INTEGER column %s must be captured as canonical signed-64 text", col.Name)
 			}
-			if err := wirevalue.ValidateDecimal(raw); err != nil {
-				return fmt.Errorf("invalid exact decimal in column %s: %w", col.Name, err)
+			if _, err := wirevalue.ParseInt64(raw); err != nil {
+				return fmt.Errorf("invalid INTEGER in column %s: %w", col.Name, err)
 			}
+			payloadData[colNameLower] = raw
+		} else if col.IsReal() {
+			var raw string
+			switch value := payloadData[colNameLower].(type) {
+			case json.Number:
+				raw = value.String()
+			case string:
+				raw = value
+			default:
+				return fmt.Errorf("REAL column %s must be captured as finite text", col.Name)
+			}
+			parsed, err := strconv.ParseFloat(raw, 64)
+			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+				return fmt.Errorf("REAL column %s must be finite", col.Name)
+			}
+			canonical, err := wirevalue.RenderFloat64(parsed)
+			if err != nil {
+				return fmt.Errorf("render REAL column %s: %w", col.Name, err)
+			}
+			payloadData[colNameLower] = canonical
 		}
 	}
 	return nil

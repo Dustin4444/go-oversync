@@ -44,13 +44,6 @@ func requirePendingInitializationID(t *testing.T, db *sql.DB) string {
 	return pendingInitializationID
 }
 
-func requireApplyMode(t *testing.T, db *sql.DB) int {
-	t.Helper()
-	var applyMode int
-	require.NoError(t, db.QueryRow(`SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1`).Scan(&applyMode))
-	return applyMode
-}
-
 func requireOperationState(t *testing.T, db *sql.DB) (string, string, string, int64, int64) {
 	t.Helper()
 	var kind, targetUserID, stagedSnapshotID string
@@ -141,15 +134,6 @@ func setCurrentSourceBundleState(t *testing.T, db *sql.DB, nextSourceBundleID, l
 	require.NotEmpty(t, attachment.CurrentSourceID)
 	require.NoError(t, updateSourceNextBundleID(ctx, db, attachment.CurrentSourceID, nextSourceBundleID))
 	attachment.LastBundleSeqSeen = lastBundleSeqSeen
-	require.NoError(t, persistAttachmentState(ctx, db, attachment))
-}
-
-func setPendingInitializationID(t *testing.T, db *sql.DB, pendingInitializationID string) {
-	t.Helper()
-	ctx := context.Background()
-	attachment, err := loadAttachmentState(ctx, db)
-	require.NoError(t, err)
-	attachment.PendingInitializationID = pendingInitializationID
 	require.NoError(t, persistAttachmentState(ctx, db, attachment))
 }
 

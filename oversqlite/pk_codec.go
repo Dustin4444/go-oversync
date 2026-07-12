@@ -4,7 +4,6 @@
 package oversqlite
 
 import (
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -55,7 +54,7 @@ func (c *Client) isPrimaryKeyBlob(tableName string) (bool, error) {
 	return false, nil
 }
 
-func (c *Client) isPrimaryKeyBlobInTx(tx *sql.Tx, tableName string) (bool, error) {
+func (c *Client) isPrimaryKeyBlobInTx(tx tableInfoQueryer, tableName string) (bool, error) {
 	tableInfo, err := c.getTableInfoTx(tx, strings.ToLower(tableName))
 	if err != nil {
 		return false, err
@@ -92,22 +91,6 @@ func (c *Client) normalizePKForMeta(tableName, pk string) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func (c *Client) normalizePKForMetaInTx(tx *sql.Tx, tableName, pk string) (string, error) {
-	isBlobPK, err := c.isPrimaryKeyBlobInTx(tx, tableName)
-	if err != nil {
-		return "", err
-	}
-	if !isBlobPK {
-		return pk, nil
-	}
-
-	b, err := decodeUUIDBytesFromString(pk)
-	if err != nil {
-		return "", fmt.Errorf("invalid blob UUID pk %q: %w", pk, err)
-	}
-	return hex.EncodeToString(b), nil
-}
-
 func (c *Client) normalizePKForServer(tableName, pk string) (string, error) {
 	isBlobPK, err := c.isPrimaryKeyBlob(tableName)
 	if err != nil {
@@ -128,7 +111,7 @@ func (c *Client) normalizePKForServer(tableName, pk string) (string, error) {
 	return id.String(), nil
 }
 
-func (c *Client) normalizePKForServerInTx(tx *sql.Tx, tableName, pk string) (string, error) {
+func (c *Client) normalizePKForServerInTx(tx tableInfoQueryer, tableName, pk string) (string, error) {
 	isBlobPK, err := c.isPrimaryKeyBlobInTx(tx, tableName)
 	if err != nil {
 		return "", err
@@ -139,7 +122,7 @@ func (c *Client) normalizePKForServerInTx(tx *sql.Tx, tableName, pk string) (str
 
 	b, err := decodeUUIDBytesFromString(pk)
 	if err != nil {
-		return "", fmt.Errorf("invalid blob UUID pk %q: %w", pk, err)
+		return "", fmt.Errorf("invalid blob UUID pk for table %s: %w", tableName, err)
 	}
 	id, err := uuid.FromBytes(b)
 	if err != nil {
@@ -174,7 +157,7 @@ func (c *Client) convertPKForQuery(tableName, pkValue string) (interface{}, erro
 	return pkValue, nil
 }
 
-func (c *Client) convertPKForQueryInTx(tx *sql.Tx, tableName, pkValue string) (interface{}, error) {
+func (c *Client) convertPKForQueryInTx(tx tableInfoQueryer, tableName, pkValue string) (interface{}, error) {
 	tableInfo, err := c.getTableInfoTx(tx, strings.ToLower(tableName))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get table info for %s: %w", tableName, err)
@@ -189,7 +172,7 @@ func (c *Client) convertPKForQueryInTx(tx *sql.Tx, tableName, pkValue string) (i
 		if strings.EqualFold(col.Name, pkColumn) && col.IsBlob() {
 			binaryData, err := decodeBlobBytesFromString(pkValue)
 			if err != nil {
-				return nil, fmt.Errorf("failed to decode primary key %s: %w", pkValue, err)
+				return nil, fmt.Errorf("failed to decode primary key for table %s column %s: %w", tableName, pkColumn, err)
 			}
 			return binaryData, nil
 		}

@@ -13,12 +13,20 @@ type execContexter interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
+type sqliteTransaction interface {
+	execContexter
+	queryRower
+	tableInfoQueryer
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	PrepareContext(context.Context, string) (*sql.Stmt, error)
+}
+
 type txStmtCache struct {
-	tx    *sql.Tx
+	tx    sqliteTransaction
 	stmts map[string]*sql.Stmt
 }
 
-func newTxStmtCache(tx *sql.Tx) *txStmtCache {
+func newTxStmtCache(tx sqliteTransaction) *txStmtCache {
 	return &txStmtCache{
 		tx:    tx,
 		stmts: make(map[string]*sql.Stmt),

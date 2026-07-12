@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -23,7 +23,7 @@ const lifecycleUsersDDL = `
 	)
 `
 
-func newLifecycleTestClientWithTransport(t *testing.T, transport roundTripFunc) (*Client, *sql.DB) {
+func newLifecycleTestClientWithTransport(t *testing.T, transport rawRoundTripFunc) (*Client, *sql.DB) {
 	t.Helper()
 
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -55,7 +55,7 @@ func newLifecycleTestClientWithTransport(t *testing.T, transport roundTripFunc) 
 	return client, db
 }
 
-func newLifecycleTestClientWithConfigAndTransport(t *testing.T, config *Config, transport roundTripFunc) (*Client, *sql.DB) {
+func newLifecycleTestClientWithConfigAndTransport(t *testing.T, config *Config, transport rawRoundTripFunc) (*Client, *sql.DB) {
 	t.Helper()
 
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -84,7 +84,7 @@ func newLifecycleTestClient(t *testing.T, connectResponse *oversync.ConnectRespo
 		switch r.URL.Path {
 		case "/sync/capabilities":
 			requireAuthenticatedSyncHeaders(t, r, "device-a")
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{
 					"connect_lifecycle": true,
 				},
@@ -147,7 +147,7 @@ func TestConnect_RetriesTransientHTTPFailureAndSucceeds(t *testing.T) {
 	client, _ := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":
@@ -175,7 +175,7 @@ func TestConnect_DoesNotRetryUnauthorized(t *testing.T) {
 	client, _ := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":
@@ -194,12 +194,27 @@ func TestConnect_DoesNotRetryUnauthorized(t *testing.T) {
 	require.Equal(t, int32(1), atomic.LoadInt32(&connectRequests))
 }
 
+func TestConnect_InvalidInitializationLeaseIsNotPersisted(t *testing.T) {
+	invalidInitializationID := " 22222222-2222-4222-8222-222222222222 "
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution:       "initialize_local",
+		InitializationID: invalidInitializationID,
+	})
+
+	_, err := client.Attach(context.Background(), "lifecycle-user")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "22222222")
+	require.Empty(t, client.pendingInitializationID)
+	require.Empty(t, client.UserID)
+	require.Empty(t, requirePendingInitializationID(t, db))
+}
+
 func TestConnect_RetryExhaustionReturnsTypedError(t *testing.T) {
 	var connectRequests int32
 	client, _ := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":
@@ -229,7 +244,7 @@ func TestConnect_RetryPolicyCanBeDisabledExplicitly(t *testing.T) {
 	client, _ := newLifecycleTestClientWithConfigAndTransport(t, config, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":
@@ -249,16 +264,17 @@ func TestConnect_RetryPolicyCanBeDisabledExplicitly(t *testing.T) {
 }
 
 func TestConnect_NetworkFailureLeavesAnonymousStateIntact(t *testing.T) {
+	const hostileText = "HOSTILE_CONNECT_TRANSPORT_SECRET"
 	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{
 					"connect_lifecycle": true,
 				},
 			}), nil
 		case "/sync/connect":
-			return nil, fmt.Errorf("connect network failed")
+			return nil, errors.New(hostileText)
 		default:
 			return errorJSONResponse(http.StatusNotFound, map[string]string{"error": "not_found"}), nil
 		}
@@ -269,7 +285,8 @@ func TestConnect_NetworkFailureLeavesAnonymousStateIntact(t *testing.T) {
 	mustOpen(t, client, context.Background())
 
 	_, err = client.Attach(context.Background(), "lifecycle-user")
-	require.ErrorContains(t, err, "connect network failed")
+	require.EqualError(t, err, "failed to send connect request: connect_request HTTP transport failed")
+	require.NotContains(t, err.Error(), hostileText)
 	require.Empty(t, client.UserID)
 
 	var (
@@ -624,7 +641,7 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":
@@ -632,12 +649,12 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 			case 1:
 				return jsonResponse(&oversync.ConnectResponse{
 					Resolution:       "initialize_local",
-					InitializationID: "init-1",
+					InitializationID: "22222222-2222-4222-8222-222222222222",
 				}), nil
 			case 2:
 				return jsonResponse(&oversync.ConnectResponse{
 					Resolution:       "initialize_local",
-					InitializationID: "init-2",
+					InitializationID: "33333333-3333-4333-8333-333333333333",
 				}), nil
 			default:
 				return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{
@@ -666,7 +683,7 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 	require.Equal(t, AttachOutcomeSeededLocal, result.Outcome)
 
 	pendingInitializationID := requirePendingInitializationID(t, db)
-	require.Equal(t, "init-1", pendingInitializationID)
+	require.Equal(t, "22222222-2222-4222-8222-222222222222", pendingInitializationID)
 
 	_, err = client.PushPending(context.Background())
 	require.Error(t, err)
@@ -692,12 +709,12 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 	require.Equal(t, AttachOutcomeSeededLocal, reconnectResult.Outcome)
 	require.Equal(t, int32(2), atomic.LoadInt32(&connectRequests))
 	require.Equal(t, "lifecycle-user", client.UserID)
-	require.Equal(t, "init-2", client.pendingInitializationID)
+	require.Equal(t, "33333333-3333-4333-8333-333333333333", client.pendingInitializationID)
 	pendingInitializationID = requirePendingInitializationID(t, db)
-	require.Equal(t, "init-2", pendingInitializationID)
+	require.Equal(t, "33333333-3333-4333-8333-333333333333", pendingInitializationID)
 }
 
-func TestConnect_ResumesSameAttachedUserWithoutNetwork(t *testing.T) {
+func TestConnect_ResumesSameAttachedUserAfterProtocolGate(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
 		Resolution: "initialize_empty",
 	})
@@ -713,12 +730,9 @@ func TestConnect_ResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 		return "token", nil
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
-	restarted.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	restarted.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		atomic.AddInt32(&requestCount, 1)
-		return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{
-			Error:   "unexpected_network",
-			Message: "resume should not hit the network",
-		}), nil
+		return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
 	})}
 	t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 
@@ -728,7 +742,7 @@ func TestConnect_ResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, resumeResult.Status)
 	require.Equal(t, AttachOutcomeResumedAttached, resumeResult.Outcome)
-	require.Equal(t, int32(0), atomic.LoadInt32(&requestCount))
+	require.Equal(t, int32(1), atomic.LoadInt32(&requestCount))
 }
 
 func TestOpen_AllowsPendingRemoteReplaceRecoveryState(t *testing.T) {
@@ -743,7 +757,7 @@ func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemove
 	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":
@@ -832,8 +846,23 @@ func TestConnect_PendingRemoteReplaceMismatchedScopeFailsClosed(t *testing.T) {
 	require.Contains(t, conflictErr.Reason, "pending remote_replace")
 }
 
-func TestConnect_PendingRemoteReplaceFinalizesFromStagedSnapshotWithoutNetwork(t *testing.T) {
+func TestConnect_PendingRemoteReplaceStartsFreshValidatedSessionAfterProtocolGate(t *testing.T) {
 	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/capabilities":
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+		case "/sync/snapshot-sessions":
+			return jsonResponse(&oversync.SnapshotSession{SnapshotID: "snapshot-2", SnapshotBundleSeq: 12, RowCount: 1, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+		case "/sync/snapshot-sessions/snapshot-2":
+			if r.Method == http.MethodDelete {
+				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
+			}
+			return jsonResponse(&oversync.SnapshotChunkResponse{
+				SnapshotID: "snapshot-2", SnapshotBundleSeq: 12,
+				Rows:           []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote-2"}, RowVersion: 5, Payload: mustJSONPayload(t, map[string]any{"id": "remote-2", "name": "Remote 2", "email": "remote2@example.com"})}},
+				NextRowOrdinal: 1,
+			}), nil
+		}
 		return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{
 			Error:   "unexpected_network",
 			Message: "pending remote_replace recovery should use staged snapshot only",
@@ -860,8 +889,8 @@ func TestConnect_PendingRemoteReplaceFinalizesFromStagedSnapshotWithoutNetwork(t
 	require.Equal(t, AttachOutcomeUsedRemote, result.Outcome)
 
 	var name string
-	require.NoError(t, db.QueryRow(`SELECT name FROM users WHERE id = ?`, "remote-1").Scan(&name))
-	require.Equal(t, "Remote", name)
+	require.NoError(t, db.QueryRow(`SELECT name FROM users WHERE id = ?`, "remote-2").Scan(&name))
+	require.Equal(t, "Remote 2", name)
 
 	var pendingTransition string
 	require.NoError(t, db.QueryRow(`SELECT kind FROM _sync_operation_state WHERE singleton_key = 1`).Scan(&pendingTransition))
@@ -872,7 +901,7 @@ func TestConnect_RemoteAuthoritativeStagesAndReplacesAnonymousLocalRows(t *testi
 	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{
 					"connect_lifecycle": true,
 				},
@@ -919,6 +948,61 @@ func TestConnect_RemoteAuthoritativeStagesAndReplacesAnonymousLocalRows(t *testi
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, "remote-1").Scan(&count))
 	require.Equal(t, 1, count)
+	require.Equal(t, "lifecycle-user", client.UserID)
+	require.True(t, client.sessionConnected)
+	attachment, err := loadAttachmentState(context.Background(), db)
+	require.NoError(t, err)
+	require.Equal(t, attachmentBindingAttached, attachment.BindingState)
+	require.Equal(t, "lifecycle-user", attachment.AttachedUserID)
+	operation, err := loadOperationState(context.Background(), db)
+	require.NoError(t, err)
+	require.Equal(t, operationKindNone, operation.Kind)
+}
+
+func TestConnect_RemoteAuthoritativeFailureDoesNotAdvancePublicIdentity(t *testing.T) {
+	for _, testCase := range []struct {
+		name                 string
+		pendingRemoteReplace bool
+		expectedConnectCalls int64
+	}{
+		{name: "new remote replace", expectedConnectCalls: 1},
+		{name: "pending remote replace recovery", pendingRemoteReplace: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var connectCalls atomic.Int64
+			client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
+				switch r.URL.Path {
+				case "/sync/capabilities":
+					return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+				case "/sync/connect":
+					connectCalls.Add(1)
+					return jsonResponse(&oversync.ConnectResponse{Resolution: "remote_authoritative"}), nil
+				case "/sync/snapshot-sessions":
+					return errorJSONResponse(http.StatusBadRequest, oversync.ErrorResponse{Error: "snapshot_rejected"}), nil
+				default:
+					return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
+				}
+			})
+			if testCase.pendingRemoteReplace {
+				setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindRemoteReplace, TargetUserID: "lifecycle-user"})
+			}
+
+			_, err := client.Attach(context.Background(), "lifecycle-user")
+			require.ErrorContains(t, err, "server returned status 400")
+			require.Empty(t, client.UserID)
+			require.False(t, client.sessionConnected)
+			require.Equal(t, testCase.expectedConnectCalls, connectCalls.Load())
+
+			attachment, loadErr := loadAttachmentState(context.Background(), db)
+			require.NoError(t, loadErr)
+			require.Equal(t, attachmentBindingAnonymous, attachment.BindingState)
+			require.Empty(t, attachment.AttachedUserID)
+			operation, loadErr := loadOperationState(context.Background(), db)
+			require.NoError(t, loadErr)
+			require.Equal(t, operationKindRemoteReplace, operation.Kind)
+			require.Equal(t, "lifecycle-user", operation.TargetUserID)
+		})
+	}
 }
 
 func TestDetach_CancelsPendingRemoteReplace(t *testing.T) {
@@ -1012,10 +1096,10 @@ func TestUninstallSync_AllowsFreshReinstallOnSameDatabase(t *testing.T) {
 		return "token", nil
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
-	reinstalled.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	reinstalled.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion,
 				Features: map[string]bool{
 					"connect_lifecycle": true,
 				},
@@ -1043,4 +1127,17 @@ func TestUninstallSync_AllowsFreshReinstallOnSameDatabase(t *testing.T) {
 	var dirtyCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
 	require.Equal(t, 1, dirtyCount)
+}
+func TestProtocolVersionGateRejectsV0EmptyAndUnknown(t *testing.T) {
+	for _, actual := range []string{"v0", "", hostileProtocolVersion} {
+		t.Run(actual, func(t *testing.T) {
+			err := requireSupportedProtocolVersion(actual)
+			var mismatch *ProtocolVersionMismatchError
+			require.ErrorAs(t, err, &mismatch)
+			require.Equal(t, "v1", mismatch.Expected)
+			require.Empty(t, mismatch.Actual)
+			require.Equal(t, "oversqlite protocol version mismatch", mismatch.Error())
+			require.NotContains(t, mismatch.Error(), hostileProtocolVersion)
+		})
+	}
 }

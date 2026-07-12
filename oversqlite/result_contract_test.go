@@ -60,7 +60,7 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 		client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 			switch r.URL.Path {
 			case "/sync/capabilities":
-				return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"connect_lifecycle": true}}), nil
+				return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
 			case "/sync/connect":
 				return jsonResponse(&oversync.ConnectResponse{Resolution: "remote_authoritative"}), nil
 			case "/sync/snapshot-sessions":

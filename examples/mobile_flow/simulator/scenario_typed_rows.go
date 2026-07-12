@@ -5,6 +5,11 @@ import (
 	"fmt"
 )
 
+const (
+	typedNullRowID = "11111111-1111-4111-8111-111111111111"
+	typedRichRowID = "22222222-2222-4222-8222-222222222222"
+)
+
 type TypedRowsScenario struct {
 	*BaseScenario
 }
@@ -35,14 +40,30 @@ func (s *TypedRowsScenario) Execute(ctx context.Context) error {
 	if _, err := s.app.db.Exec(`
 		INSERT INTO typed_rows(id, name, note, count_value, enabled_flag, rating, data, created_at)
 		VALUES(?, ?, NULL, NULL, ?, NULL, NULL, NULL)
-	`, "typed-null", "Typed Null", 0); err != nil {
+	`, typedNullRowID, "Typed Null", 0); err != nil {
 		return fmt.Errorf("failed to insert null typed row: %w", err)
 	}
 
 	if _, err := s.app.db.Exec(`
-		INSERT INTO typed_rows(id, name, note, count_value, enabled_flag, rating, data, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-	`, "typed-rich", "Typed Rich", "second-device", 42, 1, 1.25, []byte{0xca, 0xfe, 0xba, 0xbe}, "2026-03-24T18:42:11Z"); err != nil {
+		INSERT INTO typed_rows(
+			id, name, note, count_value, small_count, medium_count, exact_amount,
+			enabled_flag, rating, float4_value, data, created_at
+		)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		typedRichRowID,
+		"Typed Rich",
+		"second-device",
+		int64(9007199254740993),
+		int64(-32768),
+		int64(2147483647),
+		"12345678901234567890.1234567890",
+		1,
+		1.25,
+		3.5,
+		[]byte{0xca, 0xfe, 0xba, 0xbe},
+		"2026-03-24T18:42:11Z",
+	); err != nil {
 		return fmt.Errorf("failed to insert rich typed row: %w", err)
 	}
 

@@ -1,7 +1,6 @@
 package oversqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -404,6 +404,9 @@ func TestOpen_PreservesLocalRowsAndManagedSourceAcrossRestart(t *testing.T) {
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rebound.Close()) })
+	rebound.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+	})}
 	mustOpen(t, rebound, ctx)
 	result, err := rebound.Attach(ctx, client.UserID)
 	require.NoError(t, err)
@@ -659,11 +662,13 @@ func TestOpenAndAttachEstablishRuntimeIdentity(t *testing.T) {
 	require.Equal(t, "device-a", client.sourceID)
 	require.Empty(t, client.UserID)
 
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(map[string]any{
-				"features": map[string]bool{"connect_lifecycle": true},
+			return jsonResponse(oversync.CapabilitiesResponse{
+				ProtocolVersion: requiredProtocolVersion,
+				SchemaVersion:   1,
+				Features:        map[string]bool{"connect_lifecycle": true},
 			}), nil
 		case "/sync/connect":
 			return jsonResponse(map[string]any{
@@ -765,7 +770,7 @@ func TestStartLoops_LogLifecycleMisuseWithoutTouchingNetwork(t *testing.T) {
 	client.config.BackoffMin = time.Millisecond
 	client.config.BackoffMax = 2 * time.Millisecond
 
-	var logs bytes.Buffer
+	var logs lockedWatchLogBuffer
 	client.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	require.NoError(t, client.Start(ctx))

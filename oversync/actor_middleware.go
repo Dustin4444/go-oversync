@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 const SourceIDHeader = "Oversync-Source-ID"
@@ -31,9 +33,9 @@ func ActorMiddleware(cfg ActorMiddlewareConfig) func(http.Handler) http.Handler 
 				return
 			}
 
-			sourceID := strings.TrimSpace(r.Header.Get(SourceIDHeader))
-			if sourceID == "" {
-				writeMiddlewareError(w, http.StatusBadRequest, "invalid_request", SourceIDHeader+" header is required")
+			sourceID := r.Header.Get(SourceIDHeader)
+			if err := sourceid.Validate(sourceID); err != nil {
+				writeMiddlewareError(w, http.StatusBadRequest, "invalid_request", SourceIDHeader+" header must be a non-empty visible ASCII token")
 				return
 			}
 

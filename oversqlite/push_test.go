@@ -17,6 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const testCanonicalPushID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
 func newBundleClient(t *testing.T, schema string, tables []SyncTable, ddl ...string) (*Client, *sql.DB) {
 	t.Helper()
 	config := DefaultConfig(schema, tables)
@@ -240,6 +242,11 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 	s.t.Helper()
 
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/sync/capabilities":
+		return jsonResponse(oversync.CapabilitiesResponse{
+			ProtocolVersion: requiredProtocolVersion,
+			Features:        map[string]bool{"connect_lifecycle": true},
+		}), nil
 	case r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions":
 		requireAuthenticatedSyncHeaders(s.t, r, "")
 		var req oversync.PushSessionCreateRequest
@@ -256,7 +263,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 			}), nil
 		}
 		s.nextPushID++
-		pushID := "push-" + strconv.Itoa(s.nextPushID)
+		pushID := fmt.Sprintf("00000000-0000-4000-8000-%012x", s.nextPushID)
 		s.sessions[pushID] = &mockPushSession{
 			PushID:               pushID,
 			SourceID:             r.Header.Get(oversync.SourceIDHeader),
@@ -468,6 +475,103 @@ func TestPushPending_SuccessfulCommitDoesNotDeleteCommittedSession(t *testing.T)
 	require.Empty(t, server.deletePushIDs)
 }
 
+func TestPushPending_InvalidCreatePushIDPerformsNoFollowUpIO(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('user-1', 'Ada', 'ada@example.com')`)
+	require.NoError(t, err)
+
+	var followUpRequests int
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/sync/capabilities":
+			return jsonResponse(oversync.CapabilitiesResponse{
+				ProtocolVersion: requiredProtocolVersion,
+				Features:        map[string]bool{"connect_lifecycle": true},
+			}), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions":
+			var req oversync.PushSessionCreateRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			return jsonResponse(oversync.PushSessionCreateResponse{
+				PushID:                 " " + testCanonicalPushID + " ",
+				Status:                 "staging",
+				PlannedRowCount:        req.PlannedRowCount,
+				NextExpectedRowOrdinal: 0,
+			}), nil
+		default:
+			followUpRequests++
+			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_follow_up"}), nil
+		}
+	})}
+
+	_, err = client.PushPending(ctx)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), testCanonicalPushID)
+	require.Zero(t, followUpRequests)
+}
+
+func TestPushPending_ChunkPushIDMismatchIsExactAndRedacted(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('user-1', 'Ada', 'ada@example.com')`)
+	require.NoError(t, err)
+
+	var chunkPath string
+	var commitRequests int
+	var cleanupPath string
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/sync/capabilities":
+			return jsonResponse(oversync.CapabilitiesResponse{
+				ProtocolVersion: requiredProtocolVersion,
+				Features:        map[string]bool{"connect_lifecycle": true},
+			}), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions":
+			var req oversync.PushSessionCreateRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			return jsonResponse(oversync.PushSessionCreateResponse{
+				PushID:                 testCanonicalPushID,
+				Status:                 "staging",
+				PlannedRowCount:        req.PlannedRowCount,
+				NextExpectedRowOrdinal: 0,
+			}), nil
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			chunkPath = r.URL.Path
+			return jsonResponse(oversync.PushSessionChunkResponse{
+				PushID:                 strings.ToUpper(testCanonicalPushID),
+				NextExpectedRowOrdinal: 1,
+			}), nil
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/commit"):
+			commitRequests++
+			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_commit"}), nil
+		case r.Method == http.MethodDelete:
+			cleanupPath = r.URL.Path
+			return jsonResponse(map[string]string{"status": "deleted"}), nil
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	})}
+
+	_, err = client.PushPending(ctx)
+	require.Error(t, err)
+	require.Equal(t, "/sync/push-sessions/"+testCanonicalPushID+"/chunks", chunkPath)
+	require.Equal(t, "/sync/push-sessions/"+testCanonicalPushID, cleanupPath)
+	require.Zero(t, commitRequests)
+	require.NotContains(t, err.Error(), testCanonicalPushID)
+}
+
 func TestPushPending_RetriesTransientCreateSessionFailureAndSucceeds(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
@@ -484,7 +588,10 @@ func TestPushPending_RetriesTransientCreateSessionFailureAndSucceeds(t *testing.
 	base := newMockPushSessionServer(t)
 	base.nextBundleSeq = 10
 	var createRequests int
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && r.URL.Path == "/sync/capabilities" {
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
 			createRequests++
 			if createRequests == 1 {
@@ -515,7 +622,10 @@ func TestPushPending_DoesNotRetryUnauthorized(t *testing.T) {
 	require.NoError(t, err)
 
 	var createRequests int
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && r.URL.Path == "/sync/capabilities" {
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
 			createRequests++
 			return errorJSONResponse(http.StatusUnauthorized, oversync.ErrorResponse{
@@ -655,7 +765,10 @@ func TestPushPending_CreateSourceSequenceOutOfOrderPersistsSourceRecoveryAcrossR
 	require.NoError(t, err)
 	client.sourceIDGenerator = func() string { return "restarted-rotated-device" }
 
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && r.URL.Path == "/sync/capabilities" {
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
 			return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{
 				Error:   "source_sequence_out_of_order",
@@ -874,8 +987,9 @@ func TestPushPending_CreateSourceRetiredReplacementDivergenceFailsClosed(t *test
 	_, err = client.PushPending(ctx)
 	var divergedErr *SourceReplacementDivergedError
 	require.ErrorAs(t, err, &divergedErr)
-	require.Equal(t, "local-rotated-device", divergedErr.LocalReplacement)
-	require.Equal(t, "server-rotated-device", divergedErr.RemoteReplacement)
+	require.NotContains(t, err.Error(), "local-rotated-device")
+	require.NotContains(t, err.Error(), "server-rotated-device")
+	require.Equal(t, "replacement source diverged between local and server recovery state", divergedErr.Error())
 	require.Equal(t, operationKindNone, requireOperationKind(t, db))
 	require.Equal(t, "local-rotated-device", requireOperationReplacementSourceID(t, db))
 }
@@ -2759,13 +2873,6 @@ func mustPushPayloadName(t *testing.T, payload []byte) string {
 	require.NoError(t, json.Unmarshal(payload, &decoded))
 	name, _ := decoded["name"].(string)
 	return name
-}
-
-func mustProcessPayload(t *testing.T, client *Client, tableName, raw string) []byte {
-	t.Helper()
-	payload, err := client.processPayloadForUpload(tableName, raw)
-	require.NoError(t, err)
-	return payload
 }
 
 func mustBeginTx(t *testing.T, db *sql.DB) *sql.Tx {

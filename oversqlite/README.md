@@ -118,22 +118,14 @@ Applications should not clear this state manually. Call `Rebuild(ctx)` after aut
 let the client preserve pending outbox intent, rotate source identity when required, and resume
 upload under the fresh source after snapshot recovery completes.
 
-## Exact numeric columns and database compatibility
+## Numeric values and database compatibility
 
-Oversqlite uses RFC 8785 JCS for canonical bytes. Configure exact numeric columns explicitly on
-each `SyncTable`:
-
-```go
-NumericColumns: map[string]oversqlite.NumericColumnKind{
-	"total_count": oversqlite.NumericColumnExactInt64, // SQLite INTEGER, JSON string
-	"amount":      oversqlite.NumericColumnExactDecimal, // SQLite TEXT, JSON string
-	"ratio":       oversqlite.NumericColumnApproximate, // SQLite REAL, JSON number
-}
-```
-
-Exact integers must use canonical signed-64-bit text; exact decimals use the documented finite
-decimal grammar and preserve their wire spelling. Unsupported grammar, range, or SQLite affinity
-fails before row mutation. The client hashes the frozen request separately from the authoritative
+Oversqlite uses RFC 8785 JCS plus `jcs_uniform_numeric_strings_v1` for canonical bytes. SQLite
+`INTEGER` and `REAL` affinity determines numeric handling automatically: both upload as canonical
+strings, while exact decimals remain SQLite `TEXT` and JSON strings. SQLite Boolean affinity uses
+strict `"0"`/`"1"` ingress strings and authoritative server output uses JSON Booleans. There is no
+per-column numeric configuration. Invalid signed-64 or binary64 wire text fails before row mutation.
+The client hashes the frozen request separately from the authoritative
 committed bundle, so server-side field injection does not require comparing mutated rows with the
 outbox.
 

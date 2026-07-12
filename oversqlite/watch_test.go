@@ -1,11 +1,14 @@
 package oversqlite
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,6 +51,36 @@ func TestWatchRemoteChanges_RejectsMalformedBundleData(t *testing.T) {
 	require.Contains(t, err.Error(), "decode bundle watch event")
 }
 
+func TestWatchRemoteChanges_RejectsOversizedInputs(t *testing.T) {
+	data := strings.Repeat("x", bundleChangeWatchMaxEventBytes/2)
+	tests := []struct {
+		name    string
+		stream  string
+		wantErr error
+	}{
+		{
+			name:    "line",
+			stream:  strings.Repeat("x", bundleChangeWatchMaxLineBytes+1) + "\n",
+			wantErr: errBundleChangeWatchLineTooLarge,
+		},
+		{
+			name:    "event across bounded lines",
+			stream:  "event: bundle\ndata: " + data + "\ndata: " + data + "\n\n",
+			wantErr: errBundleChangeWatchEventTooLarge,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			events := make(chan oversync.BundleChangeEvent, 1)
+			err := parseBundleChangeWatchStream(context.Background(), strings.NewReader(testCase.stream), events)
+
+			require.ErrorIs(t, err, testCase.wantErr)
+			require.Empty(t, events)
+		})
+	}
+}
+
 func TestWatchRemoteChanges_StopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -58,16 +91,140 @@ func TestWatchRemoteChanges_StopsOnContextCancel(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+type hostileWatchBody struct {
+	err error
+}
+
+func (b *hostileWatchBody) Read([]byte) (int, error) { return 0, b.err }
+func (b *hostileWatchBody) Close() error             { return nil }
+
+type lockedWatchLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedWatchLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedWatchLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestWatchAwareDownloaderLoop_RedactsStreamReaderErrorLog(t *testing.T) {
+	const hostileText = "HOSTILE_WATCH_READER_SECRET"
+	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg.RetryPolicy = newTestRetryPolicy()
+	cfg.BackoffMin = time.Millisecond
+	cfg.BackoffMax = 2 * time.Millisecond
+	cfg.WatchFallbackInterval = time.Hour
+	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+
+	var logs lockedWatchLogBuffer
+	client.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/watch":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       &hostileWatchBody{err: errors.New(hostileText)},
+			}, nil
+		case "/sync/pull":
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+		default:
+			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
+		}
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.watchAwareDownloaderLoop(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(logs.String(), "bundle change watch stream stopped")
+	}, time.Second, time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watch loop to stop")
+	}
+
+	logOutput := logs.String()
+	require.Contains(t, logOutput, "error_type=*errors.errorString")
+	require.NotContains(t, logOutput, hostileText)
+}
+
+func TestWatchAwareDownloaderLoop_RedactsFallbackPullTransportErrorLog(t *testing.T) {
+	const hostileText = "private-source-sentinel connection reset by peer"
+	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg.RetryPolicy = &RetryPolicy{Enabled: false}
+	cfg.BackoffMin = time.Millisecond
+	cfg.BackoffMax = 2 * time.Millisecond
+	cfg.WatchFallbackInterval = time.Hour
+	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+
+	var logs lockedWatchLogBuffer
+	client.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/watch":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		case "/sync/capabilities":
+			return jsonResponse(oversync.CapabilitiesResponse{
+				ProtocolVersion: requiredProtocolVersion,
+				Features:        map[string]bool{"bundle_change_watch": true},
+			}), nil
+		case "/sync/pull":
+			return nil, phase3RetryableHostileError{}
+		default:
+			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
+		}
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.watchAwareDownloaderLoop(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(logs.String(), "bundle change watch fallback pull failed")
+	}, time.Second, time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watch loop to stop")
+	}
+
+	logOutput := logs.String()
+	require.NotContains(t, logOutput, hostileText)
+}
+
 func TestStart_DoesNotCallWatchWhenClientWatchOffEvenIfServerAdvertises(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 	client.config.BackoffMin = time.Millisecond
 	client.config.BackoffMax = 2 * time.Millisecond
 
 	var watchRequests atomic.Int64
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": true}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_watch"}), nil
@@ -95,10 +252,10 @@ func TestStart_DoesNotCallWatchWhenServerDoesNotAdvertise(t *testing.T) {
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
 
 	var watchRequests atomic.Int64
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": false}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": false}}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_watch"}), nil
@@ -117,6 +274,35 @@ func TestStart_DoesNotCallWatchWhenServerDoesNotAdvertise(t *testing.T) {
 	require.Zero(t, watchRequests.Load())
 }
 
+func TestStart_StopsAutomaticDownloadsWhenWatchCapabilityProtocolChanges(t *testing.T) {
+	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg.RetryPolicy = newTestRetryPolicy()
+	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
+	cfg.BackoffMin = time.Millisecond
+	cfg.BackoffMax = 2 * time.Millisecond
+	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+
+	var syncRequests atomic.Int64
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/capabilities":
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: "v0", Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/watch", "/sync/pull":
+			syncRequests.Add(1)
+			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_sync"}), nil
+		default:
+			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
+		}
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, client.Start(ctx))
+	time.Sleep(15 * time.Millisecond)
+	cancel()
+
+	require.Zero(t, syncRequests.Load())
+}
+
 func TestStart_UsesWatchWhenClientAutoAndServerAdvertises(t *testing.T) {
 	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
 	cfg.RetryPolicy = newTestRetryPolicy()
@@ -126,10 +312,10 @@ func TestStart_UsesWatchWhenClientAutoAndServerAdvertises(t *testing.T) {
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
 
 	watchRequest := make(chan *http.Request, 1)
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": true}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
 		case "/sync/watch":
 			watchRequest <- r
 			pr, pw := io.Pipe()
@@ -170,10 +356,10 @@ func TestStart_WatchSetupWaitsForStartupSyncContention(t *testing.T) {
 
 	var pullRequests atomic.Int64
 	watchRequest := make(chan *http.Request, 1)
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": true}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
 		case "/sync/watch":
 			watchRequest <- r
 			pr, pw := io.Pipe()
@@ -269,10 +455,10 @@ func TestStart_WatchDisconnectReconnectsWithBackoff(t *testing.T) {
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
 
 	watchRequests := make(chan *http.Request, 2)
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": true}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
 		case "/sync/watch":
 			watchRequests <- r
 			if len(watchRequests) == 1 {
@@ -317,10 +503,10 @@ func TestStart_WatchSetupFailureStillPolls(t *testing.T) {
 
 	watchRequests := make(chan struct{}, 1)
 	pullRequests := make(chan struct{}, 1)
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": true}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
 		case "/sync/watch":
 			select {
 			case watchRequests <- struct{}{}:
@@ -364,10 +550,10 @@ func TestStart_WatchForbiddenSwitchesToPolling(t *testing.T) {
 
 	var watchRequests atomic.Int64
 	pullRequests := make(chan struct{}, 2)
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": true}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusForbidden, oversync.ErrorResponse{
@@ -454,10 +640,10 @@ func TestStart_WatchRespectsPausedDownloads(t *testing.T) {
 
 	var watchRequests atomic.Int64
 	var pullRequests atomic.Int64
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{Features: map[string]bool{"bundle_change_watch": true}}), nil
+			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_watch"}), nil

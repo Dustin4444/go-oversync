@@ -175,7 +175,7 @@ func BenchmarkAuditMicroPayloadPreparation(b *testing.B) {
 		b.SetBytes(int64(len(payload)))
 		b.ResetTimer()
 		for b.Loop() {
-			prepared, err := service.preparePushRows([]PushRequestRow{row})
+			prepared, err := service.preparePushRowsWithOptions([]PushRequestRow{row}, false)
 			if err != nil || len(prepared) != 1 || len(prepared[0].payload) == 0 {
 				b.Fatalf("prepare push row: rows=%d err=%v", len(prepared), err)
 			}

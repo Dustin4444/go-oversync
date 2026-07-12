@@ -37,10 +37,6 @@ func ensureUserStateExistsWithExec(ctx context.Context, exec userStateExecer, us
 	return nil
 }
 
-func (s *SyncService) ensureUserStateExists(ctx context.Context, userID string) error {
-	return ensureUserStateExistsWithExec(ctx, s.pool, userID)
-}
-
 func lookupUserPK(ctx context.Context, q userStateQuerier, userID string) (int64, error) {
 	var userPK int64
 	if err := q.QueryRow(ctx, `

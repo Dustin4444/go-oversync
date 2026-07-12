@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -1282,6 +1283,97 @@ func TestPushSessions_UnknownExpiredAndForeignIDsFailClosed(t *testing.T) {
 	}
 }
 
+func TestPushSessions_NoncanonicalPathCannotAddressCanonicalSession(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	session := fixture.createSession(t, ctx, 1, 1)
+	noncanonical := " " + session.PushID + " "
+
+	_, err := fixture.svc.UploadPushChunk(ctx, fixture.writer, noncanonical, &PushSessionChunkRequest{
+		StartRowOrdinal: 0,
+		Rows:            []PushRequestRow{fixture.userRow(uuid.New(), "Alpha")},
+	})
+	var notFoundErr *PushSessionNotFoundError
+	require.ErrorAs(t, err, &notFoundErr)
+	require.NotContains(t, err.Error(), session.PushID)
+
+	chunk := fixture.uploadChunk(t, ctx, session.PushID, 0, fixture.userRow(uuid.New(), "Canonical"))
+	require.Equal(t, int64(1), chunk.NextExpectedRowOrdinal)
+}
+
+func TestPushSessionErrors_DoNotExposePushID(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorType reflect.Type
+	}{
+		{name: "PushSessionNotFoundError", errorType: reflect.TypeOf(PushSessionNotFoundError{})},
+		{name: "PushSessionExpiredError", errorType: reflect.TypeOf(PushSessionExpiredError{})},
+		{name: "PushSessionForbiddenError", errorType: reflect.TypeOf(PushSessionForbiddenError{})},
+		{name: "PushChunkOutOfOrderError", errorType: reflect.TypeOf(PushChunkOutOfOrderError{})},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, exposesPushID := test.errorType.FieldByName("PushID")
+			require.False(t, exposesPushID, "%s must not expose rejected or authenticated push IDs", test.name)
+		})
+	}
+}
+
+func TestPushSessions_NoncanonicalPathPrecedesChunkValidation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	session := fixture.createSession(t, ctx, 1, 1)
+	noncanonical := " " + session.PushID + " "
+
+	_, err := fixture.svc.UploadPushChunk(ctx, fixture.writer, noncanonical, nil)
+	var notFoundErr *PushSessionNotFoundError
+	require.ErrorAs(t, err, &notFoundErr)
+	require.EqualError(t, err, "push session was not found")
+	require.NotContains(t, err.Error(), session.PushID)
+}
+
+func TestHTTPSyncHandlers_NoncanonicalPushIDPrecedesBodyDecode(t *testing.T) {
+	pushID := uuid.NewString()
+	handlers := NewHTTPSyncHandlers(nil, slog.Default())
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/sync/push-sessions/noncanonical/chunks",
+		strings.NewReader("{"),
+	)
+	request = request.WithContext(ContextWithActor(request.Context(), Actor{UserID: "user", SourceID: "device"}))
+	request.SetPathValue("push_id", " "+pushID+" ")
+
+	recorder := httptest.NewRecorder()
+	handlers.HandlePushSessionChunk(recorder, request)
+
+	require.Equal(t, http.StatusNotFound, recorder.Code)
+	errorResponse := decodeErrorResponse(t, recorder)
+	require.Equal(t, "push_session_not_found", errorResponse.Error)
+	require.Equal(t, "push session was not found", errorResponse.Message)
+	require.NotContains(t, recorder.Body.String(), pushID)
+}
+
+func TestPushSessions_InvalidInitializationIDIsRejectedWithoutMutationOrDisclosure(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	actor := Actor{UserID: "init-token-user-" + uuid.NewString(), SourceID: "init-token-source"}
+	initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, actor, true)
+	req := &PushSessionCreateRequest{
+		SourceBundleID:       1,
+		PlannedRowCount:      1,
+		CanonicalRequestHash: strings.Repeat("0", 64),
+		InitializationID:     " " + initializationID + " ",
+	}
+	rawInitializationID := req.InitializationID
+
+	_, err := fixture.svc.CreatePushSession(ctx, actor, req)
+	var invalidErr *PushSessionInvalidError
+	require.ErrorAs(t, err, &invalidErr)
+	require.Equal(t, rawInitializationID, req.InitializationID)
+	require.NotContains(t, err.Error(), initializationID)
+}
+
 func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{maxRowsPerPushChunk: 1})
@@ -1379,15 +1471,16 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	postPruneCommitResp := fixture.commitSession(t, ctx, postPruneCommittedSession.PushID)
 
 	cases := []struct {
-		name           string
-		handler        func(http.ResponseWriter, *http.Request)
-		method         string
-		path           string
-		actor          Actor
-		body           any
-		pathValues     map[string]string
-		expectedStatus int
-		expectedCode   string
+		name            string
+		handler         func(http.ResponseWriter, *http.Request)
+		method          string
+		path            string
+		actor           Actor
+		body            any
+		pathValues      map[string]string
+		expectedStatus  int
+		expectedCode    string
+		expectedMessage string
 	}{
 		{
 			name:           "create invalid",
@@ -1398,6 +1491,22 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 0},
 			expectedStatus: http.StatusBadRequest,
 			expectedCode:   "push_session_invalid",
+		},
+		{
+			name:    "create noncanonical initialization id",
+			handler: handlers.HandleCreatePushSession,
+			method:  http.MethodPost,
+			path:    "/sync/push-sessions",
+			actor:   fixture.writer,
+			body: PushSessionCreateRequest{
+				SourceBundleID:       1,
+				PlannedRowCount:      1,
+				CanonicalRequestHash: strings.Repeat("0", 64),
+				InitializationID:     " 22222222-2222-4222-8222-222222222222 ",
+			},
+			expectedStatus:  http.StatusBadRequest,
+			expectedCode:    "push_session_invalid",
+			expectedMessage: "initialization_id must be a canonical lowercase dashed UUID",
 		},
 		{
 			name:           "chunk invalid",
@@ -1431,6 +1540,18 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			pathValues:     map[string]string{"push_id": uuid.NewString()},
 			expectedStatus: http.StatusNotFound,
 			expectedCode:   "push_session_not_found",
+		},
+		{
+			name:            "chunk noncanonical path id",
+			handler:         handlers.HandlePushSessionChunk,
+			method:          http.MethodPost,
+			path:            "/sync/push-sessions/noncanonical/chunks",
+			actor:           validActor,
+			body:            PushSessionChunkRequest{StartRowOrdinal: 0, Rows: []PushRequestRow{fixture.userRow(uuid.New(), "Noncanonical")}},
+			pathValues:      map[string]string{"push_id": " " + validSession.PushID + " "},
+			expectedStatus:  http.StatusNotFound,
+			expectedCode:    "push_session_not_found",
+			expectedMessage: "push session was not found",
 		},
 		{
 			name:           "chunk forbidden",
@@ -1553,6 +1674,9 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			}
 			errResp := decodeErrorResponse(t, rec)
 			require.Equal(t, tc.expectedCode, errResp.Error)
+			if tc.expectedMessage != "" {
+				require.Equal(t, tc.expectedMessage, errResp.Message)
+			}
 		})
 	}
 

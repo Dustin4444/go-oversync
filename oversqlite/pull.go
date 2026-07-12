@@ -11,14 +11,25 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
+const incrementalPullBodyLimit int64 = 64 << 20
+
 // DirtyStateRejectedError reports that pull or rebuild was rejected because local dirty rows still exist.
 type DirtyStateRejectedError struct {
 	DirtyCount int
+}
+
+// SnapshotSessionLimitExceededError reports that the server could not
+// materialize a snapshot within one of its configured limits.
+type SnapshotSessionLimitExceededError struct {
+	Dimension string
+	Actual    int64
+	Limit     int64
 }
 
 type snapshotApplyOptions struct {
@@ -29,6 +40,9 @@ type snapshotApplyOptions struct {
 	ClearSourceRecovery       bool
 	RequireFreshRotatedSource bool
 	AdvanceSourceBundleFloor  int64
+	FinalizeRemoteReplace     bool
+	RemoteTargetUserID        string
+	PinnedGuard               *snapshotApplyGuard
 }
 
 // Error implements error.
@@ -36,10 +50,17 @@ func (e *DirtyStateRejectedError) Error() string {
 	return fmt.Sprintf("cannot pull while %d local dirty rows exist", e.DirtyCount)
 }
 
+// Error implements error without retaining the server-provided message.
+func (e *SnapshotSessionLimitExceededError) Error() string {
+	return fmt.Sprintf(
+		"snapshot session exceeds server %s limit: actual=%d limit=%d",
+		e.Dimension,
+		e.Actual,
+		e.Limit,
+	)
+}
+
 func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, error) {
-	if err := c.ensureConnectedSessionLocked(ctx, "PullToStable()"); err != nil {
-		return RemoteSyncReport{}, err
-	}
 	if report, resumed, err := c.resumeRequiredRecoveryLocked(ctx); resumed || err != nil {
 		return report, err
 	}
@@ -103,7 +124,7 @@ func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, erro
 		if err != nil {
 			var prunedErr *HistoryPrunedError
 			if errors.As(err, &prunedErr) {
-				c.logger.Info("pull history pruned; rebuilding from chunked snapshot", "message", prunedErr.Message)
+				c.logger.Info("pull history pruned; rebuilding from chunked snapshot")
 				if err := c.markCheckpointRecoveryRequiredLocked(ctx, "history_pruned"); err != nil {
 					return RemoteSyncReport{}, err
 				}
@@ -111,7 +132,7 @@ func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, erro
 			}
 			var aheadErr *CheckpointAheadError
 			if errors.As(err, &aheadErr) {
-				c.logger.Info("pull checkpoint ahead; rebuilding from chunked snapshot", "message", aheadErr.Message)
+				c.logger.Info("pull checkpoint ahead; rebuilding from chunked snapshot")
 				if err := c.markCheckpointRecoveryRequiredLocked(ctx, "checkpoint_ahead"); err != nil {
 					return RemoteSyncReport{}, err
 				}
@@ -162,10 +183,14 @@ func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxB
 		endpoint += "&target_bundle_seq=" + strconv.FormatInt(targetBundleSeq, 10)
 	}
 
-	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "pull_request", http.MethodGet, endpoint, nil, "")
+	result, err := c.doAuthenticatedBoundedRequestWithRetry(
+		ctx, "pull_request", http.MethodGet, endpoint, nil, "",
+		incrementalPullBodyLimit, snapshotControlBodyLimit, nil, nil,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send pull request: %w", err)
 	}
+	body, statusCode := result.body, result.statusCode
 	if statusCode != http.StatusOK {
 		if statusCode == http.StatusConflict {
 			var errorResp oversync.ErrorResponse
@@ -173,18 +198,16 @@ func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxB
 				switch errorResp.Error {
 				case "history_pruned":
 					return nil, &HistoryPrunedError{
-						Status:  statusCode,
-						Message: errorResp.Message,
+						Status: statusCode,
 					}
 				case "checkpoint_ahead":
 					return nil, &CheckpointAheadError{
-						Status:  statusCode,
-						Message: errorResp.Message,
+						Status: statusCode,
 					}
 				}
 			}
 		}
-		return nil, fmt.Errorf("server returned status %d: %s", statusCode, string(body))
+		return nil, fmt.Errorf("pull request returned status %d: %s", statusCode, decodeServerErrorBody(body))
 	}
 
 	var pullResp oversync.PullResponse
@@ -361,7 +384,6 @@ func (c *Client) resumeCheckpointRecoveryLocked(ctx context.Context) (RemoteSync
 				DirtyCount:    dirtyCount,
 				OutboundCount: outboundCount,
 				ReplayState:   replayState,
-				Cause:         err,
 			}
 		}
 		dirtyCount, outboundCount, replayState, err = c.checkpointRecoveryPendingState(ctx)
@@ -405,7 +427,10 @@ func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context) (RemoteSyncRep
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
-	newSourceID := strings.TrimSpace(operation.ReplacementSourceID)
+	newSourceID := operation.ReplacementSourceID
+	if err := validateOptionalSourceID(newSourceID); err != nil {
+		return RemoteSyncReport{}, err
+	}
 	if newSourceID == "" {
 		newSourceID, err = c.generateFreshSourceID(ctx, c.DB, c.sourceID)
 		if err != nil {
@@ -470,6 +495,10 @@ func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
 }
 
 func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, options snapshotApplyOptions) (RemoteSyncReport, error) {
+	limits, err := c.negotiateSnapshotLimits(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
 	if !options.RotateSource && !options.ClearSourceRecovery {
 		if err := c.markCheckpointRecoveryRequiredLocked(ctx, "explicit_rebuild"); err != nil {
 			return RemoteSyncReport{}, err
@@ -477,34 +506,44 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 	} else if err := c.setRebuildRequired(ctx, true); err != nil {
 		return RemoteSyncReport{}, err
 	}
+	guard, err := c.pinSnapshotApplyGuard(ctx, options)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	options.PinnedGuard = guard
 	if err := c.clearSnapshotStage(ctx); err != nil {
 		return RemoteSyncReport{}, err
 	}
 
-	sessionReq := snapshotSessionCreateRequestFromOptions(c.sourceID, options)
+	sessionReq, err := snapshotSessionCreateRequestFromOptions(c.sourceID, options)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	startedAt := time.Now()
 	session, err := c.createSnapshotSession(ctx, sessionReq)
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
-	defer c.deleteSnapshotSessionBestEffort(context.Background(), session.SnapshotID)
+	defer c.deleteSnapshotSessionBestEffort(session.SnapshotID)
 
-	afterRowOrdinal := int64(0)
-	for {
-		chunk, err := c.fetchSnapshotChunk(ctx, session.SnapshotID, session.SnapshotBundleSeq, afterRowOrdinal, c.snapshotChunkRows())
-		if err != nil {
+	transfer, err := c.downloadSnapshotSession(ctx, session, limits)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if c.beforeSnapshotApplyHook != nil {
+		if err := c.beforeSnapshotApplyHook(ctx); err != nil {
 			return RemoteSyncReport{}, err
 		}
-		if err := c.stageSnapshotChunk(ctx, chunk, afterRowOrdinal); err != nil {
-			return RemoteSyncReport{}, err
-		}
-		if !chunk.HasMore {
-			break
-		}
-		afterRowOrdinal = chunk.NextRowOrdinal
 	}
 
 	if err := c.applyStagedSnapshotLocked(ctx, session, options); err != nil {
 		return RemoteSyncReport{}, err
+	}
+	if c.snapshotObserver != nil {
+		c.snapshotObserver(snapshotRestoreObservation{
+			StagedRows: transfer.rows, DeclaredWireBytes: transfer.bytes,
+			AppliedRows: session.RowCount, Duration: time.Since(startedAt),
+		})
 	}
 	status, err := c.syncStatusLocked(ctx)
 	if err != nil {
@@ -520,24 +559,23 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 	}, nil
 }
 
-func (c *Client) snapshotChunkRows() int {
-	if c != nil && c.config != nil && c.config.SnapshotChunkRows > 0 {
-		return c.config.SnapshotChunkRows
-	}
-	return 1000
-}
-
-func snapshotSessionCreateRequestFromOptions(currentSourceID string, options snapshotApplyOptions) *oversync.SnapshotSessionCreateRequest {
+func snapshotSessionCreateRequestFromOptions(currentSourceID string, options snapshotApplyOptions) (*oversync.SnapshotSessionCreateRequest, error) {
 	if !options.RotateSource {
-		return nil
+		return nil, nil
+	}
+	if err := validateSourceID(currentSourceID); err != nil {
+		return nil, err
+	}
+	if err := validateSourceID(options.NewSourceID); err != nil {
+		return nil, err
 	}
 	return &oversync.SnapshotSessionCreateRequest{
 		SourceReplacement: &oversync.SnapshotSourceReplacement{
 			PreviousSourceID: currentSourceID,
-			NewSourceID:      strings.TrimSpace(options.NewSourceID),
+			NewSourceID:      options.NewSourceID,
 			Reason:           strings.TrimSpace(options.ReplacementReason),
 		},
-	}
+	}, nil
 }
 
 func (c *Client) createSnapshotSession(ctx context.Context, req *oversync.SnapshotSessionCreateRequest) (*oversync.SnapshotSession, error) {
@@ -553,57 +591,137 @@ func (c *Client) createSnapshotSession(ctx context.Context, req *oversync.Snapsh
 	if len(reqBody) > 0 {
 		contentType = "application/json"
 	}
-	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "snapshot_session_create", http.MethodPost, buildSnapshotSessionCreateURL(c.BaseURL), reqBody, contentType)
+	result, err := c.doAuthenticatedBoundedRequestWithRetry(
+		ctx, "snapshot_session_create", http.MethodPost, buildSnapshotSessionCreateURL(c.BaseURL),
+		reqBody, contentType, snapshotControlBodyLimit, snapshotControlBodyLimit,
+		map[string]struct{}{"snapshot_build_capacity": {}},
+		nil,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send snapshot session request: %w", err)
 	}
-	if statusCode != http.StatusOK {
-		if statusCode == http.StatusConflict && req != nil && req.SourceReplacement != nil {
-			if retiredResp, ok := decodeSourceRetiredResponse(body); ok {
-				return nil, &SourceReplacementDivergedError{
-					LocalReplacement:  strings.TrimSpace(req.SourceReplacement.NewSourceID),
-					RemoteReplacement: strings.TrimSpace(retiredResp.ReplacedBySourceID),
+	if result.statusCode != http.StatusOK {
+		if result.statusCode == http.StatusConflict {
+			if limitErr := decodeSnapshotSessionLimitExceededError(result.body); limitErr != nil {
+				return nil, limitErr
+			}
+			if retiredResp, ok := decodeSourceRetiredResponse(result.body, c.sourceID); ok {
+				if req != nil && req.SourceReplacement != nil {
+					if retiredResp.ReplacedBySourceID != "" && retiredResp.ReplacedBySourceID != req.SourceReplacement.NewSourceID {
+						return nil, &SourceReplacementDivergedError{}
+					}
 				}
+				return nil, &SourceRecoveryRequiredError{Code: SourceRecoveryRetired}
+			}
+			if errorResp, ok := decodeServerErrorResponse(result.body); ok && errorResp.Error == "source_retired" {
+				return nil, errors.New("invalid source_retired response")
 			}
 		}
-		return nil, fmt.Errorf("server returned status %d: %s", statusCode, decodeServerErrorBody(body))
+		return nil, fmt.Errorf("server returned status %d: %s", result.statusCode, decodeServerErrorBody(result.body))
 	}
 
-	var session oversync.SnapshotSession
-	if err := json.Unmarshal(body, &session); err != nil {
+	var wire struct {
+		SnapshotID        string `json:"snapshot_id"`
+		SnapshotBundleSeq int64  `json:"snapshot_bundle_seq"`
+		RowCount          int64  `json:"row_count"`
+		ByteCount         *int64 `json:"byte_count"`
+		ExpiresAt         string `json:"expires_at"`
+	}
+	if err := json.Unmarshal(result.body, &wire); err != nil {
+		if strings.TrimSpace(wire.SnapshotID) != "" {
+			c.deleteSnapshotSessionBestEffort(wire.SnapshotID)
+		}
 		return nil, fmt.Errorf("failed to decode snapshot session response: %w", err)
 	}
+	if wire.ByteCount == nil {
+		if strings.TrimSpace(wire.SnapshotID) != "" {
+			c.deleteSnapshotSessionBestEffort(wire.SnapshotID)
+		}
+		return nil, fmt.Errorf("snapshot session response missing required byte_count")
+	}
+	session := oversync.SnapshotSession{
+		SnapshotID: wire.SnapshotID, SnapshotBundleSeq: wire.SnapshotBundleSeq,
+		RowCount: wire.RowCount, ByteCount: *wire.ByteCount, ExpiresAt: wire.ExpiresAt,
+	}
 	if err := validateSnapshotSession(&session); err != nil {
+		c.deleteSnapshotSessionBestEffort(session.SnapshotID)
 		return nil, err
 	}
 	atomic.AddInt64(&c.snapshotStats.sessionsCreated, 1)
 	return &session, nil
 }
 
-func (c *Client) fetchSnapshotChunk(ctx context.Context, snapshotID string, snapshotBundleSeq int64, afterRowOrdinal int64, maxRows int) (*oversync.SnapshotChunkResponse, error) {
-	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "snapshot_chunk_fetch", http.MethodGet, buildSnapshotChunkURL(c.BaseURL, snapshotID, afterRowOrdinal, maxRows), nil, "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to send snapshot chunk request: %w", err)
-	}
-	if statusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned status %d: %s", statusCode, decodeServerErrorBody(body))
-	}
-
-	var chunk oversync.SnapshotChunkResponse
-	if err := json.Unmarshal(body, &chunk); err != nil {
-		return nil, fmt.Errorf("failed to decode snapshot chunk response: %w", err)
-	}
-	if err := validateSnapshotChunkResponse(&chunk, snapshotID, snapshotBundleSeq, afterRowOrdinal); err != nil {
-		return nil, err
-	}
-	atomic.AddInt64(&c.snapshotStats.chunksFetched, 1)
-	return &chunk, nil
+// SnapshotChunkTooSmallError reports a server row that cannot fit the explicit
+// client budget. The budget is never increased implicitly.
+type SnapshotChunkTooSmallError struct {
+	ConfiguredBytes int64
+	RequiredBytes   int64
 }
 
-func (c *Client) deleteSnapshotSessionBestEffort(ctx context.Context, snapshotID string) {
+func (e *SnapshotChunkTooSmallError) Error() string {
+	return fmt.Sprintf("snapshot chunk byte budget %d is too small for the next row requiring %d bytes; increase Config.SnapshotChunkBytes", e.ConfiguredBytes, e.RequiredBytes)
+}
+
+func (c *Client) fetchSnapshotChunk(ctx context.Context, snapshotID string, snapshotBundleSeq int64, afterRowOrdinal int64, maxRows int, maxBytes int64) (*oversync.SnapshotChunkResponse, int64, error) {
+	bodyLimit, err := checkedSnapshotChunkBodyLimit(maxBytes, maxRows)
+	if err != nil {
+		return nil, 0, err
+	}
+	result, err := c.doAuthenticatedBoundedRequestWithRetry(
+		ctx, "snapshot_chunk_fetch", http.MethodGet,
+		buildSnapshotChunkURL(c.BaseURL, snapshotID, afterRowOrdinal, maxRows, maxBytes),
+		nil, "", bodyLimit, snapshotControlBodyLimit,
+		map[string]struct{}{"snapshot_chunk_capacity": {}},
+		func(decodedBodyBytes int64) {
+			atomicRecordMax(&c.snapshotStats.maxChunkDecodedBodyBytes, decodedBodyBytes)
+		},
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to send snapshot chunk request: %w", err)
+	}
+	if result.statusCode != http.StatusOK {
+		if errorResp, ok := decodeServerErrorResponse(result.body); ok && errorResp.Error == "snapshot_chunk_too_small" {
+			if errorResp.RequiredByteCount <= maxBytes {
+				return nil, 0, fmt.Errorf("snapshot_chunk_too_small response has invalid required_byte_count %d for requested max_bytes %d", errorResp.RequiredByteCount, maxBytes)
+			}
+			return nil, 0, &SnapshotChunkTooSmallError{ConfiguredBytes: maxBytes, RequiredBytes: errorResp.RequiredByteCount}
+		}
+		return nil, 0, fmt.Errorf("server returned status %d: %s", result.statusCode, decodeServerErrorBody(result.body))
+	}
+	var wire struct {
+		SnapshotID        string                 `json:"snapshot_id"`
+		SnapshotBundleSeq int64                  `json:"snapshot_bundle_seq"`
+		Rows              []oversync.SnapshotRow `json:"rows"`
+		NextRowOrdinal    int64                  `json:"next_row_ordinal"`
+		HasMore           bool                   `json:"has_more"`
+		ByteCount         *int64                 `json:"byte_count"`
+	}
+	if err := json.Unmarshal(result.body, &wire); err != nil {
+		return nil, 0, fmt.Errorf("failed to decode snapshot chunk response: %w", err)
+	}
+	if wire.ByteCount == nil {
+		return nil, 0, fmt.Errorf("snapshot chunk response missing required byte_count")
+	}
+	chunk := oversync.SnapshotChunkResponse{
+		SnapshotID: wire.SnapshotID, SnapshotBundleSeq: wire.SnapshotBundleSeq,
+		Rows: wire.Rows, NextRowOrdinal: wire.NextRowOrdinal, HasMore: wire.HasMore,
+		ByteCount: *wire.ByteCount,
+	}
+	if err := validateSnapshotChunkResponse(&chunk, snapshotID, snapshotBundleSeq, afterRowOrdinal, maxRows, maxBytes); err != nil {
+		return nil, 0, err
+	}
+	atomic.AddInt64(&c.snapshotStats.chunksFetched, 1)
+	atomicRecordMax(&c.snapshotStats.maxChunkRows, int64(len(chunk.Rows)))
+	atomicRecordMax(&c.snapshotStats.maxChunkWireBytes, chunk.ByteCount)
+	return &chunk, result.decodedBodyBytes, nil
+}
+
+func (c *Client) deleteSnapshotSessionBestEffort(snapshotID string) {
 	if strings.TrimSpace(snapshotID) == "" {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotRetirementTimeout)
+	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, buildSnapshotSessionDeleteURL(c.BaseURL, snapshotID), nil)
 	if err != nil {
@@ -613,13 +731,59 @@ func (c *Client) deleteSnapshotSessionBestEffort(ctx context.Context, snapshotID
 	if err != nil {
 		return
 	}
-	c.applyAuthenticatedSyncHeaders(httpReq, token)
+	if err := c.applyAuthenticatedSyncHeaders(httpReq, token); err != nil {
+		return
+	}
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
 		return
 	}
-	defer resp.Body.Close()
+	_ = resp.Body.Close()
+}
+
+type snapshotTransferTotals struct {
+	rows  int64
+	bytes int64
+}
+
+func (c *Client) downloadSnapshotSession(ctx context.Context, session *oversync.SnapshotSession, limits snapshotNegotiation) (snapshotTransferTotals, error) {
+	var totals snapshotTransferTotals
+	afterRowOrdinal := int64(0)
+	for {
+		chunk, _, err := c.fetchSnapshotChunk(ctx, session.SnapshotID, session.SnapshotBundleSeq, afterRowOrdinal, limits.maxRows, limits.maxBytes)
+		if err != nil {
+			return snapshotTransferTotals{}, err
+		}
+		if err := c.stageSnapshotChunk(ctx, chunk, afterRowOrdinal); err != nil {
+			return snapshotTransferTotals{}, err
+		}
+		totals.rows, err = checkedAddInt64(totals.rows, int64(len(chunk.Rows)))
+		if err != nil {
+			return snapshotTransferTotals{}, fmt.Errorf("snapshot accumulated row count overflow: %w", err)
+		}
+		totals.bytes, err = checkedAddInt64(totals.bytes, chunk.ByteCount)
+		if err != nil {
+			return snapshotTransferTotals{}, fmt.Errorf("snapshot accumulated byte count overflow: %w", err)
+		}
+		if totals.rows > session.RowCount || totals.bytes > session.ByteCount {
+			return snapshotTransferTotals{}, fmt.Errorf("snapshot chunk totals exceed declared session totals")
+		}
+		if chunk.HasMore {
+			if totals.rows == session.RowCount || totals.bytes == session.ByteCount {
+				return snapshotTransferTotals{}, fmt.Errorf("snapshot chunk reports has_more after reaching a declared session total")
+			}
+			afterRowOrdinal = chunk.NextRowOrdinal
+			continue
+		}
+		if totals.rows != session.RowCount {
+			return snapshotTransferTotals{}, fmt.Errorf("snapshot final row total %d does not match session row_count %d", totals.rows, session.RowCount)
+		}
+		if totals.bytes != session.ByteCount {
+			return snapshotTransferTotals{}, fmt.Errorf("snapshot final byte total %d does not match session byte_count %d", totals.bytes, session.ByteCount)
+		}
+		return totals, nil
+	}
 }
 
 func (c *Client) clearSnapshotStage(ctx context.Context) error {
@@ -644,7 +808,10 @@ func (c *Client) stageSnapshotChunk(ctx context.Context, chunk *oversync.Snapsho
 		if err != nil {
 			return err
 		}
-		rowOrdinal := afterRowOrdinal + int64(idx) + 1
+		rowOrdinal, err := checkedAddInt64(afterRowOrdinal, int64(idx)+1)
+		if err != nil {
+			return fmt.Errorf("snapshot stage row ordinal overflow: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO _sync_snapshot_stage (
 				snapshot_id, row_ordinal, schema_name, table_name, key_json, row_version, payload
@@ -660,9 +827,8 @@ func (c *Client) stageSnapshotChunk(ctx context.Context, chunk *oversync.Snapsho
 	return nil
 }
 
-func (c *Client) ensureFreshRotatedSourceInTx(ctx context.Context, tx *sql.Tx, sourceID string) error {
-	sourceID = strings.TrimSpace(sourceID)
-	if sourceID == "" {
+func (c *Client) ensureFreshRotatedSourceInTx(ctx context.Context, tx sqliteTransaction, sourceID string) error {
+	if err := validateSourceID(sourceID); err != nil {
 		return fmt.Errorf("newSourceID must be provided for rotated rebuild")
 	}
 	if err := ensureSourceState(ctx, tx, sourceID); err != nil {
@@ -673,15 +839,15 @@ func (c *Client) ensureFreshRotatedSourceInTx(ctx context.Context, tx *sql.Tx, s
 		return err
 	}
 	if state == nil {
-		return fmt.Errorf("missing source state for rotated source %s", sourceID)
+		return fmt.Errorf("missing source state for rotated source")
 	}
-	if state.NextSourceBundleID != 1 || strings.TrimSpace(state.ReplacedBySourceID) != "" {
-		return fmt.Errorf("rotated rebuild requires a fresh source id; %s is already in use", sourceID)
+	if state.NextSourceBundleID != 1 || state.ReplacedBySourceID != "" {
+		return fmt.Errorf("rotated rebuild requires a fresh source id; reserved source is already in use")
 	}
 	return nil
 }
 
-func (c *Client) retargetPreparedOutboxInTx(ctx context.Context, tx *sql.Tx, sourceID string, sourceBundleID int64) error {
+func (c *Client) retargetPreparedOutboxInTx(ctx context.Context, tx sqliteTransaction, sourceID string, sourceBundleID int64) error {
 	if sourceBundleID <= 0 {
 		return fmt.Errorf("sourceBundleID must be positive when preserving prepared outbox")
 	}
@@ -705,7 +871,7 @@ func (c *Client) retargetPreparedOutboxInTx(ctx context.Context, tx *sql.Tx, sou
 	return nil
 }
 
-func (c *Client) reapplyPreparedOutboxIntentLocallyInTx(ctx context.Context, stmtCache *txStmtCache, tx *sql.Tx) error {
+func (c *Client) reapplyPreparedOutboxIntentLocallyInTx(ctx context.Context, stmtCache *txStmtCache, tx sqliteTransaction) error {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT table_name, key_json, op, local_payload
 		FROM _sync_outbox_rows
@@ -766,15 +932,35 @@ func (c *Client) reapplyPreparedOutboxIntentLocallyInTx(ctx context.Context, stm
 	return nil
 }
 
-func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) error {
-	tx, err := c.DB.BeginTx(ctx, nil)
+func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) (resultErr error) {
+	guard := options.PinnedGuard
+	var err error
+	if guard == nil {
+		if !options.FinalizeRemoteReplace {
+			attachment, loadErr := loadAttachmentState(ctx, c.DB)
+			if loadErr != nil {
+				return loadErr
+			}
+			if attachment.BindingState != attachmentBindingAttached || strings.TrimSpace(attachment.AttachedUserID) == "" {
+				return &AttachRequiredError{Operation: "Rebuild()"}
+			}
+		}
+		guard, err = c.pinSnapshotApplyGuard(ctx, options)
+		if err != nil {
+			return err
+		}
+	}
+	tx, err := beginImmediateTx(ctx, c.DB)
 	if err != nil {
 		return fmt.Errorf("failed to begin staged snapshot apply transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.rollbackOnReturn(&resultErr, "staged snapshot apply transaction")
 	stmtCache := newTxStmtCache(tx)
 	defer stmtCache.Close()
 
+	if err := c.validateFinalSnapshotApplyGate(ctx, tx, guard, session); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
 		return fmt.Errorf("failed to defer foreign keys for staged snapshot apply: %w", err)
 	}
@@ -782,7 +968,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if err != nil {
 		return err
 	}
-	if attachment.BindingState != attachmentBindingAttached || strings.TrimSpace(attachment.AttachedUserID) == "" {
+	if !options.FinalizeRemoteReplace && (attachment.BindingState != attachmentBindingAttached || strings.TrimSpace(attachment.AttachedUserID) == "") {
 		return &AttachRequiredError{Operation: "Rebuild()"}
 	}
 	if err := c.setBundleApplyModeInTx(ctx, tx, true); err != nil {
@@ -815,6 +1001,8 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		if err := rows.Scan(&schemaName, &tableName, &keyJSON, &rowVersion, &payload); err != nil {
 			return fmt.Errorf("failed to scan staged snapshot row: %w", err)
 		}
+		atomicRecordMax(&c.snapshotStats.maxLiveStagedApplyRows, 1)
+		atomicRecordMax(&c.snapshotStats.maxLiveStagedApplyText, int64(len(schemaName)+len(tableName)+len(keyJSON)+len(payload)))
 
 		localPK, wireKey, err := c.decodeDirtyKeyForPush(tx, tableName, keyJSON)
 		if err != nil {
@@ -828,6 +1016,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 			RowVersion: rowVersion,
 			Payload:    json.RawMessage(payload),
 		}
+		atomicRecordMax(&c.snapshotStats.maxAppliedInMemoryRows, 1)
 		if err := c.applyBundleRowAuthoritativelyInTxUsing(ctx, stmtCache, tx, &bundleRow, localPK); err != nil {
 			return fmt.Errorf("failed to apply staged snapshot row for %s.%s: %w", schemaName, tableName, err)
 		}
@@ -836,18 +1025,40 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("failed to iterate staged snapshot rows: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close staged snapshot rows: %w", err)
+	}
 	if stagedRowCount != session.RowCount {
 		return fmt.Errorf("staged snapshot row count %d does not match expected row_count %d", stagedRowCount, session.RowCount)
 	}
-	if options.PreserveOutbox {
+	if c.afterSnapshotRowsHook != nil {
+		c.afterSnapshotRowsHook()
+	}
+	if options.PreserveOutbox && guard.outbox.State == outboxStatePrepared {
 		if err := c.reapplyPreparedOutboxIntentLocallyInTx(ctx, stmtCache, tx); err != nil {
 			return err
 		}
 	}
 
 	targetSourceID := c.sourceID
+	if options.FinalizeRemoteReplace {
+		targetSourceID = attachment.CurrentSourceID
+		if targetSourceID == "" {
+			targetSourceID = c.sourceID
+		}
+		if err := ensureSourceState(ctx, tx, targetSourceID); err != nil {
+			return err
+		}
+		attachment.BindingState = attachmentBindingAttached
+		attachment.AttachedUserID = strings.TrimSpace(options.RemoteTargetUserID)
+		attachment.SchemaName = c.config.Schema
+		attachment.PendingInitializationID = ""
+	}
 	if options.RotateSource {
-		targetSourceID = strings.TrimSpace(options.NewSourceID)
+		targetSourceID = options.NewSourceID
+		if err := validateSourceID(targetSourceID); err != nil {
+			return err
+		}
 		if options.RequireFreshRotatedSource {
 			if err := c.ensureFreshRotatedSourceInTx(ctx, tx, targetSourceID); err != nil {
 				return err
@@ -855,7 +1066,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		} else if err := ensureSourceState(ctx, tx, targetSourceID); err != nil {
 			return err
 		}
-		if strings.TrimSpace(c.sourceID) != "" && c.sourceID != targetSourceID {
+		if c.sourceID != "" && c.sourceID != targetSourceID {
 			if err := markSourceReplaced(ctx, tx, c.sourceID, targetSourceID); err != nil {
 				return err
 			}
@@ -867,7 +1078,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
 		return fmt.Errorf("failed to persist snapshot bundle checkpoint: %w", err)
 	}
-	if options.PreserveOutbox {
+	if options.PreserveOutbox && guard.outbox.State == outboxStatePrepared {
 		if err := c.retargetPreparedOutboxInTx(ctx, tx, targetSourceID, 1); err != nil {
 			return err
 		}
@@ -877,7 +1088,11 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 			return err
 		}
 	}
-	if options.ClearSourceRecovery {
+	if options.FinalizeRemoteReplace {
+		if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
+			return err
+		}
+	} else if options.ClearSourceRecovery {
 		if err := c.clearSourceRecoveryRequiredInTx(ctx, tx); err != nil {
 			return err
 		}
@@ -899,10 +1114,13 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if err := c.setBundleApplyModeInTx(ctx, tx, false); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := stmtCache.Close(); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("failed to commit staged snapshot apply: %w", err)
 	}
-	if options.RotateSource {
+	if options.RotateSource || options.FinalizeRemoteReplace {
 		c.sourceID = targetSourceID
 	}
 	return nil
@@ -958,13 +1176,19 @@ func validateSnapshotSession(resp *oversync.SnapshotSession) error {
 	if resp.ByteCount < 0 {
 		return fmt.Errorf("snapshot session byte_count %d must be non-negative", resp.ByteCount)
 	}
+	if resp.RowCount == 0 && resp.ByteCount != 0 {
+		return fmt.Errorf("empty snapshot session must declare byte_count 0")
+	}
+	if resp.RowCount > 0 && resp.ByteCount == 0 {
+		return fmt.Errorf("non-empty snapshot session must declare a positive byte_count")
+	}
 	if strings.TrimSpace(resp.ExpiresAt) == "" {
 		return fmt.Errorf("snapshot session response missing expires_at")
 	}
 	return nil
 }
 
-func validateSnapshotChunkResponse(resp *oversync.SnapshotChunkResponse, snapshotID string, snapshotBundleSeq int64, afterRowOrdinal int64) error {
+func validateSnapshotChunkResponse(resp *oversync.SnapshotChunkResponse, snapshotID string, snapshotBundleSeq int64, afterRowOrdinal int64, maxRows int, maxBytes int64) error {
 	if resp == nil {
 		return fmt.Errorf("snapshot chunk response missing body")
 	}
@@ -977,8 +1201,24 @@ func validateSnapshotChunkResponse(resp *oversync.SnapshotChunkResponse, snapsho
 	if len(resp.Rows) > 0 && resp.SnapshotBundleSeq == 0 {
 		return fmt.Errorf("snapshot chunk response missing snapshot_bundle_seq for non-empty row set")
 	}
-	if resp.NextRowOrdinal != afterRowOrdinal+int64(len(resp.Rows)) {
-		return fmt.Errorf("snapshot chunk response next_row_ordinal %d does not match expected %d", resp.NextRowOrdinal, afterRowOrdinal+int64(len(resp.Rows)))
+	if len(resp.Rows) > maxRows {
+		return fmt.Errorf("snapshot chunk row count %d exceeds effective max_rows %d", len(resp.Rows), maxRows)
+	}
+	if resp.ByteCount < 0 || resp.ByteCount > maxBytes {
+		return fmt.Errorf("snapshot chunk byte_count %d exceeds effective max_bytes %d or is negative", resp.ByteCount, maxBytes)
+	}
+	if len(resp.Rows) == 0 && resp.ByteCount != 0 {
+		return fmt.Errorf("empty snapshot chunk must declare byte_count 0")
+	}
+	if len(resp.Rows) > 0 && resp.ByteCount == 0 {
+		return fmt.Errorf("non-empty snapshot chunk must declare a positive byte_count")
+	}
+	expectedOrdinal, err := checkedAddInt64(afterRowOrdinal, int64(len(resp.Rows)))
+	if err != nil {
+		return fmt.Errorf("snapshot chunk next ordinal overflow: %w", err)
+	}
+	if resp.NextRowOrdinal != expectedOrdinal {
+		return fmt.Errorf("snapshot chunk response next_row_ordinal %d does not match expected %d", resp.NextRowOrdinal, expectedOrdinal)
 	}
 	if resp.HasMore && len(resp.Rows) == 0 {
 		return fmt.Errorf("snapshot chunk response with has_more=true must include at least one row")
@@ -996,8 +1236,8 @@ func validateBundle(bundle *oversync.Bundle) error {
 	if bundle.BundleSeq <= 0 {
 		return fmt.Errorf("bundle_seq %d must be positive", bundle.BundleSeq)
 	}
-	if strings.TrimSpace(bundle.SourceID) == "" {
-		return fmt.Errorf("bundle source_id must be non-empty")
+	if err := validateSourceID(bundle.SourceID); err != nil {
+		return fmt.Errorf("bundle source_id is invalid: %w", err)
 	}
 	if bundle.SourceBundleID <= 0 {
 		return fmt.Errorf("bundle source_bundle_id %d must be positive", bundle.SourceBundleID)
@@ -1059,31 +1299,97 @@ func buildSnapshotSessionCreateURL(base string) string {
 	return fmt.Sprintf("%s/sync/snapshot-sessions", base)
 }
 
-func buildSnapshotChunkURL(base, snapshotID string, afterRowOrdinal int64, maxRows int) string {
+func encodeOpaquePathSegment(value string) string {
+	const hex = "0123456789ABCDEF"
+	var encoded strings.Builder
+	encoded.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '~' {
+			encoded.WriteByte(b)
+			continue
+		}
+		encoded.WriteByte('%')
+		encoded.WriteByte(hex[b>>4])
+		encoded.WriteByte(hex[b&0x0f])
+	}
+	return encoded.String()
+}
+
+func buildSnapshotChunkURL(base, snapshotID string, afterRowOrdinal int64, maxRows int, maxBytes int64) string {
 	values := url.Values{}
 	values.Set("after_row_ordinal", strconv.FormatInt(afterRowOrdinal, 10))
 	if maxRows > 0 {
 		values.Set("max_rows", strconv.Itoa(maxRows))
 	}
-	return fmt.Sprintf("%s/sync/snapshot-sessions/%s?%s", base, url.PathEscape(snapshotID), values.Encode())
+	if maxBytes > 0 {
+		values.Set("max_bytes", strconv.FormatInt(maxBytes, 10))
+	}
+	return fmt.Sprintf("%s/sync/snapshot-sessions/%s?%s", base, encodeOpaquePathSegment(snapshotID), values.Encode())
 }
 
 func buildSnapshotSessionDeleteURL(base, snapshotID string) string {
-	return fmt.Sprintf("%s/sync/snapshot-sessions/%s", base, url.PathEscape(snapshotID))
+	return fmt.Sprintf("%s/sync/snapshot-sessions/%s", base, encodeOpaquePathSegment(snapshotID))
 }
 
 func decodeServerErrorBody(body []byte) string {
 	if len(body) == 0 {
-		return ""
+		return "invalid_error_response"
 	}
 	resp, ok := decodeServerErrorResponse(body)
 	if !ok {
-		return string(body)
+		return "invalid_error_response"
 	}
-	if strings.TrimSpace(resp.Message) != "" {
-		return fmt.Sprintf("%s: %s", resp.Error, resp.Message)
+	if !isSafeServerErrorCode(resp.Error) {
+		return "invalid_error_response"
 	}
 	return resp.Error
+}
+
+func decodeSnapshotSessionLimitExceededError(body []byte) error {
+	errorResp, ok := decodeServerErrorResponse(body)
+	if !ok || errorResp.Error != "snapshot_session_limit_exceeded" {
+		return nil
+	}
+
+	var response oversync.SnapshotSessionLimitResponse
+	if err := json.Unmarshal(body, &response); err != nil ||
+		response.Error != "snapshot_session_limit_exceeded" ||
+		!isSnapshotSessionLimitDimension(response.Dimension) ||
+		response.Limit <= 0 || response.Actual <= response.Limit {
+		return errors.New("invalid snapshot_session_limit_exceeded response")
+	}
+	return &SnapshotSessionLimitExceededError{
+		Dimension: response.Dimension,
+		Actual:    response.Actual,
+		Limit:     response.Limit,
+	}
+}
+
+func isSnapshotSessionLimitDimension(dimension string) bool {
+	switch dimension {
+	case "row_count", "byte_count", "row_byte_count":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSafeServerErrorCode(code string) bool {
+	switch code {
+	case "bundle_change_watch_forbidden", "checkpoint_ahead", "committed_bundle_not_found",
+		"history_pruned", "initialization_expired", "initialization_stale", "invalid_request",
+		"push_chunk_invalid", "push_chunk_out_of_order", "push_conflict", "push_session_expired",
+		"push_session_forbidden", "push_session_invalid", "push_session_not_found",
+		"scope_initializing", "scope_uninitialized", "service_unavailable", "snapshot_build_capacity",
+		"snapshot_chunk_capacity", "snapshot_chunk_invalid", "snapshot_chunk_too_small",
+		"snapshot_session_expired", "snapshot_session_forbidden", "snapshot_session_invalid",
+		"snapshot_session_limit_exceeded", "snapshot_session_not_found", "source_replacement_invalid", "source_retired",
+		"source_sequence_changed", "source_sequence_out_of_order":
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeServerErrorResponse(body []byte) (oversync.ErrorResponse, bool) {
@@ -1092,28 +1398,23 @@ func decodeServerErrorResponse(body []byte) (oversync.ErrorResponse, bool) {
 	}
 	var resp oversync.ErrorResponse
 	if err := json.Unmarshal(body, &resp); err == nil && strings.TrimSpace(resp.Error) != "" {
+		resp.Message = ""
 		return resp, true
 	}
 	return oversync.ErrorResponse{}, false
 }
 
-func decodeSourceRetiredResponse(body []byte) (oversync.SourceRetiredResponse, bool) {
+func decodeSourceRetiredResponse(body []byte, expectedSourceID string) (oversync.SourceRetiredResponse, bool) {
 	if len(body) == 0 {
 		return oversync.SourceRetiredResponse{}, false
 	}
 	var resp oversync.SourceRetiredResponse
-	if err := json.Unmarshal(body, &resp); err == nil && strings.TrimSpace(resp.Error) == "source_retired" {
+	if err := json.Unmarshal(body, &resp); err == nil && resp.Error == "source_retired" {
+		if validateSourceID(expectedSourceID) != nil || resp.SourceID != expectedSourceID {
+			return oversync.SourceRetiredResponse{}, false
+		}
+		resp.Message = ""
 		return resp, true
 	}
 	return oversync.SourceRetiredResponse{}, false
-}
-
-func buildPullURL(base string, afterBundleSeq int64, maxBundles int, targetBundleSeq int64) string {
-	values := url.Values{}
-	values.Set("after_bundle_seq", strconv.FormatInt(afterBundleSeq, 10))
-	values.Set("max_bundles", strconv.Itoa(maxBundles))
-	if targetBundleSeq > 0 {
-		values.Set("target_bundle_seq", strconv.FormatInt(targetBundleSeq, 10))
-	}
-	return fmt.Sprintf("%s/sync/pull?%s", base, values.Encode())
 }

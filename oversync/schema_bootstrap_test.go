@@ -776,7 +776,6 @@ func TestBootstrap_RequiresPermanentRegisteredTables(t *testing.T) {
 			h.schemaName+".records",
 			"UNLOGGED",
 			`relpersistence="u"`,
-			"recreate the database with permanent tables",
 		)
 		requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
 	})

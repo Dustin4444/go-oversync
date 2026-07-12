@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mobiletoly/go-oversync/internal/protocolhash"
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 const (
@@ -234,8 +234,8 @@ func (s *SyncService) withinSyncBundleTx(
 	if err := actor.validate(false); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(source.SourceID) == "" {
-		return nil, fmt.Errorf("bundle source_id is required")
+	if err := sourceid.Validate(source.SourceID); err != nil {
+		return nil, fmt.Errorf("bundle source_id is invalid: %w", err)
 	}
 	if source.SourceBundleID <= 0 {
 		return nil, fmt.Errorf("bundle source_bundle_id must be > 0")
@@ -609,12 +609,4 @@ func persistCommittedBundleRows(ctx context.Context, tx pgx.Tx, userPK, bundleSe
 	}
 
 	return nil
-}
-
-func decodeSyncKeyJSON(raw string) (SyncKey, error) {
-	var key SyncKey
-	if err := json.Unmarshal([]byte(raw), &key); err != nil {
-		return nil, err
-	}
-	return key, nil
 }

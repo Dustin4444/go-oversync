@@ -1228,16 +1228,21 @@ components:
 
     RegisteredTableSpec:
       type: object
-      required: [schema, table]
+      required: [schema, table, sync_key_columns]
       properties:
         schema:
           type: string
+          minLength: 1
         table:
           type: string
+          minLength: 1
         sync_key_columns:
           type: array
+          minItems: 1
+          maxItems: 1
           items:
             type: string
+            minLength: 1
 
     BundleChangeEvent:
       type: object
@@ -1256,7 +1261,7 @@ components:
 
     CapabilitiesResponse:
       type: object
-      required: [protocol_version, schema_version, features, bundle_limits]
+      required: [protocol_version, schema_version, registered_table_specs, features, bundle_limits]
       properties:
         protocol_version:
           type: string

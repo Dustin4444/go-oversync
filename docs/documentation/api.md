@@ -494,6 +494,13 @@ Response:
 Returns the protocol version, schema version, app name, registered tables, registered table specs,
 feature flags, and bundle limits.
 
+`registered_table_specs` is required and canonical. Every item requires non-blank `schema` and
+`table` strings plus exactly one non-blank `sync_key_columns` entry; duplicate schema/table specs are
+invalid. `registered_tables` is an optional legacy summary. Compatible clients compare the exact
+advertised schema/table and ordered key list with their validated local sync configuration before
+connect or data movement. This is table/key compatibility checking, not wire-profile or projection
+negotiation.
+
 The breaking-development server protocol version is exactly `v1`. Updated clients must reject any other,
 empty, or unknown value before connect, outbox freeze, or remote synchronization work.
 

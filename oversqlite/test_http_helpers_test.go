@@ -38,6 +38,9 @@ func jsonResponse(v any) *http.Response {
 		if typed.Features == nil {
 			typed.Features = map[string]bool{}
 		}
+		if typed.RegisteredTableSpecs == nil {
+			typed.RegisteredTableSpecs = []oversync.RegisteredTableSpec{}
+		}
 		if typed.BundleLimits.DefaultRowsPerSnapshotChunk == 0 {
 			typed.BundleLimits.DefaultRowsPerSnapshotChunk = 1000
 			typed.BundleLimits.MaxRowsPerSnapshotChunk = 1000

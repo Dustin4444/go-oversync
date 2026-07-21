@@ -480,6 +480,8 @@ func TestSnapshotPublicContract_LockedCapabilityAndEndpointDocumentation(t *test
 		Properties  map[string]struct {
 			Description string `yaml:"description"`
 			Ref         string `yaml:"$ref"`
+			MinItems    int    `yaml:"minItems"`
+			MaxItems    int    `yaml:"maxItems"`
 			AllOf       []struct {
 				Ref string `yaml:"$ref"`
 			} `yaml:"allOf"`
@@ -586,6 +588,13 @@ func TestSnapshotPublicContract_LockedCapabilityAndEndpointDocumentation(t *test
 	limits := spec.Components.Schemas["BundleCapabilitiesLimits"]
 	capabilitiesSchema := spec.Components.Schemas["CapabilitiesResponse"]
 	require.Contains(t, capabilitiesSchema.Required, "bundle_limits")
+	require.Contains(t, capabilitiesSchema.Required, "registered_table_specs")
+	tableSpec := spec.Components.Schemas["RegisteredTableSpec"]
+	for _, name := range []string{"schema", "table", "sync_key_columns"} {
+		require.Contains(t, tableSpec.Required, name)
+	}
+	require.Equal(t, 1, tableSpec.Properties["sync_key_columns"].MinItems)
+	require.Equal(t, 1, tableSpec.Properties["sync_key_columns"].MaxItems)
 	for _, name := range []string{"default_bytes_per_snapshot_chunk", "max_bytes_per_snapshot_chunk", "max_bytes_per_snapshot_row", "max_concurrent_snapshot_builds", "max_concurrent_snapshot_chunk_requests"} {
 		require.Contains(t, limits.Required, name)
 		_, ok := limits.Properties[name]
@@ -611,6 +620,7 @@ func TestSnapshotPublicContract_LockedCapabilityAndEndpointDocumentation(t *test
 	require.NoError(t, err)
 	var zeroWire map[string]any
 	require.NoError(t, json.Unmarshal(zeroCapabilities, &zeroWire))
+	require.Contains(t, zeroWire, "registered_table_specs")
 	zeroBundleLimits, ok := zeroWire["bundle_limits"].(map[string]any)
 	require.True(t, ok, "zero-value capabilities must encode bundle_limits as an object")
 	for _, name := range []string{"default_bytes_per_snapshot_chunk", "max_bytes_per_snapshot_chunk", "max_bytes_per_snapshot_row", "max_concurrent_snapshot_builds", "max_concurrent_snapshot_chunk_requests"} {

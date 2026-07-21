@@ -139,7 +139,7 @@ func TestSnapshotSessionMissingByteCount_AttemptsRetirement(t *testing.T) {
 func TestSnapshotCapabilityNegotiation_RequiredRelationshipsAndExactName(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 
-	valid := `{"protocol_version":"v1","schema_version":1,"features":{},"bundle_limits":{"default_rows_per_snapshot_chunk":1000,"max_rows_per_snapshot_chunk":2000,"default_bytes_per_snapshot_chunk":4194304,"max_bytes_per_snapshot_chunk":8388608,"max_bytes_per_snapshot_row":1048576,"max_concurrent_snapshot_builds":2,"max_concurrent_snapshot_chunk_requests":3}}`
+	valid := `{"protocol_version":"v1","schema_version":1,"registered_table_specs":[],"features":{},"bundle_limits":{"default_rows_per_snapshot_chunk":1000,"max_rows_per_snapshot_chunk":2000,"default_bytes_per_snapshot_chunk":4194304,"max_bytes_per_snapshot_chunk":8388608,"max_bytes_per_snapshot_row":1048576,"max_concurrent_snapshot_builds":2,"max_concurrent_snapshot_chunk_requests":3}}`
 	tests := []struct {
 		name string
 		body string

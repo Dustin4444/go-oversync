@@ -28,12 +28,13 @@ type phase3Tx struct {
 func (tx *phase3Tx) QueryRow(context.Context, string, ...any) pgx.Row { return tx.row }
 
 func TestPhase3CapabilitiesRequiredPresenceAtDecodeBoundary(t *testing.T) {
-	valid := `{"protocol_version":"v1","schema_version":1,"features":{},"bundle_limits":{"default_rows_per_snapshot_chunk":1000,"max_rows_per_snapshot_chunk":2000,"default_bytes_per_snapshot_chunk":4194304,"max_bytes_per_snapshot_chunk":8388608,"max_bytes_per_snapshot_row":1048576,"max_concurrent_snapshot_builds":2,"max_concurrent_snapshot_chunk_requests":3}}`
+	valid := `{"protocol_version":"v1","schema_version":1,"registered_table_specs":[{"schema":"business","table":"users","sync_key_columns":["id"]}],"features":{},"bundle_limits":{"default_rows_per_snapshot_chunk":1000,"max_rows_per_snapshot_chunk":2000,"default_bytes_per_snapshot_chunk":4194304,"max_bytes_per_snapshot_chunk":8388608,"max_bytes_per_snapshot_row":1048576,"max_concurrent_snapshot_builds":2,"max_concurrent_snapshot_chunk_requests":3}}`
 	require.NoError(t, json.Unmarshal([]byte(valid), &CapabilitiesResponse{}))
 
 	for _, field := range []string{
 		"protocol_version",
 		"schema_version",
+		"registered_table_specs",
 		"features",
 		"bundle_limits",
 		"default_rows_per_snapshot_chunk",
@@ -47,11 +48,41 @@ func TestPhase3CapabilitiesRequiredPresenceAtDecodeBoundary(t *testing.T) {
 		t.Run(field, func(t *testing.T) {
 			var document map[string]any
 			require.NoError(t, json.Unmarshal([]byte(valid), &document))
-			if field == "protocol_version" || field == "schema_version" || field == "features" || field == "bundle_limits" {
+			if field == "protocol_version" || field == "schema_version" || field == "registered_table_specs" || field == "features" || field == "bundle_limits" {
 				delete(document, field)
 			} else {
 				delete(document["bundle_limits"].(map[string]any), field)
 			}
+			encoded, err := json.Marshal(document)
+			require.NoError(t, err)
+			require.Error(t, json.Unmarshal(encoded, &CapabilitiesResponse{}))
+		})
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		value any
+	}{
+		{name: "null specs", value: nil},
+		{name: "non-array specs", value: map[string]any{}},
+		{name: "missing schema", value: []any{map[string]any{"table": "users", "sync_key_columns": []any{"id"}}}},
+		{name: "blank schema", value: []any{map[string]any{"schema": " ", "table": "users", "sync_key_columns": []any{"id"}}}},
+		{name: "missing table", value: []any{map[string]any{"schema": "business", "sync_key_columns": []any{"id"}}}},
+		{name: "blank table", value: []any{map[string]any{"schema": "business", "table": " ", "sync_key_columns": []any{"id"}}}},
+		{name: "missing keys", value: []any{map[string]any{"schema": "business", "table": "users"}}},
+		{name: "null keys", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": nil}}},
+		{name: "empty keys", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{}}}},
+		{name: "multiple keys", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{"id", "tenant_id"}}}},
+		{name: "blank key", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{" "}}}},
+		{name: "duplicate spec", value: []any{
+			map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{"id"}},
+			map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{"id"}},
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var document map[string]any
+			require.NoError(t, json.Unmarshal([]byte(valid), &document))
+			document["registered_table_specs"] = testCase.value
 			encoded, err := json.Marshal(document)
 			require.NoError(t, err)
 			require.Error(t, json.Unmarshal(encoded, &CapabilitiesResponse{}))

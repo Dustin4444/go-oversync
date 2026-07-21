@@ -6,6 +6,7 @@ package oversync
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
@@ -164,7 +165,7 @@ type CapabilitiesResponse struct {
 	SchemaVersion        int                      `json:"schema_version"`
 	AppName              string                   `json:"app_name,omitempty"`
 	RegisteredTables     []string                 `json:"registered_tables,omitempty"`
-	RegisteredTableSpecs []RegisteredTableSpec    `json:"registered_table_specs,omitempty"`
+	RegisteredTableSpecs []RegisteredTableSpec    `json:"registered_table_specs"`
 	Features             map[string]bool          `json:"features"`
 	BundleLimits         BundleCapabilitiesLimits `json:"bundle_limits"`
 }
@@ -252,7 +253,7 @@ func (response *CapabilitiesResponse) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	for _, name := range []string{"protocol_version", "schema_version", "features", "bundle_limits"} {
+	for _, name := range []string{"protocol_version", "schema_version", "registered_table_specs", "features", "bundle_limits"} {
 		value, ok := fields[name]
 		if !ok || string(value) == "null" {
 			return fmt.Errorf("capabilities response missing required %s", name)
@@ -265,6 +266,17 @@ func (response *CapabilitiesResponse) UnmarshalJSON(data []byte) error {
 	if decoded.Features == nil {
 		return fmt.Errorf("capabilities response features must be an object")
 	}
+	if decoded.RegisteredTableSpecs == nil {
+		return fmt.Errorf("capabilities response registered_table_specs must be an array")
+	}
+	seenTables := make(map[[2]string]struct{}, len(decoded.RegisteredTableSpecs))
+	for _, spec := range decoded.RegisteredTableSpecs {
+		key := [2]string{spec.Schema, spec.Table}
+		if _, exists := seenTables[key]; exists {
+			return fmt.Errorf("capabilities response registered_table_specs contains a duplicate table")
+		}
+		seenTables[key] = struct{}{}
+	}
 	*response = CapabilitiesResponse(decoded)
 	return nil
 }
@@ -273,7 +285,39 @@ func (response *CapabilitiesResponse) UnmarshalJSON(data []byte) error {
 type RegisteredTableSpec struct {
 	Schema         string   `json:"schema"`
 	Table          string   `json:"table"`
-	SyncKeyColumns []string `json:"sync_key_columns,omitempty"`
+	SyncKeyColumns []string `json:"sync_key_columns"`
+}
+
+func (spec *RegisteredTableSpec) UnmarshalJSON(data []byte) error {
+	type plainSpec RegisteredTableSpec
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"schema", "table", "sync_key_columns"} {
+		value, ok := fields[name]
+		if !ok || string(value) == "null" {
+			return fmt.Errorf("registered table spec missing required %s", name)
+		}
+	}
+	var decoded plainSpec
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if strings.TrimSpace(decoded.Schema) == "" {
+		return fmt.Errorf("registered table spec schema must be a non-blank identifier")
+	}
+	if strings.TrimSpace(decoded.Table) == "" {
+		return fmt.Errorf("registered table spec table must be a non-blank identifier")
+	}
+	if len(decoded.SyncKeyColumns) != 1 {
+		return fmt.Errorf("registered table spec sync_key_columns must contain exactly one entry")
+	}
+	if strings.TrimSpace(decoded.SyncKeyColumns[0]) == "" {
+		return fmt.Errorf("registered table spec sync_key_columns must contain a non-blank identifier")
+	}
+	*spec = RegisteredTableSpec(decoded)
+	return nil
 }
 
 // ErrorResponse represents an error response

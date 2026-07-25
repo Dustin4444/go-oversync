@@ -21,6 +21,28 @@ func newIntegrationTestPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	t.Helper()
 
 	databaseURL, managed := provisionIntegrationTestDatabase(t, ctx)
+	return newIntegrationTestPoolForDatabaseURL(t, ctx, databaseURL, managed)
+}
+
+func newIntegrationTestPoolForServer(
+	t *testing.T,
+	ctx context.Context,
+	server *managedIntegrationPostgresServer,
+) *pgxpool.Pool {
+	t.Helper()
+
+	databaseURL, managed := provisionIntegrationTestDatabaseOnServer(t, ctx, server)
+	return newIntegrationTestPoolForDatabaseURL(t, ctx, databaseURL, managed)
+}
+
+func newIntegrationTestPoolForDatabaseURL(
+	t *testing.T,
+	ctx context.Context,
+	databaseURL string,
+	managed bool,
+) *pgxpool.Pool {
+	t.Helper()
+
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		t.Fatalf("create integration test pool: %v", err)

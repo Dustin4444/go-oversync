@@ -197,19 +197,25 @@ there is no runtime reset endpoint or TRUNCATE-based reset.
 
 ## Managed `sync` layout validation
 
+Oversync supports PostgreSQL 16.x and 17.x. The maintained compatibility lane uses the current
+`postgres:16` image, while PostgreSQL 17.10 remains the pinned normative database-backed assurance
+lane.
+
 The entire PostgreSQL `sync` schema is reserved and server-managed. Do not add operator tables,
 views, sequences, functions, rules, indexes, constraints, columns, or non-internal triggers there.
 On application registered tables, only the three Oversync-reserved trigger names are managed;
 application triggers and indexes with other names remain supported.
 
 Every existing-layout `Bootstrap()` validates registered declarations, the marker and exact table
-catalog, then compares the complete PostgreSQL 17.10 semantic manifest for
+catalog, then compares the complete version-independent semantic manifest for
 `server_postgres_sync_v1`. Validation covers relation
 persistence/partition/RLS/replica identity, every column and default, PK/UNIQUE/CHECK/FK semantics,
 constraint-backed and explicit indexes, identity and metric sequences, exact managed-function body
 hashes and attributes, and the root/descendant trigger definitions and arguments. Expected and
 actual facts are sorted and length-delimited before SHA-256 fingerprinting; field differences, not
-hash equality alone, decide acceptance.
+hash equality alone, decide acceptance. Catalog object paths use exact dot-separated name components,
+not PostgreSQL-rendered SQL identifiers, so server-version keyword classifications cannot change
+their semantic identity.
 
 A coherent marked layout takes the trusted-database attachment path. It reads no registered business
 rows or managed operational-state rows, takes no explicit business or managed data locks, and

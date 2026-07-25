@@ -61,6 +61,15 @@ func provisionIntegrationTestDatabase(t *testing.T, ctx context.Context) (string
 	if err != nil {
 		t.Fatalf("start managed integration PostgreSQL (set TEST_DATABASE_URL to use an existing database): %v", err)
 	}
+	return provisionIntegrationTestDatabaseOnServer(t, ctx, server)
+}
+
+func provisionIntegrationTestDatabaseOnServer(
+	t *testing.T,
+	ctx context.Context,
+	server *managedIntegrationPostgresServer,
+) (string, bool) {
+	t.Helper()
 
 	databaseName := fmt.Sprintf(
 		"oversync_test_%d_%d",
@@ -83,12 +92,12 @@ func provisionIntegrationTestDatabase(t *testing.T, ctx context.Context) (string
 
 func getManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error) {
 	managedIntegrationPostgresOnce.Do(func() {
-		managedIntegrationPostgres, managedIntegrationPostgresErr = startManagedIntegrationPostgres()
+		managedIntegrationPostgres, managedIntegrationPostgresErr = startManagedIntegrationPostgres(managedIntegrationPostgresImage)
 	})
 	return managedIntegrationPostgres, managedIntegrationPostgresErr
 }
 
-func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error) {
+func startManagedIntegrationPostgres(image string) (*managedIntegrationPostgresServer, error) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return nil, fmt.Errorf("find docker CLI: %w", err)
 	}
@@ -120,7 +129,7 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 		"--health-interval", "250ms",
 		"--health-timeout", "5s",
 		"--health-retries", "120",
-		managedIntegrationPostgresImage,
+		image,
 	)
 	if err != nil {
 		_ = os.RemoveAll(dataDir)
@@ -155,9 +164,9 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 	if err := server.waitUntilReady(ctx); err != nil {
 		logs, logsErr := dockerOutput(context.Background(), "logs", "--tail", "50", containerID)
 		if logsErr == nil && logs != "" {
-			return nil, fmt.Errorf("wait for %s: %w; container logs: %s", managedIntegrationPostgresImage, err, logs)
+			return nil, fmt.Errorf("wait for %s: %w; container logs: %s", image, err, logs)
 		}
-		return nil, fmt.Errorf("wait for %s: %w", managedIntegrationPostgresImage, err)
+		return nil, fmt.Errorf("wait for %s: %w", image, err)
 	}
 
 	started = true
@@ -165,17 +174,24 @@ func startManagedIntegrationPostgres() (*managedIntegrationPostgresServer, error
 }
 
 func stopManagedIntegrationPostgres() error {
-	if managedIntegrationPostgres == nil || managedIntegrationPostgres.containerID == "" {
+	if managedIntegrationPostgres == nil {
+		return nil
+	}
+	return managedIntegrationPostgres.close()
+}
+
+func (s *managedIntegrationPostgresServer) close() error {
+	if s.containerID == "" {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, containerErr := dockerOutput(ctx, "rm", "--force", managedIntegrationPostgres.containerID)
+	_, containerErr := dockerOutput(ctx, "rm", "--force", s.containerID)
 	if containerErr != nil && strings.Contains(containerErr.Error(), "No such container") {
 		containerErr = nil
 	}
-	return errors.Join(containerErr, os.RemoveAll(managedIntegrationPostgres.dataDir))
+	return errors.Join(containerErr, os.RemoveAll(s.dataDir))
 }
 
 func parseDockerPublishedPort(output string) (string, string, error) {

@@ -129,6 +129,9 @@ The large server-side sync tables use compact internal identifiers such as `user
 
 ## Step 1: Start PostgreSQL
 
+Oversync supports PostgreSQL 16.x and 17.x. This example uses the maintained PostgreSQL 16
+compatibility lane.
+
 ```bash
 docker run --name oversync-pg \
   -e POSTGRES_PASSWORD=postgres \

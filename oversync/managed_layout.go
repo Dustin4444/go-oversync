@@ -123,7 +123,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.bundle_log.byte_count", Attribute: "ordinal", Value: "6"},
 		{Kind: "column", Identity: "sync.bundle_log.byte_count", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.bundle_log.byte_count", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "identity", Value: ""},
@@ -155,7 +155,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.bundle_log.source_bundle_id", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.bundle_log.source_bundle_id", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.bundle_log.source_bundle_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "identity", Value: ""},
@@ -201,7 +201,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.bundle_rows.payload_wire", Attribute: "identity", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_rows.payload_wire", Attribute: "not_null", Value: "false"},
 		{Kind: "column", Identity: "sync.bundle_rows.payload_wire", Attribute: "ordinal", Value: "7"},
-		{Kind: "column", Identity: "sync.bundle_rows.payload_wire", Attribute: "type", Value: "pg_catalog.\"json\""},
+		{Kind: "column", Identity: "sync.bundle_rows.payload_wire", Attribute: "type", Value: "pg_catalog.json"},
 		{Kind: "column", Identity: "sync.bundle_rows.payload_wire", Attribute: "typmod", Value: "-1"},
 		{Kind: "column", Identity: "sync.bundle_rows.row_ordinal", Attribute: "collation", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_rows.row_ordinal", Attribute: "default", Value: ""},
@@ -227,7 +227,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.bundle_rows.user_pk", Attribute: "ordinal", Value: "1"},
 		{Kind: "column", Identity: "sync.bundle_rows.user_pk", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.bundle_rows.user_pk", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "identity", Value: ""},
@@ -235,7 +235,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "ordinal", Value: "3"},
 		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.meta.layout_name", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.meta.protocol_label", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.meta.protocol_label", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.meta.protocol_label", Attribute: "default", Value: "'v1'::text"},
 		{Kind: "column", Identity: "sync.meta.protocol_label", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.meta.protocol_label", Attribute: "identity", Value: ""},
@@ -281,7 +281,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.push_session_rows.payload_apply", Attribute: "identity", Value: ""},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_apply", Attribute: "not_null", Value: "false"},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_apply", Attribute: "ordinal", Value: "7"},
-		{Kind: "column", Identity: "sync.push_session_rows.payload_apply", Attribute: "type", Value: "pg_catalog.\"json\""},
+		{Kind: "column", Identity: "sync.push_session_rows.payload_apply", Attribute: "type", Value: "pg_catalog.json"},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_apply", Attribute: "typmod", Value: "-1"},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "collation", Value: ""},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "default", Value: ""},
@@ -289,7 +289,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "identity", Value: ""},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "not_null", Value: "false"},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "ordinal", Value: "8"},
-		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "type", Value: "pg_catalog.\"json\""},
+		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "type", Value: "pg_catalog.json"},
 		{Kind: "column", Identity: "sync.push_session_rows.payload_request", Attribute: "typmod", Value: "-1"},
 		{Kind: "column", Identity: "sync.push_session_rows.push_id", Attribute: "collation", Value: ""},
 		{Kind: "column", Identity: "sync.push_session_rows.push_id", Attribute: "default", Value: ""},
@@ -315,7 +315,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.push_session_rows.table_id", Attribute: "ordinal", Value: "3"},
 		{Kind: "column", Identity: "sync.push_session_rows.table_id", Attribute: "type", Value: "pg_catalog.int4"},
 		{Kind: "column", Identity: "sync.push_session_rows.table_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "identity", Value: ""},
@@ -371,7 +371,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.push_sessions.source_bundle_id", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.push_sessions.source_bundle_id", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.push_sessions.source_bundle_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "identity", Value: ""},
@@ -443,7 +443,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.scope_state.initialized_at", Attribute: "ordinal", Value: "6"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_at", Attribute: "type", Value: "pg_catalog.timestamptz"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_at", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "identity", Value: ""},
@@ -451,7 +451,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "ordinal", Value: "7"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "identity", Value: ""},
@@ -505,7 +505,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.snapshot_session_rows.payload_wire", Attribute: "identity", Value: ""},
 		{Kind: "column", Identity: "sync.snapshot_session_rows.payload_wire", Attribute: "not_null", Value: "true"},
 		{Kind: "column", Identity: "sync.snapshot_session_rows.payload_wire", Attribute: "ordinal", Value: "6"},
-		{Kind: "column", Identity: "sync.snapshot_session_rows.payload_wire", Attribute: "type", Value: "pg_catalog.\"json\""},
+		{Kind: "column", Identity: "sync.snapshot_session_rows.payload_wire", Attribute: "type", Value: "pg_catalog.json"},
 		{Kind: "column", Identity: "sync.snapshot_session_rows.payload_wire", Attribute: "typmod", Value: "-1"},
 		{Kind: "column", Identity: "sync.snapshot_session_rows.wire_byte_count", Attribute: "collation", Value: ""},
 		{Kind: "column", Identity: "sync.snapshot_session_rows.wire_byte_count", Attribute: "default", Value: ""},
@@ -595,7 +595,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.source_state.max_committed_source_bundle_id", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.source_state.max_committed_source_bundle_id", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.source_state.max_committed_source_bundle_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "default", Value: "''::text"},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "identity", Value: ""},
@@ -603,7 +603,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "ordinal", Value: "5"},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "default", Value: "''::text"},
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "identity", Value: ""},
@@ -611,7 +611,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "ordinal", Value: "6"},
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "identity", Value: ""},
@@ -619,7 +619,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "ordinal", Value: "2"},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.source_state.state", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.source_state.state", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.source_state.state", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.state", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.state", Attribute: "identity", Value: ""},
@@ -635,7 +635,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.source_state.user_pk", Attribute: "ordinal", Value: "1"},
 		{Kind: "column", Identity: "sync.source_state.user_pk", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.source_state.user_pk", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "identity", Value: ""},
@@ -643,7 +643,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "ordinal", Value: "2"},
 		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.table_catalog.schema_name", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.table_catalog.sync_key_column", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.table_catalog.sync_key_column", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.table_catalog.sync_key_column", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.table_catalog.sync_key_column", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.table_catalog.sync_key_column", Attribute: "identity", Value: ""},
@@ -667,7 +667,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.table_catalog.table_id", Attribute: "ordinal", Value: "1"},
 		{Kind: "column", Identity: "sync.table_catalog.table_id", Attribute: "type", Value: "pg_catalog.int4"},
 		{Kind: "column", Identity: "sync.table_catalog.table_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.table_catalog.table_name", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.table_catalog.table_name", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.table_catalog.table_name", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.table_catalog.table_name", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.table_catalog.table_name", Attribute: "identity", Value: ""},
@@ -691,7 +691,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.user_state.retained_bundle_floor", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.user_state.retained_bundle_floor", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.user_state.retained_bundle_floor", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "collation", Value: "pg_catalog.\"default\""},
+		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "collation", Value: "pg_catalog.default"},
 		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "identity", Value: ""},
@@ -1347,7 +1347,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.bundle_log_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "access_method", Value: "btree"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
-		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.\\\"default\\\"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.3", Value: "{\"role\": \"key\", \"column\": \"source_bundle_id\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute_count", Value: "3"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "exclusion", Value: "false"},
@@ -1424,7 +1424,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.push_sessions_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "access_method", Value: "btree"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
-		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.\\\"default\\\"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.3", Value: "{\"role\": \"key\", \"column\": \"source_bundle_id\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute_count", Value: "3"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "exclusion", Value: "false"},
@@ -1517,7 +1517,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.snapshot_sessions_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "access_method", Value: "btree"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
-		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.\\\"default\\\"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute_count", Value: "2"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "exclusion", Value: "false"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "key_count", Value: "2"},
@@ -1568,8 +1568,8 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.table_catalog_pkey", Attribute: "unique", Value: "true"},
 		{Kind: "index", Identity: "sync.table_catalog_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "access_method", Value: "btree"},
-		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"schema_name\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.\\\"default\\\"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
-		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"table_name\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.\\\"default\\\"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"schema_name\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"table_name\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "attribute_count", Value: "2"},
 		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "exclusion", Value: "false"},
 		{Kind: "index", Identity: "sync.table_catalog_schema_table_key", Attribute: "key_count", Value: "2"},
@@ -1593,7 +1593,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.user_state_pkey", Attribute: "unique", Value: "true"},
 		{Kind: "index", Identity: "sync.user_state_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "access_method", Value: "btree"},
-		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.\\\"default\\\"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute_count", Value: "1"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "exclusion", Value: "false"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "key_count", Value: "1"},
@@ -2205,6 +2205,8 @@ func loadManagedLayoutVolatileFacts(ctx context.Context, q syncCatalogQuerier) (
 
 func loadManagedLayoutFactsSelected(ctx context.Context, q syncCatalogQuerier, volatileOnly bool) ([]managedLayoutFact, error) {
 	facts := make([]managedLayoutFact, 0, 512)
+	// Catalog paths are semantic fact identities, not executable SQL. Render
+	// their exact components without PostgreSQL's version-dependent %I quoting.
 	queries := []struct {
 		phase string
 		sql   string
@@ -2216,7 +2218,7 @@ SELECT 'namespace', 'sync', 'present', 'true'
 FROM pg_namespace
 WHERE nspname = 'sync'
 UNION ALL
-SELECT 'relation', format('%I.%I', namespace.nspname, relation.relname), attribute.name, attribute.value
+SELECT 'relation', format('%s.%s', namespace.nspname, relation.relname), attribute.name, attribute.value
 FROM pg_class AS relation
 JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
 CROSS JOIN LATERAL (
@@ -2237,7 +2239,7 @@ ORDER BY 1, 2, 3, 4`,
 			sql: `
 SELECT
   'column',
-  format('%I.%I.%I', namespace.nspname, relation.relname, attribute.attname),
+  format('%s.%s.%s', namespace.nspname, relation.relname, attribute.attname),
   fact.name,
   fact.value
 FROM pg_class AS relation
@@ -2256,13 +2258,13 @@ LEFT JOIN pg_namespace AS collation_namespace ON collation_namespace.oid = colla
 CROSS JOIN LATERAL (
   VALUES
     ('ordinal'::text, attribute.attnum::text),
-    ('type', format('%I.%I', type_namespace.nspname, type.typname)),
+    ('type', format('%s.%s', type_namespace.nspname, type.typname)),
     ('typmod', attribute.atttypmod::text),
     ('not_null', attribute.attnotnull::text),
     ('identity', attribute.attidentity::text),
     ('generated', attribute.attgenerated::text),
     ('default', COALESCE(pg_get_expr(default_value.adbin, default_value.adrelid), '')),
-    ('collation', CASE WHEN collation_entry.oid IS NULL THEN '' ELSE format('%I.%I', collation_namespace.nspname, collation_entry.collname) END)
+    ('collation', CASE WHEN collation_entry.oid IS NULL THEN '' ELSE format('%s.%s', collation_namespace.nspname, collation_entry.collname) END)
 ) AS fact(name, value)
 WHERE namespace.nspname = 'sync'
   AND relation.relkind IN ('r', 'p')
@@ -2275,7 +2277,7 @@ WITH constraint_details AS (
   SELECT
     constraint_entry.oid,
     constraint_entry.conrelid,
-    format('%I.%I.%I', namespace.nspname, relation.relname, constraint_entry.conname) AS identity,
+    format('%s.%s.%s', namespace.nspname, relation.relname, constraint_entry.conname) AS identity,
     constraint_entry.contype::text AS type,
     COALESCE((
       SELECT to_json(array_agg(attribute.attname ORDER BY key.ordinality))::text
@@ -2284,7 +2286,7 @@ WITH constraint_details AS (
         ON attribute.attrelid = constraint_entry.conrelid
        AND attribute.attnum = key.attnum
     ), '[]') AS columns,
-    CASE WHEN constraint_entry.confrelid = 0 THEN '' ELSE format('%I.%I', foreign_namespace.nspname, foreign_relation.relname) END AS referenced_table,
+    CASE WHEN constraint_entry.confrelid = 0 THEN '' ELSE format('%s.%s', foreign_namespace.nspname, foreign_relation.relname) END AS referenced_table,
     COALESCE((
       SELECT to_json(array_agg(attribute.attname ORDER BY key.ordinality))::text
       FROM unnest(constraint_entry.confkey) WITH ORDINALITY AS key(attnum, ordinality)
@@ -2331,8 +2333,8 @@ WITH index_details AS (
   SELECT
     index_relation.oid AS index_oid,
     index.indrelid AS table_oid,
-    format('%I.%I', index_namespace.nspname, index_relation.relname) AS identity,
-    format('%I.%I', table_namespace.nspname, table_relation.relname) AS table_identity,
+    format('%s.%s', index_namespace.nspname, index_relation.relname) AS identity,
+    format('%s.%s', table_namespace.nspname, table_relation.relname) AS table_identity,
     access_method.amname AS access_method,
     index.indisunique::text AS is_unique,
     index.indisprimary::text AS is_primary,
@@ -2378,8 +2380,8 @@ WITH index_details AS (
       'role', CASE WHEN position.ordinality <= index.indnkeyatts THEN 'key' ELSE 'include' END,
       'column', COALESCE(attribute.attname, ''),
 	  'expression', CASE WHEN position.attnum = 0 THEN pg_get_indexdef(index.indexrelid, position.ordinality::integer, false) ELSE '' END,
-      'collation', CASE WHEN collation_entry.oid IS NULL OR collation_entry.oid = 0 THEN '' ELSE format('%I.%I', collation_namespace.nspname, collation_entry.collname) END,
-      'opclass', CASE WHEN operator_class.oid IS NULL OR operator_class.oid = 0 THEN '' ELSE format('%I.%I', operator_namespace.nspname, operator_class.opcname) END,
+      'collation', CASE WHEN collation_entry.oid IS NULL OR collation_entry.oid = 0 THEN '' ELSE format('%s.%s', collation_namespace.nspname, collation_entry.collname) END,
+      'opclass', CASE WHEN operator_class.oid IS NULL OR operator_class.oid = 0 THEN '' ELSE format('%s.%s', operator_namespace.nspname, operator_class.opcname) END,
       'descending', ((position.options & 1) = 1),
       'nulls_first', ((position.options & 2) = 2)
     )::text AS value
@@ -2405,8 +2407,8 @@ ORDER BY 1, 2, 3, 4`,
 			sql: `
 WITH sequence_details AS (
   SELECT
-    format('%I.%I', namespace.nspname, relation.relname) AS identity,
-    format('%I.%I', type_namespace.nspname, type.typname) AS data_type,
+    format('%s.%s', namespace.nspname, relation.relname) AS identity,
+    format('%s.%s', type_namespace.nspname, type.typname) AS data_type,
     relation.relpersistence::text AS persistence,
     sequence.seqstart::text AS start_value,
     sequence.seqincrement::text AS increment,
@@ -2414,7 +2416,7 @@ WITH sequence_details AS (
     sequence.seqmin::text AS min_value,
     sequence.seqcache::text AS cache,
     sequence.seqcycle::text AS cycle,
-    CASE WHEN owner_attribute.attname IS NULL THEN '' ELSE format('%I.%I.%I', owner_namespace.nspname, owner_relation.relname, owner_attribute.attname) END AS owned_by
+    CASE WHEN owner_attribute.attname IS NULL THEN '' ELSE format('%s.%s.%s', owner_namespace.nspname, owner_relation.relname, owner_attribute.attname) END AS owned_by
   FROM pg_class AS relation
   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
   JOIN pg_sequence AS sequence ON sequence.seqrelid = relation.oid
@@ -2454,8 +2456,8 @@ ORDER BY 1, 2, 3, 4`,
 			sql: `
 WITH function_details AS (
   SELECT
-    format('%I.%I(%s)', namespace.nspname, procedure.proname, pg_get_function_identity_arguments(procedure.oid)) AS identity,
-    format('%I.%I', return_namespace.nspname, return_type.typname) AS return_type,
+    format('%s.%s(%s)', namespace.nspname, procedure.proname, pg_get_function_identity_arguments(procedure.oid)) AS identity,
+    format('%s.%s', return_namespace.nspname, return_type.typname) AS return_type,
     language.lanname AS language,
     procedure.provolatile::text AS volatility,
     procedure.proisstrict::text AS strict,
@@ -2492,8 +2494,8 @@ ORDER BY 1, 2, 3, 4`,
 			sql: `
 WITH trigger_details AS (
   SELECT
-    format('%I.%I.%I', table_namespace.nspname, relation.relname, trigger.tgname) AS identity,
-    format('%I.%I(%s)', function_namespace.nspname, procedure.proname, pg_get_function_identity_arguments(procedure.oid)) AS function_identity,
+    format('%s.%s.%s', table_namespace.nspname, relation.relname, trigger.tgname) AS identity,
+    format('%s.%s(%s)', function_namespace.nspname, procedure.proname, pg_get_function_identity_arguments(procedure.oid)) AS function_identity,
     trigger.tgenabled::text AS enabled,
     CASE
       WHEN (trigger.tgtype & 64) = 64 THEN 'instead_of'
@@ -2509,7 +2511,7 @@ WITH trigger_details AS (
     ) AS events,
     COALESCE(trigger.tgoldtable::text, '') AS old_transition,
     COALESCE(trigger.tgnewtable::text, '') AS new_transition,
-    CASE WHEN trigger.tgconstraint = 0 THEN '' ELSE format('%I.%I.%I', constraint_namespace.nspname, constraint_relation.relname, constraint_entry.conname) END AS constraint_identity,
+    CASE WHEN trigger.tgconstraint = 0 THEN '' ELSE format('%s.%s.%s', constraint_namespace.nspname, constraint_relation.relname, constraint_entry.conname) END AS constraint_identity,
     encode(trigger.tgargs, 'hex') AS arguments_hex
   FROM pg_trigger AS trigger
   JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
@@ -2547,7 +2549,7 @@ ORDER BY 1, 2, 3, 4`,
 			sql: `
 SELECT
   'rule',
-  format('%I.%I.%I', namespace.nspname, relation.relname, rule.rulename),
+  format('%s.%s.%s', namespace.nspname, relation.relname, rule.rulename),
   'definition',
   pg_get_ruledef(rule.oid, false)
 FROM pg_rewrite AS rule

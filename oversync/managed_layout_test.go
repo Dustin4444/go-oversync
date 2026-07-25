@@ -2,8 +2,10 @@ package oversync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -319,6 +321,131 @@ func TestBootstrap_FreshLayoutSelfValidates(t *testing.T) {
 	require.NoError(t, fixture.harness.pool.QueryRow(fixture.ctx, `SELECT COUNT(*) FROM sync.table_catalog`).Scan(&catalogCount))
 	require.Equal(t, 1, markerCount)
 	require.Equal(t, 1, catalogCount)
+}
+
+func TestBootstrap_ManagedLayoutSupportedPostgresVersions(t *testing.T) {
+	tests := []struct {
+		image string
+		major int
+	}{
+		{image: "postgres:16", major: 16},
+		{image: managedIntegrationPostgresImage, major: 17},
+	}
+	for _, test := range tests {
+		t.Run(strings.ReplaceAll(test.image, ":", "_"), func(t *testing.T) {
+			var (
+				server *managedIntegrationPostgresServer
+				err    error
+			)
+			if test.image == managedIntegrationPostgresImage {
+				server, err = getManagedIntegrationPostgres()
+			} else {
+				server, err = startManagedIntegrationPostgres(test.image)
+				if err == nil {
+					t.Cleanup(func() {
+						require.NoError(t, server.close())
+					})
+				}
+			}
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			t.Cleanup(cancel)
+			pool := newIntegrationTestPoolForServer(t, ctx, server)
+			var serverVersionNum int
+			require.NoError(t, pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::integer`).Scan(&serverVersionNum))
+			require.Equal(t, test.major, serverVersionNum/10000)
+
+			schemaName := fmt.Sprintf("managed_version_%d", test.major)
+			schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+			_, err = pool.Exec(ctx, fmt.Sprintf(`
+				CREATE SCHEMA %s;
+				CREATE TABLE %s.records (
+					id UUID NOT NULL,
+					_sync_scope_id TEXT NOT NULL,
+					payload TEXT NOT NULL,
+					CONSTRAINT records_owner_key UNIQUE (_sync_scope_id, id)
+				);
+				INSERT INTO %s.records (id, _sync_scope_id, payload)
+				VALUES ('5dc911f0-6b38-43a9-a247-ec910eac7bd1', 'managed-owner', 'original')
+			`, schemaIdent, schemaIdent, schemaIdent))
+			require.NoError(t, err)
+
+			config := &ServiceConfig{
+				MaxSupportedSchemaVersion: 1,
+				AppName:                   "managed-layout-version-" + strconv.Itoa(test.major),
+				RegisteredTables: []RegisteredTable{{
+					Schema:         schemaName,
+					Table:          "records",
+					SyncKeyColumns: []string{"id"},
+				}},
+			}
+			service, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = service.Close(context.Background()) })
+			require.NoError(t, service.Bootstrap(ctx))
+			require.NoError(t, service.validateManagedLayout(ctx, pool))
+
+			actualFacts, err := loadManagedLayoutFacts(ctx, pool)
+			require.NoError(t, err)
+			for _, identity := range []string{
+				"sync.bundle_rows.payload_wire",
+				"sync.push_session_rows.payload_apply",
+				"sync.push_session_rows.payload_request",
+				"sync.snapshot_session_rows.payload_wire",
+			} {
+				require.Equal(t, "pg_catalog.json", managedLayoutFactValue(t, actualFacts, "column", identity, "type"))
+			}
+			require.Equal(
+				t,
+				"pg_catalog.default",
+				managedLayoutFactValue(t, actualFacts, "column", "sync.meta.layout_name", "collation"),
+			)
+			var indexAttribute map[string]any
+			require.NoError(
+				t,
+				json.Unmarshal(
+					[]byte(managedLayoutFactValue(t, actualFacts, "index", "sync.user_state_user_id_key", "attribute.1")),
+					&indexAttribute,
+				),
+			)
+			require.Equal(t, "pg_catalog.default", indexAttribute["collation"])
+
+			second, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = second.Close(context.Background()) })
+			require.NoError(t, second.Bootstrap(ctx))
+
+			_, err = pool.Exec(ctx, `ALTER TABLE sync.snapshot_sessions ALTER COLUMN row_count TYPE integer`)
+			require.NoError(t, err)
+			drifted, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = drifted.Close(context.Background()) })
+			err = drifted.Bootstrap(ctx)
+			var schemaErr *UnsupportedSchemaError
+			require.ErrorAs(t, err, &schemaErr)
+			require.ErrorContains(t, err, "changed column sync.snapshot_sessions.row_count attribute type")
+			_, err = drifted.Connect(ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
+			require.ErrorIs(t, err, errServiceNotReady)
+		})
+	}
+}
+
+func managedLayoutFactValue(
+	t *testing.T,
+	facts []managedLayoutFact,
+	kind string,
+	identity string,
+	attribute string,
+) string {
+	t.Helper()
+	for _, fact := range facts {
+		if fact.Kind == kind && fact.Identity == identity && fact.Attribute == attribute {
+			return fact.Value
+		}
+	}
+	require.FailNowf(t, "managed layout fact missing", "%s %s attribute %s", kind, identity, attribute)
+	return ""
 }
 
 func TestManagedLayoutValidation_UsesFixedCatalogQueryCount(t *testing.T) {

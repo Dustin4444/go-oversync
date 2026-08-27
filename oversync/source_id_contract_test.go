@@ -38,3 +38,19 @@ func TestValidateSnapshotSourceReplacement_RejectsNormalizedOrNonASCIISourceIDs(
 		})
 	}
 }
+
+func TestValidateSnapshotSourceReplacement_RejectsReservedServerSources(t *testing.T) {
+	service := &SyncService{config: &ServiceConfig{ReservedServerSourceIDs: []string{"server-writer"}}}
+	_, err := service.validateSnapshotSourceReplacement(
+		Actor{UserID: "user-1", SourceID: "device-a"},
+		&SnapshotSourceReplacement{
+			PreviousSourceID: "device-a",
+			NewSourceID:      "server-writer",
+			Reason:           "history_pruned",
+		},
+	)
+	var invalidErr *SnapshotSessionInvalidError
+	require.ErrorAs(t, err, &invalidErr)
+	require.NotContains(t, invalidErr.Error(), "server-writer")
+	require.NotContains(t, invalidErr.Error(), "reserved")
+}

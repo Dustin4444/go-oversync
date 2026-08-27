@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -83,12 +82,15 @@ func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_
 }
 
 func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, actor Actor, req *SnapshotSessionCreateRequest) (_ *SnapshotSession, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "CreateSnapshotSession"); err != nil {
+		return nil, err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(false); err != nil {
+	if err := s.validateClientActor(actor, false); err != nil {
 		return nil, err
 	}
 	startedAt := time.Now()
@@ -111,12 +113,12 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 	}
 
 	var resp *SnapshotSession
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
 		if err := requireScopeInitializedQuerier(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
 
-		retainedState, err := loadRetainedHistoryStateByUserID(ctx, tx, actor.UserID)
+		retainedState, err := lockSnapshotRetainedHistoryState(ctx, tx, actor.UserID)
 		if err != nil {
 			return err
 		}
@@ -182,6 +184,19 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 	return resp, nil
 }
 
+func lockSnapshotRetainedHistoryState(ctx context.Context, tx pgx.Tx, userID string) (*retainedHistoryState, error) {
+	state, err := scanRetainedHistoryState(tx.QueryRow(ctx, `
+		SELECT user_pk, next_bundle_seq, retained_bundle_floor
+		FROM sync.user_state
+		WHERE user_id = $1
+		FOR UPDATE
+	`, userID))
+	if err != nil {
+		return nil, fmt.Errorf("lock retained history state for snapshot %q: %w", userID, err)
+	}
+	return state, nil
+}
+
 func tryAcquireSnapshotPermit(permits chan struct{}) bool {
 	select {
 	case permits <- struct{}{}:
@@ -192,20 +207,23 @@ func tryAcquireSnapshotPermit(permits chan struct{}) bool {
 }
 func releaseSnapshotPermit(permits chan struct{}) { <-permits }
 
-func validateSnapshotSourceReplacement(actor Actor, replacement *SnapshotSourceReplacement) (*SnapshotSourceReplacement, error) {
+func (s *SyncService) validateSnapshotSourceReplacement(actor Actor, replacement *SnapshotSourceReplacement) (*SnapshotSourceReplacement, error) {
 	if replacement == nil {
 		return nil, nil
 	}
 	clean := &SnapshotSourceReplacement{
 		PreviousSourceID: replacement.PreviousSourceID,
 		NewSourceID:      replacement.NewSourceID,
-		Reason:           strings.TrimSpace(replacement.Reason),
+		Reason:           replacement.Reason,
 	}
 	if err := sourceid.Validate(clean.PreviousSourceID); err != nil {
 		return nil, &SnapshotSessionInvalidError{Message: "previous_source_id is invalid"}
 	}
 	if err := sourceid.Validate(clean.NewSourceID); err != nil {
 		return nil, &SnapshotSessionInvalidError{Message: "new_source_id is invalid"}
+	}
+	if s.isReservedServerSourceID(clean.PreviousSourceID) || s.isReservedServerSourceID(clean.NewSourceID) {
+		return nil, &SnapshotSessionInvalidError{Message: "source replacement is invalid"}
 	}
 	if clean.PreviousSourceID != actor.SourceID {
 		return nil, &SnapshotSessionInvalidError{Message: "previous_source_id must match authenticated source_id"}
@@ -221,11 +239,15 @@ func validateSnapshotSourceReplacement(actor Actor, replacement *SnapshotSourceR
 	return clean, nil
 }
 
+func validateSnapshotSourceReplacement(actor Actor, replacement *SnapshotSourceReplacement) (*SnapshotSourceReplacement, error) {
+	return (*SyncService)(nil).validateSnapshotSourceReplacement(actor, replacement)
+}
+
 func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, req *SnapshotSessionCreateRequest) error {
 	if req == nil || req.SourceReplacement == nil {
 		return nil
 	}
-	replacement, err := validateSnapshotSourceReplacement(actor, req.SourceReplacement)
+	replacement, err := s.validateSnapshotSourceReplacement(actor, req.SourceReplacement)
 	if err != nil {
 		return err
 	}
@@ -444,6 +466,9 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, sn
 }
 
 func (s *SyncService) GetSnapshotChunk(ctx context.Context, actor Actor, snapshotID string, afterRowOrdinal int64, maxRows int, maxBytes int64) (_ *SnapshotChunkResponse, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "GetSnapshotChunk"); err != nil {
+		return nil, err
+	}
 	response, release, err := s.getSnapshotChunkWithLease(ctx, actor, snapshotID, afterRowOrdinal, maxRows, maxBytes)
 	if release != nil {
 		defer release()
@@ -536,7 +561,7 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 			release()
 		}
 	}()
-	if err := actor.validate(false); err != nil {
+	if err := s.validateClientActor(actor, false); err != nil {
 		return nil, release, err
 	}
 	if snapshotID == "" {
@@ -580,7 +605,7 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 	observation.selectionStartedAt = time.Now()
 
 	var resp *SnapshotChunkResponse
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
 		var (
 			sessionUserID     string
 			snapshotBundleSeq int64
@@ -693,19 +718,22 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 }
 
 func (s *SyncService) DeleteSnapshotSession(ctx context.Context, actor Actor, snapshotID string) (err error) {
+	if err := rejectRetryableCallbackContext(ctx, "DeleteSnapshotSession"); err != nil {
+		return err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return err
 	}
 	defer done()
-	if err := actor.validate(false); err != nil {
+	if err := s.validateClientActor(actor, false); err != nil {
 		return err
 	}
 	if snapshotID == "" {
 		return &SnapshotChunkInvalidError{Message: "snapshot_id must be provided"}
 	}
 
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
 		var sessionUserID string
 		if err := tx.QueryRow(ctx, `
 			SELECT us.user_id

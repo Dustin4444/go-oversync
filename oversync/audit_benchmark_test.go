@@ -404,6 +404,37 @@ func auditBenchmarkCaptureRows(
 	return "users", []string{"_sync_scope_id", "id", "name", "email"}, rows, inputBytes
 }
 
+func auditBenchmarkInsertStatement(table pgx.Identifier, columns []string, rows [][]any) (string, []any) {
+	columnSQL := make([]string, len(columns))
+	for index, column := range columns {
+		columnSQL[index] = pgx.Identifier{column}.Sanitize()
+	}
+	var statement strings.Builder
+	statement.WriteString("INSERT INTO ")
+	statement.WriteString(table.Sanitize())
+	statement.WriteString(" (")
+	statement.WriteString(strings.Join(columnSQL, ","))
+	statement.WriteString(") VALUES ")
+	arguments := make([]any, 0, len(rows)*len(columns))
+	parameter := 1
+	for rowIndex, row := range rows {
+		if rowIndex != 0 {
+			statement.WriteByte(',')
+		}
+		statement.WriteByte('(')
+		for columnIndex, value := range row {
+			if columnIndex != 0 {
+				statement.WriteByte(',')
+			}
+			fmt.Fprintf(&statement, "$%d", parameter)
+			parameter++
+			arguments = append(arguments, value)
+		}
+		statement.WriteByte(')')
+	}
+	return statement.String(), arguments
+}
+
 func auditBenchmarkPush(
 	ctx context.Context,
 	svc *SyncService,
@@ -644,20 +675,21 @@ func BenchmarkAuditDatabaseServerCapture(b *testing.B) {
 						)
 						inputBytesPerOp = inputBytes
 						tableIdent := pgx.Identifier{fixture.schemaName, tableName}
+						insertSQL, insertArgs := auditBenchmarkInsertStatement(tableIdent, columns, rows)
 						opCtx, cancelOp := context.WithTimeout(fixture.ctx, fixture.operationTimeout)
 						b.StartTimer()
 
 						result, err := manager.ExecWrite(
 							opCtx,
 							fixture.writer.UserID,
-							ScopeWriteOptions{WriterID: "server-capture"},
-							func(tx pgx.Tx) error {
-								copied, err := tx.CopyFrom(opCtx, tableIdent, columns, pgx.CopyFromRows(rows))
+							ScopeWriteOptions{WriterID: "server-capture", RetryableWriteOptions: retryableWriteOptionsForTest()},
+							func(ctx context.Context, tx DatabaseWriteTx) error {
+								tag, err := tx.Exec(ctx, insertSQL, insertArgs...)
 								if err != nil {
 									return err
 								}
-								if copied != int64(rowCount) {
-									return fmt.Errorf("captured COPY wrote %d rows, want %d", copied, rowCount)
+								if tag.RowsAffected() != int64(rowCount) {
+									return fmt.Errorf("captured insert wrote %d rows, want %d", tag.RowsAffected(), rowCount)
 								}
 								return nil
 							},
@@ -667,7 +699,7 @@ func BenchmarkAuditDatabaseServerCapture(b *testing.B) {
 						if err != nil {
 							auditBenchmarkFatalOperation(b, "server capture commit", fixture.operationTimeout, err)
 						}
-						if result.Bundle == nil || result.Bundle.RowCount != int64(rowCount) {
+						if result.Bundle.RowCount != int64(rowCount) {
 							b.Fatalf("captured bundle row count = %#v, want %d", result.Bundle, rowCount)
 						}
 						b.StartTimer()

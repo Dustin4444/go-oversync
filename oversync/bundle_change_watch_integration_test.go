@@ -211,6 +211,26 @@ func TestSubscribeBundleChanges_ImmediateEventWhenBehind(t *testing.T) {
 	require.Equal(t, bundle.BundleSeq, event.BundleSeq)
 }
 
+func TestBundleChangeSubscriberCountForTest_PreservesExactUserIdentity(t *testing.T) {
+	f := newBundleChangeWatchFixture(t, true)
+	plain := "exact-user-" + f.suffix
+	spaced := " " + plain + " "
+	mustInitializeEmptyScope(t, f.ctx, f.svc, plain, "plain-device")
+	mustInitializeEmptyScope(t, f.ctx, f.svc, spaced, "spaced-device")
+
+	watchCtx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+	_, err := f.svc.SubscribeBundleChanges(watchCtx, Actor{UserID: spaced, SourceID: "spaced-device"}, 0)
+	require.NoError(t, err)
+
+	plainCount, err := f.svc.BundleChangeSubscriberCountForTest(f.ctx, plain)
+	require.NoError(t, err)
+	spacedCount, err := f.svc.BundleChangeSubscriberCountForTest(f.ctx, spaced)
+	require.NoError(t, err)
+	require.Zero(t, plainCount)
+	require.Equal(t, 1, spacedCount)
+}
+
 func TestSubscribeBundleChanges_WakesOnCommittedBundle(t *testing.T) {
 	f := newBundleChangeWatchFixture(t, true)
 	actor := f.actor("committed", "device-a")
@@ -240,9 +260,9 @@ func TestSubscribeBundleChanges_DoesNotWakeOnRolledBackBundle(t *testing.T) {
 	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
 	require.NoError(t, err)
 
-	err = f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+	err = f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		tableIdent := pgx.Identifier{f.schemaName, "users"}.Sanitize()
-		_, execErr := tx.Exec(f.ctx, fmt.Sprintf(`INSERT INTO %s (_sync_scope_id, id, name, email) VALUES ($1, $2, $3, $4)`, tableIdent), actor.UserID, uuid.New(), "rollback", "rollback@example.com")
+		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (_sync_scope_id, id, name, email) VALUES ($1, $2, $3, $4)`, tableIdent), actor.UserID, uuid.New(), "rollback", "rollback@example.com")
 		require.NoError(t, execErr)
 		return errors.New("force rollback")
 	})
@@ -322,10 +342,11 @@ func TestBundleChangeNotify_NoCapturedChangesEmitsNoPostgresNotify(t *testing.T)
 	mustInitializeEmptyScope(t, f.ctx, f.svc, actor.UserID, actor.SourceID)
 	rawListener := acquireRawBundleChangeListener(t, f.ctx, f.pool, f.svc.effectiveBundleChangeWatchConfig())
 
-	err := f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+	err := f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		return nil
 	})
-	require.NoError(t, err)
+	var noChanges *ScopeWriteNoCapturedChangesError
+	require.ErrorAs(t, err, &noChanges)
 
 	assertNoRawBundleChangeNotification(t, rawListener)
 }

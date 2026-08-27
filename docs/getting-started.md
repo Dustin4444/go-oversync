@@ -393,6 +393,9 @@ Behavior to expect:
   structured results in addition to `error`.
 - `PushPending()` freezes one outbound snapshot, uploads it through push sessions, fetches the
   committed authoritative rows, and replays them locally.
+- if a push transaction returns `503 commit_outcome_unknown`, `PushPending()` retries from session
+  creation with the frozen source bundle ID and canonical request hash; an already-committed replay
+  converges without uploading the rows again
 - `Attach()` may return `retry_later` as a normal retriable lifecycle outcome before the client
   becomes attached.
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.

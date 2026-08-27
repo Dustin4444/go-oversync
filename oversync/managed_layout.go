@@ -123,7 +123,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.bundle_log.byte_count", Attribute: "ordinal", Value: "6"},
 		{Kind: "column", Identity: "sync.bundle_log.byte_count", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.bundle_log.byte_count", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "identity", Value: ""},
@@ -155,7 +155,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.bundle_log.source_bundle_id", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.bundle_log.source_bundle_id", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.bundle_log.source_bundle_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "identity", Value: ""},
@@ -315,7 +315,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.push_session_rows.table_id", Attribute: "ordinal", Value: "3"},
 		{Kind: "column", Identity: "sync.push_session_rows.table_id", Attribute: "type", Value: "pg_catalog.int4"},
 		{Kind: "column", Identity: "sync.push_session_rows.table_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "identity", Value: ""},
@@ -371,7 +371,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.push_sessions.source_bundle_id", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.push_sessions.source_bundle_id", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.push_sessions.source_bundle_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "identity", Value: ""},
@@ -443,7 +443,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.scope_state.initialized_at", Attribute: "ordinal", Value: "6"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_at", Attribute: "type", Value: "pg_catalog.timestamptz"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_at", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "identity", Value: ""},
@@ -451,7 +451,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "ordinal", Value: "7"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "identity", Value: ""},
@@ -595,7 +595,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.source_state.max_committed_source_bundle_id", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.source_state.max_committed_source_bundle_id", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.source_state.max_committed_source_bundle_id", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "default", Value: "''::text"},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "identity", Value: ""},
@@ -611,7 +611,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "ordinal", Value: "6"},
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "type", Value: "pg_catalog.text"},
 		{Kind: "column", Identity: "sync.source_state.retirement_reason", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "identity", Value: ""},
@@ -691,7 +691,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.user_state.retained_bundle_floor", Attribute: "ordinal", Value: "4"},
 		{Kind: "column", Identity: "sync.user_state.retained_bundle_floor", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.user_state.retained_bundle_floor", Attribute: "typmod", Value: "-1"},
-		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "collation", Value: "pg_catalog.default"},
+		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "collation", Value: "pg_catalog.C"},
 		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "generated", Value: ""},
 		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "identity", Value: ""},
@@ -1285,7 +1285,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "parallel", Value: "u"},
 		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "return_type", Value: "pg_catalog.trigger"},
 		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "security_definer", Value: "false"},
-		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "source.sha256", Value: "3304a5f48a65f815c501e633c7b8645acbd992ac54d6256d0b90c458f1df0049"},
+		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "source.sha256", Value: "654c42c0aadd39fd66de5e50a6098aacf3e42ae6db414558d5a75f2fd69208f0"},
 		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "strict", Value: "false"},
 		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "volatility", Value: "v"},
 		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "configuration", Value: "[]"},
@@ -1294,7 +1294,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "parallel", Value: "u"},
 		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "return_type", Value: "pg_catalog.trigger"},
 		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "security_definer", Value: "false"},
-		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "source.sha256", Value: "ea9676345ff44e0978f2621bfe215c2265dc3ed7d34cf88e9b55ebc850e67cd4"},
+		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "source.sha256", Value: "dd695ca6102b95fd5439ae2129bd0088af74bc22e009120ab1f5c6a41c5e6f17"},
 		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "strict", Value: "false"},
 		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "volatility", Value: "v"},
 		{Kind: "function", Identity: "sync.reject_registered_table_truncate()", Attribute: "configuration", Value: "[]"},
@@ -1347,7 +1347,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.bundle_log_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "access_method", Value: "btree"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
-		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.C\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.3", Value: "{\"role\": \"key\", \"column\": \"source_bundle_id\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute_count", Value: "3"},
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "exclusion", Value: "false"},
@@ -1424,7 +1424,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.push_sessions_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "access_method", Value: "btree"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
-		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.C\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.3", Value: "{\"role\": \"key\", \"column\": \"source_bundle_id\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute_count", Value: "3"},
 		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "exclusion", Value: "false"},
@@ -1517,7 +1517,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.snapshot_sessions_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "access_method", Value: "btree"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
-		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.2", Value: "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.C\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute_count", Value: "2"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "exclusion", Value: "false"},
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "key_count", Value: "2"},
@@ -1593,7 +1593,7 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "index", Identity: "sync.user_state_pkey", Attribute: "unique", Value: "true"},
 		{Kind: "index", Identity: "sync.user_state_pkey", Attribute: "valid", Value: "true"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "access_method", Value: "btree"},
-		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.default\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
+		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute.1", Value: "{\"role\": \"key\", \"column\": \"user_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.C\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute_count", Value: "1"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "exclusion", Value: "false"},
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "key_count", Value: "1"},
@@ -1846,6 +1846,7 @@ func (s *SyncService) expectedManagedLayoutFacts(
 		return nil, fmt.Errorf("no compiled managed layout manifest for %q", syncSchemaLayoutName)
 	}
 	facts := append([]managedLayoutFact(nil), compiled...)
+	facts = append(facts, retryableWriteManagedLayoutFacts...)
 	targets, err := loadRegisteredTableTriggerTargetInventory(ctx, q, s.config.RegisteredTables)
 	if err != nil {
 		return nil, err
@@ -2263,7 +2264,13 @@ CROSS JOIN LATERAL (
     ('not_null', attribute.attnotnull::text),
     ('identity', attribute.attidentity::text),
     ('generated', attribute.attgenerated::text),
-    ('default', COALESCE(pg_get_expr(default_value.adbin, default_value.adrelid), '')),
+    ('default', COALESCE(
+      CASE WHEN set_config('TimeZone', 'UTC', true) = 'UTC'
+        THEN pg_get_expr(default_value.adbin, default_value.adrelid)
+        ELSE NULL
+      END,
+      ''
+    )),
     ('collation', CASE WHEN collation_entry.oid IS NULL THEN '' ELSE format('%s.%s', collation_namespace.nspname, collation_entry.collname) END)
 ) AS fact(name, value)
 WHERE namespace.nspname = 'sync'
@@ -2300,7 +2307,11 @@ WITH constraint_details AS (
     constraint_entry.condeferrable::text AS deferrable,
     constraint_entry.condeferred::text AS initially_deferred,
     constraint_entry.convalidated::text AS validated,
-    CASE WHEN constraint_entry.contype = 'c' THEN pg_get_expr(constraint_entry.conbin, constraint_entry.conrelid) ELSE '' END AS expression
+    CASE
+      WHEN constraint_entry.contype = 'c' AND set_config('TimeZone', 'UTC', true) = 'UTC'
+        THEN pg_get_expr(constraint_entry.conbin, constraint_entry.conrelid)
+      ELSE ''
+    END AS expression
   FROM pg_constraint AS constraint_entry
   JOIN pg_class AS relation ON relation.oid = constraint_entry.conrelid
   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
@@ -2344,7 +2355,13 @@ WITH index_details AS (
     index.indislive::text AS is_live,
     index.indnkeyatts::text AS key_count,
     index.indnatts::text AS attribute_count,
-    COALESCE(pg_get_expr(index.indpred, index.indrelid), '') AS predicate
+    COALESCE(
+      CASE WHEN set_config('TimeZone', 'UTC', true) = 'UTC'
+        THEN pg_get_expr(index.indpred, index.indrelid)
+        ELSE NULL
+      END,
+      ''
+    ) AS predicate
   FROM pg_index AS index
   JOIN pg_class AS index_relation ON index_relation.oid = index.indexrelid
   JOIN pg_namespace AS index_namespace ON index_namespace.oid = index_relation.relnamespace
@@ -2379,7 +2396,11 @@ WITH index_details AS (
     jsonb_build_object(
       'role', CASE WHEN position.ordinality <= index.indnkeyatts THEN 'key' ELSE 'include' END,
       'column', COALESCE(attribute.attname, ''),
-	  'expression', CASE WHEN position.attnum = 0 THEN pg_get_indexdef(index.indexrelid, position.ordinality::integer, false) ELSE '' END,
+	  'expression', CASE
+	    WHEN position.attnum = 0 AND set_config('TimeZone', 'UTC', true) = 'UTC'
+	      THEN pg_get_indexdef(index.indexrelid, position.ordinality::integer, false)
+	    ELSE ''
+	  END,
       'collation', CASE WHEN collation_entry.oid IS NULL OR collation_entry.oid = 0 THEN '' ELSE format('%s.%s', collation_namespace.nspname, collation_entry.collname) END,
       'opclass', CASE WHEN operator_class.oid IS NULL OR operator_class.oid = 0 THEN '' ELSE format('%s.%s', operator_namespace.nspname, operator_class.opcname) END,
       'descending', ((position.options & 1) = 1),

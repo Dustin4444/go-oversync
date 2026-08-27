@@ -46,10 +46,19 @@ Typical usage:
 ```go
 scopeMgr := oversync.NewScopeManager(syncService, oversync.ScopeManagerConfig{})
 
+// Persist these with the logical command and reuse them after restart or an
+// unknown commit result. operationHash covers every value used by callback SQL.
+operationHash := sha256.Sum256(canonicalCommandBytes)
+
 _, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
 	WriterID: "admin-panel",
-}, func(tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `
+	RetryableWriteOptions: oversync.RetryableWriteOptions{
+		OperationID:         commandID,
+		OperationHash:       operationHash,
+		OperationValidUntil: commandValidUntil,
+	},
+}, func(callbackCtx context.Context, tx oversync.DatabaseWriteTx) error {
+	_, err := tx.Exec(callbackCtx, `
 		UPDATE business.users
 		SET name = $3
 		WHERE _sync_scope_id = $1
@@ -61,6 +70,18 @@ _, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
 
 That write is captured into the normal committed-bundle history and later reaches clients through
 ordinary pull or snapshot flows. There is no separate admin-only delivery path.
+
+The callback can run up to three times after definite rollback. Keep it database-only, use its
+supplied context and transaction, and do not publish external effects from it. Preserve the exact
+operation identity, hash, and deadline to resolve `oversync.CommitOutcomeUnknownError` by replay.
+Persist the deadline before the first attempt even when no receipt exists. The example server uses
+the unregistered `business.server_operation_deadlines` table for that application-owned record;
+rolled-back Oversync attempts therefore cannot cause a restart to generate a different deadline.
+`ScopeWriteResult.Bundle` is a durable summary and does not contain row payloads.
+
+If the server reserves a trusted writer ID, pass the same exact set to both
+`server.ServerConfig.ReservedServerSourceIDs` and the underlying Sync service/actor boundary. Client
+requests using a reserved source are rejected without exposing the configured set.
 
 ## Run
 

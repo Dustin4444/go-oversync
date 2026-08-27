@@ -12,7 +12,7 @@ var ErrInvalid = errors.New("source id must be a non-empty visible ASCII token")
 
 // Validate requires value to match [!-~]+ exactly.
 func Validate(value string) error {
-	if value == "" {
+	if value == "" || len(value) > 256 {
 		return ErrInvalid
 	}
 	for index := 0; index < len(value); index++ {

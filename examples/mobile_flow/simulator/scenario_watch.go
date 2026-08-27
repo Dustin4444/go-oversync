@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mobiletoly/go-oversync/examples/mobile_flow/config"
 	serverpkg "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
@@ -233,9 +233,29 @@ func (s *WatchServerOriginatedScenario) Execute(ctx context.Context) error {
 	defer pool.Close()
 	defer func() { _ = service.Close(context.Background()) }()
 
-	s.rowID = uuid.New()
+	s.rowID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("go-oversync.mobile-flow.watch-server-originated.v1\x00"+s.harness.userID))
 	scopeMgr := oversync.NewScopeManager(service, oversync.ScopeManagerConfig{Logger: logger})
-	result, err := scopeMgr.ExecWrite(ctx, s.harness.userID, oversync.ScopeWriteOptions{WriterID: "mobile-flow-server-originated"}, func(tx pgx.Tx) error {
+	logicalRequest, err := json.Marshal(struct {
+		ScopeID string    `json:"scope_id"`
+		RowID   uuid.UUID `json:"row_id"`
+		Name    string    `json:"name"`
+		Email   string    `json:"email"`
+	}{s.harness.userID, s.rowID, "Watch Server Ada", "watch.server.ada@example.com"})
+	if err != nil {
+		return fmt.Errorf("encode server-originated operation identity: %w", err)
+	}
+	operationValidUntil, err := serverpkg.LoadOrCreateOperationDeadline(ctx, pool, "business", s.rowID, 24*time.Hour)
+	if err != nil {
+		return fmt.Errorf("load or create stable server-originated operation deadline: %w", err)
+	}
+	result, err := scopeMgr.ExecWrite(ctx, s.harness.userID, oversync.ScopeWriteOptions{
+		WriterID: "mobile-flow-server-originated",
+		RetryableWriteOptions: oversync.RetryableWriteOptions{
+			OperationID:         s.rowID,
+			OperationHash:       sha256.Sum256(logicalRequest),
+			OperationValidUntil: operationValidUntil,
+		},
+	}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO business.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -245,7 +265,7 @@ func (s *WatchServerOriginatedScenario) Execute(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("server-originated write: %w", err)
 	}
-	if result == nil || result.Bundle == nil {
+	if result == nil || result.Bundle.BundleSeq <= 0 {
 		return fmt.Errorf("server-originated write produced no committed bundle")
 	}
 

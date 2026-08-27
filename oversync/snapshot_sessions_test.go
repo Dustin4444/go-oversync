@@ -331,7 +331,7 @@ func TestSnapshotSessions_MultiTableSnapshotUsesDeterministicTableOrder(t *testi
 	require.Equal(t, []string{"files", "users"}, []string{rows[0].Table, rows[1].Table})
 }
 
-func TestSnapshotSessions_RepeatableReadFenceHasNoSnapshotPullGap(t *testing.T) {
+func TestSnapshotSessions_ReadCommittedFenceHasNoSnapshotPullGap(t *testing.T) {
 	fixture := newSnapshotSessionFixture(t, "visibility_fence", snapshotSessionFixtureOptions{})
 	beforeID, afterID := uuid.New(), uuid.New()
 	before := fixture.pushUser(t, 1, beforeID, "Before")
@@ -362,6 +362,41 @@ func TestSnapshotSessions_RepeatableReadFenceHasNoSnapshotPullGap(t *testing.T) 
 	require.Len(t, pull.Bundles, 1)
 	require.Equal(t, after.BundleSeq, pull.Bundles[0].BundleSeq)
 	require.Equal(t, afterID.String(), pull.Bundles[0].Rows[0].Key["id"])
+}
+
+func TestSnapshotSessions_CreateUsesRequiredMutationTransactionModes(t *testing.T) {
+	fixture := newSnapshotSessionFixture(t, "mutation_modes", snapshotSessionFixtureOptions{})
+	fixture.pushUser(t, 1, uuid.New(), "Before")
+
+	_, err := fixture.pool.Exec(fixture.ctx, `
+		CREATE OR REPLACE FUNCTION sync.assert_snapshot_mutation_modes()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $function$
+		BEGIN
+			IF current_setting('transaction_isolation') <> 'read committed'
+			   OR current_setting('transaction_read_only') <> 'off'
+			   OR current_setting('transaction_deferrable') <> 'off' THEN
+				RAISE EXCEPTION 'unexpected snapshot transaction modes: isolation=%, read_only=%, deferrable=%',
+					current_setting('transaction_isolation'),
+					current_setting('transaction_read_only'),
+					current_setting('transaction_deferrable');
+			END IF;
+			RETURN NEW;
+		END;
+		$function$;
+		CREATE TRIGGER assert_snapshot_mutation_modes
+		BEFORE INSERT ON sync.snapshot_sessions
+		FOR EACH ROW EXECUTE FUNCTION sync.assert_snapshot_mutation_modes();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = fixture.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS assert_snapshot_mutation_modes ON sync.snapshot_sessions`)
+		_, _ = fixture.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS sync.assert_snapshot_mutation_modes()`)
+	})
+
+	_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	require.NoError(t, err)
 }
 
 func TestSnapshotSessions_OneChunkStillUsesSessionStorage(t *testing.T) {
@@ -639,8 +674,8 @@ func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
 
 	fixture.pushUserAs(t, actor, 1, row1, "Alpha")
 	fixture.pushUserAs(t, actor, 2, row2, "Gamma")
-	require.NoError(t, fixture.svc.WithinSyncBundle(fixture.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 3}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(fixture.ctx, fmt.Sprintf(`DELETE FROM %s.users WHERE id = $1`, fixture.schemaName), row2)
+	require.NoError(t, fixture.svc.WithinSyncBundle(fixture.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 3}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.users WHERE id = $1`, fixture.schemaName), row2)
 		return err
 	}))
 
@@ -1025,7 +1060,14 @@ func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T
 
 	session := fixture.createSessionWithUser(t, rowID, "Alpha")
 
-	_, err := fixture.pool.Exec(fixture.ctx, `
+	conn, err := fixture.pool.Acquire(fixture.ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = conn.Exec(context.Background(), `DROP TRIGGER IF EXISTS reject_snapshot_session_updates ON sync.snapshot_sessions`)
+		conn.Release()
+	})
+
+	_, err = conn.Exec(fixture.ctx, `
 		CREATE OR REPLACE FUNCTION pg_temp.reject_snapshot_session_updates()
 		RETURNS trigger
 		LANGUAGE plpgsql
@@ -1036,16 +1078,13 @@ func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T
 		$$
 	`)
 	require.NoError(t, err)
-	_, err = fixture.pool.Exec(fixture.ctx, `
+	_, err = conn.Exec(fixture.ctx, `
 		CREATE TRIGGER reject_snapshot_session_updates
 		BEFORE UPDATE ON sync.snapshot_sessions
 		FOR EACH ROW
 		EXECUTE FUNCTION pg_temp.reject_snapshot_session_updates()
 	`)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, _ = fixture.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS reject_snapshot_session_updates ON sync.snapshot_sessions`)
-	})
 
 	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)

@@ -46,6 +46,13 @@ Authoritative replication state:
 - `sync.bundle_rows`: retained committed row effects using compact `table_id`, `key_bytes`, and
   `op_code`
 
+Server-originated write authority:
+
+- `sync.scope_write_receipts`: bounded durable operation receipts that own concurrent admission and
+  exact replay of committed server-originated writes
+- `sync.server_source_reservations`: configured server-writer identities and permanent `ever_used`
+  tombstones that prevent an exercised server source from becoming a client source
+
 Transport and lifecycle state:
 
 - `sync.scope_state`: durable first-connect authority state keyed by `user_pk`
@@ -138,6 +145,12 @@ If your application writes registered PostgreSQL tables outside client push hand
 That topic has enough runtime detail to deserve its own page. See
 [Server-Originated Writes]({{ site.baseurl }}/documentation/server-originated-writes/).
 
+Both APIs use an explicitly retryable database-only callback and durable operation receipts.
+Callbacks must use their supplied context and restricted transaction, contain no external effects,
+and preserve a stable logical operation hash and deadline across retries and process restarts. Scope
+writes also require a stable operation UUID. The linked page documents replay and unknown-commit
+outcomes.
+
 ## Registered Table Requirements
 
 Registered PostgreSQL tables must satisfy these rules before bootstrap:
@@ -229,8 +242,8 @@ This fast path trusts PostgreSQL's committed durability. Ordinary direct registe
 without bundle context and every registered-table `TRUNCATE` remain rejected, but privileged guard
 bypass or direct managed-row edits are unsupported. Bootstrap does not detect or repair those data
 mutations. Stop all Oversync instances and restore a known coherent backup or follow a separately
-reviewed operator procedure. This validation adds no wire, checkpoint, snapshot, bundle, or client
-durable-state version.
+reviewed operator procedure. Every instance sharing a database must use the same managed-layout
+contract and configuration; incompatible binaries fail closed during layout validation.
 
 ## Auth Contract
 
@@ -239,7 +252,10 @@ The handlers expect the host application to authenticate first and place
 
 The built-in transport helper is `oversync.ActorMiddleware(...)`, which reads
 `Oversync-Source-ID` after the host auth layer has already established trusted `user_id` in
-request context.
+request context. It preserves that trusted user ID byte-for-byte. Configure the same exact
+`ReservedServerSourceIDs` set on `ServiceConfig` and `ActorMiddlewareConfig`; client actor and source
+replacement inputs using a reserved trusted-writer ID are rejected as ordinary invalid SourceIDs
+without enumerating the set.
 
 `_sync_scope_id` is derived from `Actor.UserID`, enforced only on the authoritative PostgreSQL
 side, and excluded from client-visible payloads, conflicts, pulls, and snapshots.

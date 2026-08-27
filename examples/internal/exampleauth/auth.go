@@ -31,7 +31,7 @@ func (a *TokenAuth) GenerateToken(userID string, expiration time.Duration) (stri
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			NotBefore: jwt.NewNumericDate(time.Now()),
 			Issuer:    "go-oversync-examples",
-			Subject:   strings.TrimSpace(userID),
+			Subject:   userID,
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -52,7 +52,7 @@ func (a *TokenAuth) ValidateToken(tokenString string) (*Claims, error) {
 	if !ok || !token.Valid {
 		return nil, fmt.Errorf("invalid token")
 	}
-	if strings.TrimSpace(claims.Subject) == "" {
+	if claims.Subject == "" {
 		return nil, fmt.Errorf("missing sub (user ID) in token")
 	}
 	return claims, nil
@@ -80,10 +80,10 @@ func (a *TokenAuth) Middleware(next http.Handler) http.Handler {
 }
 
 func WithUserID(ctx context.Context, userID string) context.Context {
-	return context.WithValue(ctx, contextUserIDKey{}, strings.TrimSpace(userID))
+	return context.WithValue(ctx, contextUserIDKey{}, userID)
 }
 
 func UserIDFromContext(ctx context.Context) (string, bool) {
 	userID, ok := ctx.Value(contextUserIDKey{}).(string)
-	return strings.TrimSpace(userID), ok
+	return userID, ok
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,19 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+func TestHTTPSyncHandlers_WritePushTransactionFailurePreservesCommitAmbiguity(t *testing.T) {
+	h := NewHTTPSyncHandlers(nil, slog.Default())
+	rec := httptest.NewRecorder()
+
+	handled := h.writePushTransactionFailure(rec, &CommitOutcomeUnknownError{Err: errors.New("lost commit response")})
+
+	require.True(t, handled)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	response := decodeErrorResponse(t, rec)
+	require.Equal(t, "commit_outcome_unknown", response.Error)
+	require.Equal(t, "Push transaction commit outcome is unknown; restart push session creation with the same source tuple", response.Message)
+}
 
 func TestSyncService_GetCapabilities(t *testing.T) {
 	svc := &SyncService{

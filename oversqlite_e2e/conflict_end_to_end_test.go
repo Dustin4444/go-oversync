@@ -74,8 +74,8 @@ func (f *userConflictFixture) serverUpdateNameInBundle(t *testing.T, sourceBundl
 	require.NoError(t, f.server.SyncService.WithinSyncBundle(f.ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
 		SourceBundleID: sourceBundleID,
-	}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(f.ctx, fmt.Sprintf(`
+	}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
 			SET name = $2
 			WHERE id = $1

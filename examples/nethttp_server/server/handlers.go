@@ -29,6 +29,7 @@ func InitializeApplicationTables(ctx context.Context, pool *pgxpool.Pool, logger
 		filesTable := qualifiedTable(schema, "files")
 		fileReviewsTable := qualifiedTable(schema, "file_reviews")
 		typedRowsTable := qualifiedTable(schema, "typed_rows")
+		operationDeadlinesTable := qualifiedTable(schema, "server_operation_deadlines")
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schemaName)); err != nil {
 			return fmt.Errorf("failed to create business schema: %w", err)
@@ -174,8 +175,21 @@ CREATE TABLE IF NOT EXISTS %s (
 	created_at TIMESTAMPTZ NULL,
 	PRIMARY KEY (_sync_scope_id, id)
 )
-`, typedRowsTable)); err != nil {
+	`, typedRowsTable)); err != nil {
 			return fmt.Errorf("failed to create typed_rows table: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s (
+	operation_id UUID PRIMARY KEY,
+	operation_valid_until TIMESTAMPTZ NOT NULL,
+	CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+	CHECK (isfinite(operation_valid_until)),
+	CHECK (operation_valid_until >= '0001-01-01 00:00:00+00'::timestamptz
+	       AND operation_valid_until < '10000-01-01 00:00:00+00'::timestamptz)
+)
+`, operationDeadlinesTable)); err != nil {
+			return fmt.Errorf("failed to create server operation deadline table: %w", err)
 		}
 
 		logger.Info("Initialized business schema and tables", "schema", schema)

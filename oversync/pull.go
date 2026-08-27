@@ -18,6 +18,9 @@ func (s *SyncService) ProcessPull(
 	maxBundles int,
 	targetBundleSeq int64,
 ) (resp *PullResponse, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "ProcessPull"); err != nil {
+		return nil, err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
@@ -27,7 +30,7 @@ func (s *SyncService) ProcessPull(
 	defer func() {
 		s.observeStageErr(ctx, "pull", "total", totalStart, maxBundles, 0, err)
 	}()
-	if err := actor.validate(false); err != nil {
+	if err := s.validateClientActor(actor, false); err != nil {
 		return nil, err
 	}
 	if maxBundles <= 0 {
@@ -45,7 +48,7 @@ func (s *SyncService) ProcessPull(
 
 	var txResp *PullResponse
 	txStart := s.stageStart()
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
 		var txErr error
 		txResp, txErr = s.processPullQuerier(ctx, tx, actor.UserID, afterBundleSeq, maxBundles, targetBundleSeq)
 		return txErr
@@ -180,7 +183,10 @@ func (s *SyncService) recordHistoryPrunedError(ctx context.Context) error {
 	if s == nil || s.pool == nil {
 		return nil
 	}
-	_, err := s.pool.Exec(ctx, `SELECT nextval('sync.history_pruned_error_seq')`)
+	err := pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `SELECT nextval('sync.history_pruned_error_seq')`)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("record history_pruned event: %w", err)
 	}

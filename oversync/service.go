@@ -161,14 +161,18 @@ type SyncService struct {
 	closedCh           chan struct{}
 	closeOnce          sync.Once
 
-	snapshotBuildPermits   chan struct{}
-	snapshotChunkPermits   chan struct{}
-	snapshotCleanupMu      sync.Mutex
-	snapshotCleanupCancel  context.CancelFunc
-	snapshotCleanupDone    chan struct{}
-	snapshotCleanupTrigger chan string
-	snapshotMetrics        snapshotRuntimeMetrics
-	snapshotHooks          *snapshotTestHooks
+	snapshotBuildPermits       chan struct{}
+	snapshotChunkPermits       chan struct{}
+	snapshotCleanupMu          sync.Mutex
+	snapshotCleanupCancel      context.CancelFunc
+	snapshotCleanupDone        chan struct{}
+	snapshotCleanupTrigger     chan string
+	scopeReceiptCleanupMu      sync.Mutex
+	scopeReceiptCleanupCancel  context.CancelFunc
+	scopeReceiptCleanupDone    chan struct{}
+	scopeReceiptCleanupTrigger chan string
+	snapshotMetrics            snapshotRuntimeMetrics
+	snapshotHooks              *snapshotTestHooks
 }
 
 type snapshotTestHooks struct {
@@ -189,6 +193,9 @@ type ServiceConfig struct {
 	MaxSupportedSchemaVersion int               // Current schema version to return
 	AppName                   string            // Application name for connection tracking
 	RegisteredTables          []RegisteredTable // Schema.table combinations allowed for sync (required)
+	// ReservedServerSourceIDs is the exact frozen set of SourceIDs rejected at
+	// client boundaries and available to trusted ScopeManager writes.
+	ReservedServerSourceIDs []string
 
 	MaxRowsPerBundle  int // Maximum number of row effects allowed in one committed bundle (0 = unlimited)
 	MaxBytesPerBundle int // Maximum JSON payload size allowed in one committed bundle (0 = unlimited)
@@ -448,6 +455,14 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 	if logger == nil {
 		logger = slog.Default()
 	}
+	configCopy := *config
+	configCopy.RegisteredTables = append([]RegisteredTable(nil), config.RegisteredTables...)
+	configCopy.ReservedServerSourceIDs = append([]string(nil), config.ReservedServerSourceIDs...)
+	configCopy.DependencyOverrides = cloneDependencyOverrides(config.DependencyOverrides)
+	config = &configCopy
+	if err := validateReservedServerSourceIDs(config.ReservedServerSourceIDs); err != nil {
+		return nil, err
+	}
 	normalizedWatchConfig, err := normalizeBundleChangeWatchConfig(config.BundleChangeWatch)
 	if err != nil {
 		return nil, err
@@ -458,20 +473,21 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 	}
 
 	service := &SyncService{
-		pool:                   pool,
-		logger:                 logger,
-		config:                 config,
-		bundleChangeHub:        newBundleChangeHub(),
-		registeredTables:       make(map[string]bool),
-		registeredTableInfo:    make(map[string]registeredTableRuntimeInfo),
-		registeredTableByID:    make(map[int32]registeredTableRuntimeInfo),
-		columnTypesByTable:     make(map[string]map[string]string),
-		lifecycle:              serviceLifecycleRunning,
-		bootstrapReadiness:     bootstrapReadinessNotReady,
-		closedCh:               make(chan struct{}),
-		snapshotBuildPermits:   make(chan struct{}, config.MaxConcurrentSnapshotBuilds),
-		snapshotChunkPermits:   make(chan struct{}, config.MaxConcurrentSnapshotChunkRequests),
-		snapshotCleanupTrigger: make(chan string, 1),
+		pool:                       pool,
+		logger:                     logger,
+		config:                     config,
+		bundleChangeHub:            newBundleChangeHub(),
+		registeredTables:           make(map[string]bool),
+		registeredTableInfo:        make(map[string]registeredTableRuntimeInfo),
+		registeredTableByID:        make(map[int32]registeredTableRuntimeInfo),
+		columnTypesByTable:         make(map[string]map[string]string),
+		lifecycle:                  serviceLifecycleRunning,
+		bootstrapReadiness:         bootstrapReadinessNotReady,
+		closedCh:                   make(chan struct{}),
+		snapshotBuildPermits:       make(chan struct{}, config.MaxConcurrentSnapshotBuilds),
+		snapshotChunkPermits:       make(chan struct{}, config.MaxConcurrentSnapshotChunkRequests),
+		snapshotCleanupTrigger:     make(chan string, 1),
+		scopeReceiptCleanupTrigger: make(chan string, 1),
 	}
 
 	// Initialize registered tables set and handlers
@@ -490,6 +506,9 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 // Topology is prepared at bootstrap time and is restart-only for now; runtime schema changes are
 // not re-discovered automatically by SyncService.
 func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
+	if err := rejectRetryableCallbackContext(ctx, "Bootstrap"); err != nil {
+		return err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -510,6 +529,8 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 	defer func() {
 		s.finishBootstrap(succeeded)
 		if succeeded {
+			s.startScopeReceiptCleanupWorker()
+			s.requestScopeReceiptCleanup("post_bootstrap")
 			s.startSnapshotCleanupWorker()
 			s.requestSnapshotCleanup("post_bootstrap")
 			s.logger.Info("Sync bootstrap completed", "duration", time.Since(startedAt), "registered_table_count", len(s.config.RegisteredTables), "bootstrap_mode", bootstrapMode)
@@ -534,6 +555,10 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
 		return err
 	}
+	if err := s.validateIdentityCollations(ctx, s.pool); err != nil {
+		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
+		return err
+	}
 	if err := s.discoverSchemaRelationships(ctx); err != nil {
 		err = fmt.Errorf("failed to discover schema relationships: %w", err)
 		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
@@ -545,7 +570,7 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 	if err := runRetryableTx(ctx, 3, 50*time.Millisecond, func() error {
 		attempt++
 		currentAttempt := attempt
-		return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		return pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
 			lockStartedAt := s.stageStart()
 			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, syncBootstrapLockKey); err != nil {
 				err = fmt.Errorf("acquire sync bootstrap lock: %w", err)
@@ -566,6 +591,10 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
 				return err
 			}
+			if err := s.validateIdentityCollations(ctx, tx); err != nil {
+				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+				return err
+			}
 			expectedCatalog, err := s.expectedTableCatalogRows()
 			if err != nil {
 				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
@@ -579,6 +608,9 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 			if existingLayout {
 				if err := s.validateManagedLayout(ctx, tx); err != nil {
 					s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+					return err
+				}
+				if err := s.validateServerSourceReservations(ctx, tx); err != nil {
 					return err
 				}
 				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
@@ -611,6 +643,12 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 			if err := s.createFreshSyncLayoutInTx(ctx, tx); err != nil {
 				s.logger.Error("Failed to initialize database schema", "error", err)
 				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+				return err
+			}
+			if err := s.installServerSourceReservations(ctx, tx); err != nil {
+				return err
+			}
+			if err := s.validateIdentityCollations(ctx, tx); err != nil {
 				return err
 			}
 			if err := s.installRegisteredTableCaptureTriggersInTx(ctx, tx); err != nil {
@@ -1148,6 +1186,9 @@ func isBuiltInNumericWireType(typeSchema, typeName string) bool {
 // It rejects new runtime operations, waits for in-flight work to drain, and is safe to call multiple times.
 // Note: This does NOT close the database pool - the caller is responsible for pool lifecycle.
 func (s *SyncService) Close(ctx context.Context) error {
+	if err := rejectRetryableCallbackContext(ctx, "Close"); err != nil {
+		return err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1157,17 +1198,18 @@ func (s *SyncService) Close(ctx context.Context) error {
 	case serviceLifecycleClosed:
 		s.closeServiceSignalLocked()
 		s.mu.Unlock()
-		return s.waitSnapshotCleanupWorker(ctx)
+		return s.waitSyncMaintenanceWorkers(ctx)
 	case serviceLifecycleRunning:
 		s.logger.Debug("Shutting down sync service")
 		s.lifecycle = serviceLifecycleShuttingDown
 		s.stopSnapshotCleanupWorker()
+		s.stopScopeReceiptCleanupWorker()
 		if s.inFlightOps == 0 {
 			s.lifecycle = serviceLifecycleClosed
 			s.closeServiceSignalLocked()
 			s.mu.Unlock()
 			s.logger.Debug("Sync service shutdown complete")
-			return s.waitSnapshotCleanupWorker(ctx)
+			return s.waitSyncMaintenanceWorkers(ctx)
 		}
 		if s.drainedCh == nil {
 			s.drainedCh = make(chan struct{})
@@ -1177,7 +1219,7 @@ func (s *SyncService) Close(ctx context.Context) error {
 			s.lifecycle = serviceLifecycleClosed
 			s.closeServiceSignalLocked()
 			s.mu.Unlock()
-			return s.waitSnapshotCleanupWorker(ctx)
+			return s.waitSyncMaintenanceWorkers(ctx)
 		}
 		if s.drainedCh == nil {
 			s.drainedCh = make(chan struct{})
@@ -1189,7 +1231,7 @@ func (s *SyncService) Close(ctx context.Context) error {
 	select {
 	case <-drainedCh:
 		s.logger.Debug("Sync service shutdown complete")
-		return s.waitSnapshotCleanupWorker(ctx)
+		return s.waitSyncMaintenanceWorkers(ctx)
 	case <-ctx.Done():
 		return fmt.Errorf("wait for in-flight operations to drain: %w", ctx.Err())
 	}
@@ -1388,6 +1430,9 @@ func (s *SyncService) operationalInvariantStats(ctx context.Context) (*operation
 
 // GetStatus returns the current service lifecycle and bundle-era operability snapshot.
 func (s *SyncService) GetStatus(ctx context.Context) (*StatusResponse, error) {
+	if err := rejectRetryableCallbackContext(ctx, "GetStatus"); err != nil {
+		return nil, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

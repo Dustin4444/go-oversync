@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
@@ -126,8 +125,8 @@ func TestScopeManager_ServerOriginatedWritesPullToRealClient(t *testing.T) {
 	rowID := uuid.New()
 
 	firstResult, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-		WriterID: "admin-panel",
-	}, func(tx pgx.Tx) error {
+		WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest(),
+	}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO business.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -147,8 +146,8 @@ func TestScopeManager_ServerOriginatedWritesPullToRealClient(t *testing.T) {
 	require.Equal(t, "Server Ada", name)
 
 	secondResult, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-		WriterID: "admin-panel",
-	}, func(tx pgx.Tx) error {
+		WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest(),
+	}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, `
 			UPDATE business.users
 			SET name = $3
@@ -189,8 +188,8 @@ func TestScopeManager_ServerOriginatedWritesRemainScopeIsolatedForRealClients(t 
 	require.NoError(t, err)
 
 	_, err = scopeMgr.ExecWrite(ctx, scopeA, oversync.ScopeWriteOptions{
-		WriterID: "admin-panel",
-	}, func(tx pgx.Tx) error {
+		WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest(),
+	}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO business.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -228,8 +227,8 @@ func TestScopeManager_FailedServerWriteDoesNotReachRealClient(t *testing.T) {
 	rowID := uuid.New()
 	writeErr := fmt.Errorf("synthetic failure")
 	_, err = scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-		WriterID: "admin-panel",
-	}, func(tx pgx.Tx) error {
+		WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest(),
+	}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO business.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -263,8 +262,8 @@ func TestScopeManager_ServerOriginatedWritesFollowNormalPullFlowOverTime(t *test
 	postID := uuid.New()
 
 	firstResult, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-		WriterID: "admin-panel",
-	}, func(tx pgx.Tx) error {
+		WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest(),
+	}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO business.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -291,8 +290,8 @@ func TestScopeManager_ServerOriginatedWritesFollowNormalPullFlowOverTime(t *test
 	require.Equal(t, 1, postCount)
 
 	secondResult, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-		WriterID: "admin-panel",
-	}, func(tx pgx.Tx) error {
+		WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest(),
+	}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, `
 			UPDATE business.users
 			SET name = $3

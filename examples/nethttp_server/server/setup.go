@@ -32,6 +32,7 @@ type ServerConfig struct {
 	Logger                             *slog.Logger
 	AppName                            string
 	BusinessSchema                     string
+	ReservedServerSourceIDs            []string
 	StageMetrics                       oversync.StageMetricsRecorder
 	InitializationLeaseTTL             time.Duration
 	MaxConcurrentSnapshotBuilds        int
@@ -205,7 +206,8 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		BundleChangeWatch: oversync.BundleChangeWatchConfig{
 			Enabled: true,
 		},
-		RegisteredTables: RegisteredTablesForBusinessSchema(businessSchema),
+		RegisteredTables:        RegisteredTablesForBusinessSchema(businessSchema),
+		ReservedServerSourceIDs: append([]string(nil), config.ReservedServerSourceIDs...),
 	}
 	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(
 		serviceConfig.MaxConcurrentSnapshotBuilds,
@@ -256,11 +258,12 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	actorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
 		UserIDFromContext: func(ctx context.Context) (string, error) {
 			userID, ok := exampleauth.UserIDFromContext(ctx)
-			if !ok || strings.TrimSpace(userID) == "" {
+			if !ok || userID == "" {
 				return "", fmt.Errorf("authenticated user_id not found")
 			}
 			return userID, nil
 		},
+		ReservedServerSourceIDs: append([]string(nil), config.ReservedServerSourceIDs...),
 	})
 
 	// Create sync handlers
@@ -325,7 +328,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		})
 	})
 	mux.HandleFunc("GET /test/watch-subscribers", func(w http.ResponseWriter, r *http.Request) {
-		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+		userID := r.URL.Query().Get("user_id")
 		if userID == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request", "message": "user_id required"})

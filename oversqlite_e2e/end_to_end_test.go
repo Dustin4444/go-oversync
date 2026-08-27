@@ -40,7 +40,7 @@ func TestEndToEnd_RebuildKeepSourcePullAndServerCascadeOnCategories(t *testing.T
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
 		SourceBundleID: 1,
-	}, func(tx pgx.Tx) error {
+	}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.categories WHERE id = $1`, pgx.Identifier{schema}.Sanitize()), rootID)
 		return err
 	}))
@@ -331,7 +331,7 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
 		SourceBundleID: 1,
-	}, func(tx pgx.Tx) error {
+	}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
 			SET name = $2

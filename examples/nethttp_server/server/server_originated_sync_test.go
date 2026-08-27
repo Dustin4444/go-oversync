@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
@@ -75,8 +74,7 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	err = ts.SyncService.WithinSyncBundle(
 		ctx,
 		oversync.Actor{UserID: userID, SourceID: "server-admin"},
-		oversync.BundleSource{SourceID: "server-admin", SourceBundleID: 1},
-		func(tx pgx.Tx) error {
+		oversync.BundleSource{SourceID: "server-admin", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 			_, err := tx.Exec(ctx, `
 			INSERT INTO business.users (id, name, email)
 			VALUES ($1, $2, $3)

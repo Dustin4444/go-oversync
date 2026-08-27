@@ -629,7 +629,7 @@ func TestAuditPostgresRestart_FastAttachPreservesCommittedSupportedWrite(t *test
 	mustInitializeEmptyScope(t, ctx, service, actor.UserID, "seed")
 	rowID := uuid.New()
 	tableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
-	require.NoError(t, service.WithinSyncBundle(ctx, Actor{UserID: actor.UserID}, BundleSource{SourceID: "server-writer", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, service.WithinSyncBundle(ctx, Actor{UserID: actor.UserID}, BundleSource{SourceID: "server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s (id, name, email)
 			VALUES ($1, 'Durable Ω', 'durable@example.com')

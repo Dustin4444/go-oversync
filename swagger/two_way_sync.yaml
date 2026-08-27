@@ -76,7 +76,7 @@ paths:
         '401':
           description: Authentication required
         '503':
-          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          description: Service unavailable during graceful shutdown, or push transaction commit outcome unknown (`service_unavailable` or `commit_outcome_unknown`). On `commit_outcome_unknown`, restart session creation with the same source tuple.
           content:
             application/json:
               schema:
@@ -208,7 +208,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
-          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          description: Service unavailable during graceful shutdown, or push transaction commit outcome unknown (`service_unavailable` or `commit_outcome_unknown`). On `commit_outcome_unknown`, restart session creation with the same source tuple.
           content:
             application/json:
               schema:
@@ -278,7 +278,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
-          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          description: Service unavailable during graceful shutdown, or push transaction commit outcome unknown (`service_unavailable` or `commit_outcome_unknown`). On `commit_outcome_unknown`, restart session creation with the same source tuple.
           content:
             application/json:
               schema:
@@ -784,7 +784,8 @@ components:
       description: |
         Current sync source identity for this authenticated request. This header is sync transport
         metadata, not authentication. Direct protocol callers provide it explicitly; higher-level
-        clients such as oversqlite may manage it internally.
+        clients such as oversqlite may manage it internally. Values reserved for trusted server
+        publication are rejected as ordinary invalid SourceIDs without disclosing the configured set.
   securitySchemes:
     BearerAuth:
       type: http
@@ -794,6 +795,7 @@ components:
     SourceID:
       type: string
       minLength: 1
+      maxLength: 256
       pattern: '^[!-~]+$'
       description: Exact non-empty visible-ASCII sync source token. Values are accepted and compared without normalization.
       example: device-a
@@ -1067,10 +1069,10 @@ components:
       properties:
         previous_source_id:
           $ref: '#/components/schemas/SourceID'
-          description: Must match the authenticated `Oversync-Source-ID`.
+          description: Must match the authenticated `Oversync-Source-ID` and must not be reserved for trusted server publication.
         new_source_id:
           $ref: '#/components/schemas/SourceID'
-          description: Fresh replacement writer identity reserved for the rotated rebuild.
+          description: Fresh replacement writer identity for the rotated rebuild; configured trusted server publication IDs are rejected.
         reason:
           type: string
           enum: [history_pruned, source_sequence_out_of_order, source_sequence_changed, source_retired]

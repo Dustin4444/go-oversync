@@ -204,8 +204,43 @@ func (s *SyncService) WithinSyncBundle(
 	ctx context.Context,
 	actor Actor,
 	source BundleSource,
-	fn func(tx pgx.Tx) error,
+	opts RetryableBundleWriteOptions,
+	fn RetryableDatabaseWrite,
 ) (err error) {
+	if err := rejectRetryableCallbackContext(ctx, "WithinSyncBundle"); err != nil {
+		return err
+	}
+	if err := s.validateClientActor(actor, false); err != nil {
+		return err
+	}
+	if err := sourceid.Validate(source.SourceID); err != nil {
+		return fmt.Errorf("bundle source_id is invalid: %w", err)
+	}
+	if s.isReservedServerSourceID(source.SourceID) {
+		return fmt.Errorf("bundle source_id is invalid: %w", sourceid.ErrInvalid)
+	}
+	if source.SourceBundleID <= 0 {
+		return &RetryableWriteInvalidError{Message: "bundle source_bundle_id must be > 0"}
+	}
+	if err := validateCanonicalRequestHash(source.CanonicalRequestHash); err != nil {
+		return err
+	}
+	if fn == nil {
+		return &RetryableWriteInvalidError{Message: "bundle callback is required"}
+	}
+	writeOpts := RetryableWriteOptions{
+		OperationID:         withinSyncBundleOperationID(actor.UserID, source.SourceID, source.SourceBundleID),
+		OperationHash:       opts.OperationHash,
+		OperationValidUntil: opts.OperationValidUntil,
+	}
+	if err := validateRetryableWriteOptions(writeOpts); err != nil {
+		return err
+	}
+	emptyEffects, err := s.canonicalizeEffectSet(nil)
+	if err != nil {
+		return err
+	}
+
 	done, err := s.beginOperation()
 	if err != nil {
 		return err
@@ -218,70 +253,75 @@ func (s *SyncService) WithinSyncBundle(
 	}
 	defer releaseConn()
 
-	return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		_, err := s.withinSyncBundleTx(ctx, tx, actor, source, fn)
-		return err
+	_, err = runRetryableWriteTransaction(ctx, conn, func(tx pgx.Tx) (struct{}, error) {
+		return struct{}{}, s.withinSyncBundleAttempt(ctx, tx, actor, source, writeOpts, emptyEffects, fn)
 	})
+	return err
 }
 
-func (s *SyncService) withinSyncBundleTx(
+func (s *SyncService) withinSyncBundleAttempt(
 	ctx context.Context,
 	tx pgx.Tx,
 	actor Actor,
 	source BundleSource,
-	fn func(tx pgx.Tx) error,
-) (*Bundle, error) {
-	if err := actor.validate(false); err != nil {
-		return nil, err
-	}
-	if err := sourceid.Validate(source.SourceID); err != nil {
-		return nil, fmt.Errorf("bundle source_id is invalid: %w", err)
-	}
-	if source.SourceBundleID <= 0 {
-		return nil, fmt.Errorf("bundle source_bundle_id must be > 0")
-	}
-	if fn == nil {
-		return nil, fmt.Errorf("bundle callback is required")
-	}
-
+	opts RetryableWriteOptions,
+	emptyEffects canonicalEffectSet,
+	fn RetryableDatabaseWrite,
+) error {
 	if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
-		return nil, err
+		return err
+	}
+	userPK, err := lookupUserPK(ctx, tx, actor.UserID)
+	if err != nil {
+		return err
+	}
+	explicitSourceBundleID := source.SourceBundleID
+	decision, err := acquireScopeWriteReceipt(ctx, tx, scopeWriteReceiptSpec{
+		userPK:                 userPK,
+		operationID:            opts.OperationID,
+		operationHash:          opts.OperationHash,
+		requiredEffectsHash:    emptyEffects.hash,
+		forbiddenEffectsHash:   emptyEffects.hash,
+		writerID:               source.SourceID,
+		explicitSourceBundleID: &explicitSourceBundleID,
+		operationValidUntil:    opts.OperationValidUntil,
+	})
+	if err != nil {
+		return err
+	}
+	if decision.replay != nil {
+		if decision.replay.Bundle.CanonicalRequestHash != source.CanonicalRequestHash {
+			return &OperationReplayChangedError{}
+		}
+		return nil
 	}
 	scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	switch scopeState.State {
 	case scopeStateInitialized:
 	case scopeStateInitializing:
-		return nil, &ScopeInitializingError{UserID: actor.UserID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
+		return &ScopeInitializingError{UserID: actor.UserID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
 	default:
-		return nil, &ScopeUninitializedError{UserID: actor.UserID}
+		return &ScopeUninitializedError{UserID: actor.UserID}
 	}
 	if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
-		return nil, fmt.Errorf("defer bundle constraints: %w", err)
+		return fmt.Errorf("defer bundle constraints: %w", err)
 	}
-	if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
-		return nil, err
-	}
-	expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID)
+	expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	switch {
 	case source.SourceBundleID < expectedSourceBundleID:
-		return nil, &SourceTupleHistoryPrunedError{
-			UserID:                         actor.UserID,
-			SourceID:                       source.SourceID,
-			SourceBundleID:                 source.SourceBundleID,
-			MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
-		}
+		return &OperationHistoryUnavailableError{}
 	case source.SourceBundleID > expectedSourceBundleID:
-		return nil, &SourceSequenceOutOfOrderError{
+		return &SourceSequenceOutOfOrderError{
 			UserID:   actor.UserID,
 			SourceID: source.SourceID,
 			Expected: expectedSourceBundleID,
@@ -294,25 +334,34 @@ func (s *SyncService) withinSyncBundleTx(
 		SourceID:       source.SourceID,
 		SourceBundleID: source.SourceBundleID,
 	}); err != nil {
-		return nil, err
+		return err
 	}
 
-	if err := fn(tx); err != nil {
-		return nil, err
+	callbackCtx, capability, err := newRestrictedDatabaseWriteTx(ctx, tx, actor.UserID)
+	if err != nil {
+		return err
+	}
+	if err := fn(callbackCtx, capability); err != nil {
+		return err
 	}
 	bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, scopeState.UserPK, source)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if bundle != nil {
-		if err := activateSourceState(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID, source.SourceBundleID); err != nil {
-			return nil, err
-		}
-		if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
-			return nil, err
-		}
+	if bundle == nil {
+		return &ScopeWriteNoCapturedChangesError{ScopeID: actor.UserID, WriterID: source.SourceID}
 	}
-	return bundle, nil
+	if err := activateSourceState(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID, source.SourceBundleID); err != nil {
+		return err
+	}
+	if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
+		return err
+	}
+	result := &ScopeWriteResult{Bundle: committedBundleRef(bundle)}
+	if err := completeScopeWriteReceipt(ctx, tx, scopeState.UserPK, opts.OperationID, result); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, source BundleSource) (*Bundle, error) {

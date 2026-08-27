@@ -139,6 +139,18 @@ func TestMobileApp_OnDetach_KeepsOfflineWritesPending(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(oversync.CapabilitiesResponse{
 				ProtocolVersion: oversync.SyncProtocolVersion,
 				Features:        map[string]bool{"connect_lifecycle": true},
+				RegisteredTableSpecs: func() []oversync.RegisteredTableSpec {
+					tables := managedSyncTables()
+					specs := make([]oversync.RegisteredTableSpec, 0, len(tables))
+					for _, table := range tables {
+						specs = append(specs, oversync.RegisteredTableSpec{
+							Schema:         "business",
+							Table:          table.TableName,
+							SyncKeyColumns: []string{table.SyncKeyColumnName},
+						})
+					}
+					return specs
+				}(),
 				BundleLimits: oversync.BundleCapabilitiesLimits{
 					DefaultRowsPerSnapshotChunk: 1, MaxRowsPerSnapshotChunk: 1,
 					DefaultBytesPerSnapshotChunk: 1024, MaxBytesPerSnapshotChunk: 1024,

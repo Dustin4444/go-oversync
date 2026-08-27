@@ -24,6 +24,7 @@ type ServerConfig struct {
 	JWTSecret                          string
 	Logger                             *slog.Logger
 	AppName                            string
+	ReservedServerSourceIDs            []string
 	MaxConcurrentSnapshotBuilds        int
 	MaxConcurrentSnapshotChunkRequests int
 }
@@ -105,6 +106,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			{Schema: "business", Table: "person_address", SyncKeyColumns: []string{"id"}},
 			{Schema: "business", Table: "comment", SyncKeyColumns: []string{"id"}},
 		},
+		ReservedServerSourceIDs: append([]string(nil), config.ReservedServerSourceIDs...),
 	}
 	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(
 		svcCfg.MaxConcurrentSnapshotBuilds,
@@ -146,11 +148,12 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	actorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
 		UserIDFromContext: func(ctx context.Context) (string, error) {
 			userID, ok := exampleauth.UserIDFromContext(ctx)
-			if !ok || strings.TrimSpace(userID) == "" {
+			if !ok || userID == "" {
 				return "", fmt.Errorf("authenticated user_id not found")
 			}
 			return userID, nil
 		},
+		ReservedServerSourceIDs: append([]string(nil), config.ReservedServerSourceIDs...),
 	})
 
 	syncHandlers := oversync.NewHTTPSyncHandlers(syncService, logger)
@@ -158,38 +161,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /syncx/health", syncHandlers.HandleHealth)
 	mux.HandleFunc("GET /syncx/status", syncHandlers.HandleStatus)
-	mux.HandleFunc("POST /dummy-signin", func(w http.ResponseWriter, r *http.Request) {
-		type req struct{ User, Password string }
-		type resp struct {
-			Token     string `json:"token"`
-			ExpiresIn int64  `json:"expires_in"`
-			User      string `json:"user"`
-		}
-		var rr req
-		if err := json.NewDecoder(r.Body).Decode(&rr); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(400)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
-			return
-		}
-		if rr.User == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(400)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user_required"})
-			return
-		}
-		const tokenExpiresInSeconds int64 = 180
-		// TODO (any username/password accepted for now)
-		tok, err := auth.GenerateToken(rr.User, time.Duration(tokenExpiresInSeconds)*time.Second)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(500)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "token_error"})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp{Token: tok, ExpiresIn: tokenExpiresInSeconds, User: rr.User})
-	})
+	mux.Handle("POST /dummy-signin", sampleSyncDummySigninHandler(auth, logger))
 	withSyncActor := func(next http.Handler) http.Handler {
 		return auth.Middleware(actorMiddleware(next))
 	}
@@ -216,6 +188,41 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		ctx:         ctx,
 		cancel:      cancel,
 	}, nil
+}
+
+func sampleSyncDummySigninHandler(auth *exampleauth.TokenAuth, logger *slog.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		type req struct{ User, Password string }
+		type resp struct {
+			Token     string `json:"token"`
+			ExpiresIn int64  `json:"expires_in"`
+			User      string `json:"user"`
+		}
+		var rr req
+		if err := json.NewDecoder(r.Body).Decode(&rr); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
+			return
+		}
+		if rr.User == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user_required"})
+			return
+		}
+		const tokenExpiresInSeconds int64 = 180
+		token, err := auth.GenerateToken(rr.User, time.Duration(tokenExpiresInSeconds)*time.Second)
+		if err != nil {
+			logger.Error("failed to generate dummy JWT", "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "token_error"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp{Token: token, ExpiresIn: tokenExpiresInSeconds, User: rr.User})
+	})
 }
 
 func configuredSnapshotConcurrencyFromEnv(builds, chunks int) (int, int, error) {

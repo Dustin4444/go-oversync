@@ -55,6 +55,11 @@ func newWatchMobileClient(t *testing.T, cfg *oversqlite.Config, watchSupported b
 		case "/sync/capabilities":
 			return watchJSONResponse(oversync.CapabilitiesResponse{
 				ProtocolVersion: oversync.SyncProtocolVersion,
+				RegisteredTableSpecs: []oversync.RegisteredTableSpec{{
+					Schema:         "business",
+					Table:          "users",
+					SyncKeyColumns: []string{"id"},
+				}},
 				BundleLimits: oversync.BundleCapabilitiesLimits{
 					DefaultRowsPerSnapshotChunk: 1, MaxRowsPerSnapshotChunk: 1,
 					DefaultBytesPerSnapshotChunk: 1024, MaxBytesPerSnapshotChunk: 1024,

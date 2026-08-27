@@ -62,13 +62,14 @@ func loadFastAttachDataFingerprints(
 	tableCount int,
 ) map[string]string {
 	t.Helper()
-	relations := make([]string, 0, tableCount+13)
+	relations := make([]string, 0, tableCount+15)
 	for tableIndex := range tableCount {
 		relations = append(relations, pgx.Identifier{schemaName, fmt.Sprintf("table_%02d", tableIndex)}.Sanitize())
 	}
 	for _, tableName := range []string{
 		"bundle_capture_stage", "bundle_log", "bundle_rows", "meta", "push_session_rows", "push_sessions",
-		"row_state", "scope_state", "snapshot_session_rows", "snapshot_sessions", "source_state", "table_catalog", "user_state",
+		"row_state", "scope_state", "scope_write_receipts", "server_source_reservations", "snapshot_session_rows",
+		"snapshot_sessions", "source_state", "table_catalog", "user_state",
 	} {
 		relations = append(relations, pgx.Identifier{"sync", tableName}.Sanitize())
 	}
@@ -152,7 +153,8 @@ func (t *adoptionQueryTracer) counts() adoptionQueryCounts {
 		normalized := strings.ToLower(strings.Join(strings.Fields(query), " "))
 		counts.total++
 		classified := false
-		if normalized == "begin" || normalized == "commit" || normalized == "rollback" ||
+		if normalized == "begin isolation level read committed read write not deferrable" ||
+			normalized == "commit" || normalized == "rollback" ||
 			strings.Contains(normalized, "pg_advisory_xact_lock") {
 			counts.catalogDefinition++
 			classified = true
@@ -209,7 +211,8 @@ func (t *adoptionQueryTracer) counts() adoptionQueryCounts {
 		if strings.Contains(normalized, "pg_catalog") || strings.Contains(normalized, "from pg_") ||
 			strings.Contains(normalized, "join pg_") || strings.Contains(normalized, "information_schema") ||
 			strings.Contains(normalized, "to_regclass(") || strings.Contains(normalized, "from sync.meta") ||
-			strings.Contains(normalized, "from sync.table_catalog") {
+			strings.Contains(normalized, "from sync.table_catalog") ||
+			strings.Contains(normalized, "from sync.server_source_reservations") {
 			counts.catalogDefinition++
 			classified = true
 		}
@@ -406,7 +409,7 @@ func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *te
 
 			restartCounts := tracer.counts()
 			statementFamilies := tracer.normalizedStatementFamilies()
-			require.Equal(t, 24, restartCounts.total, "existing-layout attachment SQL count must be scale-independent")
+			require.Equal(t, 29, restartCounts.total, "existing-layout attachment SQL count must be scale-independent")
 			if expectedAttachStatementFamilies == nil {
 				expectedAttachStatementFamilies = append([]string(nil), statementFamilies...)
 			} else {

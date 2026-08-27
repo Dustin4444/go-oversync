@@ -43,7 +43,7 @@ func TestScopeManager_ExecWrite_ValidatesInputs(t *testing.T) {
 	nilMgr := NewScopeManager(nil, ScopeManagerConfig{})
 	require.NotNil(t, nilMgr)
 	require.NotNil(t, nilMgr.logger)
-	_, err := nilMgr.ExecWrite(ctx, "scope-a", ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error { return nil })
+	_, err := nilMgr.ExecWrite(ctx, "scope-a", ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error { return nil })
 	var invalidErr *ScopeWriteInvalidError
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, err.Error(), "sync service")
@@ -58,15 +58,15 @@ func TestScopeManager_ExecWrite_ValidatesInputs(t *testing.T) {
 	_, mgr := newScopeManagerIntegrationService(t, ctx, pool, schemaName, logger)
 	require.NotNil(t, mgr.logger)
 
-	_, err = mgr.ExecWrite(ctx, "", ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error { return nil })
+	_, err = mgr.ExecWrite(ctx, "", ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error { return nil })
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, err.Error(), "scope_id")
 
-	_, err = mgr.ExecWrite(ctx, "scope-a", ScopeWriteOptions{WriterID: ""}, func(tx pgx.Tx) error { return nil })
+	_, err = mgr.ExecWrite(ctx, "scope-a", ScopeWriteOptions{WriterID: "", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error { return nil })
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, err.Error(), "writer_id")
 
-	_, err = mgr.ExecWrite(ctx, "scope-a", ScopeWriteOptions{WriterID: "admin-panel"}, nil)
+	_, err = mgr.ExecWrite(ctx, "scope-a", ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, nil)
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, err.Error(), "callback")
 }
@@ -85,7 +85,7 @@ func TestScopeManager_ExecWrite_AutoInitializesAndCommitsVisibleBundle(t *testin
 
 	scopeID := "scope-auto-" + suffix
 	rowID := uuid.New()
-	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -136,7 +136,7 @@ func TestScopeManager_ExecWrite_DoesNotAutoInitializeInitializedScope(t *testing
 	mustInitializeEmptyScope(t, ctx, svc, scopeID, "device-a")
 
 	rowID := uuid.New()
-	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -165,7 +165,7 @@ func TestScopeManager_ExecWrite_FailsClosedWhenScopeInitializing(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", resp.Resolution)
 
-	_, err = mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err = mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		return nil
 	})
 	var initializingErr *ScopeInitializingError
@@ -199,7 +199,7 @@ func TestScopeManager_ExecWrite_FailsForRetiredWriter(t *testing.T) {
 		return retireSourceState(ctx, tx, userPK, "admin-panel", "replacement-writer", "test")
 	}))
 
-	_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		return nil
 	})
 	var retiredErr *SourceRetiredError
@@ -230,17 +230,17 @@ func TestScopeManager_ExecWrite_NoCapturedChanges(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		fn   func(tx pgx.Tx) error
+		fn   RetryableDatabaseWrite
 	}{
 		{
 			name: "no_writes",
-			fn: func(tx pgx.Tx) error {
+			fn: func(ctx context.Context, tx DatabaseWriteTx) error {
 				return nil
 			},
 		},
 		{
 			name: "unregistered_only",
-			fn: func(tx pgx.Tx) error {
+			fn: func(ctx context.Context, tx DatabaseWriteTx) error {
 				_, err := tx.Exec(ctx, fmt.Sprintf(`
 					INSERT INTO %s.unregistered_notes (id, body)
 					VALUES ($1, $2)
@@ -250,7 +250,7 @@ func TestScopeManager_ExecWrite_NoCapturedChanges(t *testing.T) {
 		},
 		{
 			name: "normalized_away",
-			fn: func(tx pgx.Tx) error {
+			fn: func(ctx context.Context, tx DatabaseWriteTx) error {
 				rowID := uuid.New()
 				if _, err := tx.Exec(ctx, fmt.Sprintf(`
 					INSERT INTO %s.users (id, name, email)
@@ -268,7 +268,7 @@ func TestScopeManager_ExecWrite_NoCapturedChanges(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, tc.fn)
+			_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, tc.fn)
 			var noChangesErr *ScopeWriteNoCapturedChangesError
 			require.ErrorAs(t, err, &noChangesErr)
 			require.Equal(t, scopeID, noChangesErr.ScopeID)
@@ -304,7 +304,7 @@ func TestScopeManager_ExecWrite_CallbackErrorRollsBack(t *testing.T) {
 	scopeID := "scope-rollback-" + suffix
 	rowID := uuid.New()
 	errBoom := fmt.Errorf("boom")
-	_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -349,7 +349,7 @@ func TestScopeManager_ExecWrite_WriterSequencingAcrossScopesAndWriters(t *testin
 	insertUser := func(scopeID, writerID, name string) *ScopeWriteResult {
 		t.Helper()
 		rowID := uuid.New()
-		result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: writerID}, func(tx pgx.Tx) error {
+		result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: writerID, RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 			_, err := tx.Exec(ctx, fmt.Sprintf(`
 				INSERT INTO %s.users (id, name, email)
 				VALUES ($1, $2, $3)
@@ -401,7 +401,7 @@ func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRu
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
 
-	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: sharedWriter}, func(tx pgx.Tx) error {
+	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: sharedWriter, RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
 			SET name = $3
@@ -429,7 +429,7 @@ func TestScopeManager_ExecWrite_RejectsCrossScopeMutations(t *testing.T) {
 	ownerA := "owner-a-" + suffix
 	ownerB := "owner-b-" + suffix
 	rowID := uuid.New()
-	_, err := mgr.ExecWrite(ctx, ownerA, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err := mgr.ExecWrite(ctx, ownerA, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -438,7 +438,7 @@ func TestScopeManager_ExecWrite_RejectsCrossScopeMutations(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = mgr.ExecWrite(ctx, ownerB, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err = mgr.ExecWrite(ctx, ownerB, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
 			SET name = $2
@@ -448,7 +448,7 @@ func TestScopeManager_ExecWrite_RejectsCrossScopeMutations(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "scope mismatch")
 
-	_, err = mgr.ExecWrite(ctx, ownerB, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err = mgr.ExecWrite(ctx, ownerB, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			DELETE FROM %s.users
 			WHERE id = $1
@@ -470,7 +470,7 @@ func TestScopeManager_ExecWrite_RejectsMismatchedScopeOnInsert(t *testing.T) {
 
 	_, mgr := newScopeManagerIntegrationService(t, ctx, pool, schemaName, logger)
 
-	_, err := mgr.ExecWrite(ctx, "actor-a-"+suffix, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err := mgr.ExecWrite(ctx, "actor-a-"+suffix, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (_sync_scope_id, id, name, email)
 			VALUES ($1, $2, $3, $4)
@@ -559,7 +559,7 @@ func TestScopeManager_ExecWrite_ComplexScopeSafeSQLAndTriggerEffects(t *testing.
 	userID := uuid.New()
 	postID := uuid.New()
 
-	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -580,8 +580,7 @@ func TestScopeManager_ExecWrite_ComplexScopeSafeSQLAndTriggerEffects(t *testing.
 		return err
 	})
 	require.NoError(t, err)
-	require.NotNil(t, result.Bundle)
-	require.Len(t, result.Bundle.Rows, 3)
+	require.Equal(t, int64(3), result.Bundle.RowCount)
 
 	reader := Actor{UserID: scopeID, SourceID: "reader"}
 	pullResp, err := svc.ProcessPull(ctx, reader, 0, 10, 0)
@@ -605,7 +604,7 @@ func TestScopeManager_ExecWrite_DifferentScopeDoesNotObserveChanges(t *testing.T
 	scopeA := "scope-a-" + suffix
 	scopeB := "scope-b-" + suffix
 	mustInitializeEmptyScope(t, ctx, svc, scopeB, "reader-b")
-	_, err := mgr.ExecWrite(ctx, scopeA, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	_, err := mgr.ExecWrite(ctx, scopeA, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -640,7 +639,7 @@ func TestScopeManager_ExecWrite_ConcurrentUsage(t *testing.T) {
 			wg.Add(1)
 			go func(i int, writerID string) {
 				defer wg.Done()
-				_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: writerID}, func(tx pgx.Tx) error {
+				_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: writerID, RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 					_, err := tx.Exec(ctx, fmt.Sprintf(`
 						INSERT INTO %s.users (id, name, email)
 						VALUES ($1, $2, $3)
@@ -666,7 +665,7 @@ func TestScopeManager_ExecWrite_ConcurrentUsage(t *testing.T) {
 		wg.Add(1)
 		go func(scopeID string) {
 			defer wg.Done()
-			_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+			_, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 				_, err := tx.Exec(ctx, fmt.Sprintf(`
 					INSERT INTO %s.users (id, name, email)
 					VALUES ($1, $2, $3)
@@ -700,7 +699,7 @@ func TestScopeManager_ExecWrite_PreservesPullRetentionAndCommittedBundleRowVisib
 
 	writeUser := func(name string) *ScopeWriteResult {
 		t.Helper()
-		result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+		result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 			_, err := tx.Exec(ctx, fmt.Sprintf(`
 				INSERT INTO %s.users (id, name, email)
 				VALUES ($1, $2, $3)

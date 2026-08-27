@@ -76,6 +76,8 @@ Important runtime tables include:
 - `sync.row_state`
 - `sync.bundle_log`
 - `sync.bundle_rows`
+- `sync.scope_write_receipts`
+- `sync.server_source_reservations`
 - `sync.push_sessions`
 - `sync.push_session_rows`
 - `sync.snapshot_sessions`
@@ -109,7 +111,8 @@ so through `ScopeManager.ExecWrite(...)` in the common case, or `WithinSyncBundl
 application needs the lower-level primitive directly. Both paths ensure the committed business
 transaction is captured as one sync bundle visible to other clients. See
 [Server-Originated Writes]({{ site.baseurl }}/documentation/server-originated-writes/) for the
-runtime contract and examples.
+retryable database-only callback contract, durable operation identity, commit-ambiguity handling,
+and examples.
 
 ## Core Concepts
 

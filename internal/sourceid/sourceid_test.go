@@ -1,6 +1,7 @@
 package sourceid
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -18,6 +19,11 @@ func TestValidate_ExactVisibleASCIIToken(t *testing.T) {
 			require.NoError(t, Validate(value))
 		})
 	}
+}
+
+func TestValidate_Enforces256ByteMaximum(t *testing.T) {
+	require.NoError(t, Validate(strings.Repeat("x", 256)))
+	require.ErrorIs(t, Validate(strings.Repeat("x", 257)), ErrInvalid)
 }
 
 func TestValidate_RejectsAbsentWhitespaceUnicodeAndControl(t *testing.T) {

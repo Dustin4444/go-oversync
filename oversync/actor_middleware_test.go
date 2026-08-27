@@ -31,7 +31,7 @@ func TestActorMiddleware_InjectsActorFromContextAndHeader(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusNoContent, rec.Code)
-	require.Equal(t, Actor{UserID: "user-1", SourceID: "source-1"}, got)
+	require.Equal(t, Actor{UserID: " user-1 ", SourceID: "source-1"}, got)
 }
 
 func TestActorMiddleware_FailsClosedWhenUserIDCannotBeResolved(t *testing.T) {
@@ -88,4 +88,25 @@ func TestActorMiddleware_FailsClosedWhenSourceHeaderIsMissingOrInvalid(t *testin
 			require.Equal(t, "invalid_request", decodeErrorResponse(t, rec).Error)
 		})
 	}
+}
+
+func TestActorMiddleware_RejectsReservedServerSourceWithoutEnumeration(t *testing.T) {
+	middleware := ActorMiddleware(ActorMiddlewareConfig{
+		UserIDFromContext:       func(context.Context) (string, error) { return "user-1", nil },
+		ReservedServerSourceIDs: []string{"server-writer"},
+	})
+	handler := middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("reserved server source must not reach the handler")
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/sync/push-sessions", nil)
+	req.Header.Set(SourceIDHeader, "server-writer")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	response := decodeErrorResponse(t, rec)
+	require.Equal(t, "invalid_request", response.Error)
+	require.NotContains(t, response.Message, "reserved")
+	require.NotContains(t, response.Message, "server-writer")
 }

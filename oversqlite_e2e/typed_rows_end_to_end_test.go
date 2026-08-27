@@ -100,7 +100,7 @@ func TestEndToEnd_UniformNumericScenariosUseSharedBusinessRichManifest(t *testin
 		RatingExpectedText: &directRating, Float4ExpectedText: &directFloat4,
 	}
 	actor := oversync.Actor{UserID: userID, SourceID: "direct-postgresql"}
-	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, actor, oversync.BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, actor, oversync.BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.typed_rows
 			(id, name, count_value, small_count, medium_count, exact_amount, enabled_flag, rating, float4_value)
@@ -244,7 +244,7 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
 		SourceBundleID: 1,
-	}, func(tx pgx.Tx) error {
+	}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.typed_rows (id, name, note, count_value, enabled_flag, rating, data, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)

@@ -5,172 +5,162 @@ permalink: /documentation/server-originated-writes/
 parent: Architecture
 ---
 
-This page explains how to write registered PostgreSQL business rows on behalf of one scope so that
-clients later receive those changes through the normal sync flow.
+Server-originated writes mutate registered PostgreSQL business tables for one scope and publish the
+committed effects through the ordinary sync history. The callback contract is intentionally
+retryable: application code must treat the callback as transaction-pure and may see it invoked up to
+three times for one public call.
 
-## When To Use This
+## Choose the API
 
-Use server-originated writes when the host application needs to mutate registered business tables
-outside client push handling, for example:
+Use `ScopeManager.ExecWrite(...)` for the common server-write case. It allocates the next writer
+bundle ID, auto-initializes an `UNINITIALIZED` scope, and returns a durable `CommittedBundleRef`.
 
-- admin or backoffice edits
-- billing-worker adjustments
-- workflow-triggered corrections
-- server-side seeding of scope data
+Use `WithinSyncBundle(...)` only when the caller already owns a stable exact
+`(user_id, source_id, source_bundle_id)` tuple. It does not allocate a source bundle ID or replace
+the caller's source-order policy.
 
-## Which API To Use
+Both APIs require a stable logical-operation hash and admission deadline. `ExecWrite` additionally
+requires a stable, nonzero operation UUID. Generate and persist these values when the application
+accepts the logical command, then reuse them across process restarts, ordinary retries, and an
+unknown commit result. Do not generate a new identity inside a retry loop.
 
-Use `ScopeManager.ExecWrite(...)` in the common case.
+Persist the deadline in application-owned durable storage before the first public write attempt.
+The Oversync receipt is not that storage: a definitely rolled-back attempt, or a lost response from
+an attempt that later proves rolled back, leaves no receipt from which a restarted caller could
+recover the original deadline. The example server's `server_operation_deadlines` table demonstrates
+the required pre-attempt persistence pattern.
 
-It is the convenience API for one scope-aware server write. On success it:
+## `ScopeManager.ExecWrite` example
 
-- auto-initializes an `UNINITIALIZED` scope as remote-authoritative empty
-- allocates the next expected per-scope `source_bundle_id` for the chosen writer
-- runs your callback inside one captured PostgreSQL transaction
-- commits exactly one sync-visible bundle
-
-Use `WithinSyncBundle(...)` only if your application already manages:
-
-- exact `(user_id, source_id, source_bundle_id)` tuples
-- scope lifecycle preconditions
-- advanced retry/orchestration outside the convenience API
-
-## Typical Workflow
-
-1. Resolve the target `scopeID`.
-2. Choose one stable `WriterID` for the logical producer, such as `admin-panel` or
-   `billing-worker`.
-3. Run `ScopeManager.ExecWrite(...)` with a callback that performs the business-table mutation.
-4. Clients attached to that scope later receive the committed bundle through ordinary pull or
-   snapshot flows.
-
-Minimal shape:
+This example assumes `command.ID`, `command.ValidUntil`, and the canonical command bytes are durable
+application data. The hash must cover every value that can change callback SQL.
 
 ```go
+operationHash := sha256.Sum256(command.CanonicalBytes())
 scopeMgr := oversync.NewScopeManager(syncService, oversync.ScopeManagerConfig{})
 
-_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
+result, err := scopeMgr.ExecWrite(ctx, command.ScopeID, oversync.ScopeWriteOptions{
 	WriterID: "admin-panel",
-}, func(tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `
+	RetryableWriteOptions: oversync.RetryableWriteOptions{
+		OperationID:         command.ID,
+		OperationHash:       operationHash,
+		OperationValidUntil: command.ValidUntil,
+	},
+	RequiredEffectTables: []oversync.RegisteredEffectTable{
+		{Schema: "business", Table: "users"},
+	},
+}, func(callbackCtx context.Context, tx oversync.DatabaseWriteTx) error {
+	_, err := tx.Exec(callbackCtx, `
 		UPDATE business.users
 		SET name = $3
 		WHERE _sync_scope_id = $1
 		  AND id = $2
-	`, scopeID, userID, "Updated By Admin")
+	`, command.ScopeID, command.UserID, command.NewName)
 	return err
 })
+if err != nil {
+	// Handle the typed outcomes described below.
+}
+log.Printf("committed bundle %d with %d effects", result.Bundle.BundleSeq, result.Bundle.RowCount)
 ```
 
-## Scope Initialization Behavior
+`OperationValidUntil` is checked against PostgreSQL time after operation-receipt ownership is
+acquired. A first attempt must be in the future, no more than 90 days ahead, and have no
+sub-microsecond precision. Crossing it after admission does not cancel an in-flight transaction.
+Completed receipts remain replayable until their retention horizon.
+After successful bootstrap, each Sync instance runs the bounded receipt cleanup lane once per minute
+and once immediately after bootstrap. Each run executes at most four independent five-second,
+500-row `READ COMMITTED` batches using ordered `FOR UPDATE SKIP LOCKED`; `Close` cancels and drains
+the worker.
 
-`ExecWrite(...)` auto-initializes only `UNINITIALIZED` scopes.
+`RequiredEffectTables` and `ForbiddenEffectTables` are optional frozen registered-table sets. They
+must be disjoint. Forbidden tables are checked against raw capture, so insert-then-delete does not
+hide a forbidden effect. Required tables must have a normalized committed effect.
 
-That initialization is a first-authority decision:
+## Retryable callback rules
 
-- after `ExecWrite(...)` initializes the scope, a later first device can no longer win the
-  `initialize_local` path for that scope
+The callback may run three total times. Oversync retries only PostgreSQL SQLSTATE `40001`, `40P01`,
+and `55P03` after definite rollback, waiting 25 ms and then 50 ms without jitter. Cancellation
+interrupts either wait. Sequence allocation may leave gaps after a rolled-back attempt.
 
-`ExecWrite(...)` does not hide `INITIALIZING` scopes. If another initializer currently holds the
-lease, the call fails closed with the existing initialization error.
+Inside the callback:
 
-## Callback SQL Rules
+- use only the supplied `DatabaseWriteTx` and the supplied `callbackCtx`
+- keep all business effects in that PostgreSQL transaction
+- use deterministic in-memory calculation whose results are not retained between attempts
+- do not mutate process-global state or call networks, filesystems, messaging services, email, object storage,
+  telemetry publishers, or other external systems
+- do not use a captured pool, connection, or outer context
+- do not recursively call a transaction-owning Oversync API
+- do not issue transaction control, `SET`, `RESET`, `SET CONSTRAINTS`, role/search-path changes,
+  `set_config`, or trigger/constraint-altering settings
+- audit invoked PostgreSQL functions and procedures for non-transactional side effects
 
-`ScopeManager.ExecWrite(...)` runs your callback inside one captured PostgreSQL transaction.
+Oversync lexes callback SQL before execution. It accepts one DML/read statement, rejects
+transaction/session-control statement classes, rejects direct `set_config` calls including quoted
+or comment-disguised spellings, and fails closed on Unicode-escaped identifiers. Invoked database
+functions are still trusted-caller obligations because Oversync cannot sandbox their bodies.
+Violating those remaining obligations can repeat a non-transactional effect and invalidates the
+API's retry and atomicity guarantees.
 
-Allowed:
+The capability exposes only `Exec`, `Query`, and `QueryRow`. It has no commit, rollback, begin,
+connection, batch, copy, or prepare escape hatch. `Query` still returns `pgx.Rows`, but its adapter's
+`Conn()` method safely returns `nil`.
 
-- multiple SQL statements
-- joins and subqueries
-- CTEs
-- writes across multiple registered tables for the same scope
-- trigger-driven secondary writes
+Registered-table owner guards enforce the exact active scope. Omit `_sync_scope_id` on insert unless
+setting it to the exact target scope, and constrain update/delete statements by the exact scope.
+New operations that produce no normalized registered-table effects fail closed.
 
-Important rules:
+## Replay and error handling
 
-- `oversync` does not statically inspect SQL text
-- row ownership is enforced at execution time by registered-table owner-guard triggers
-- for `INSERT` into registered tables, omit `_sync_scope_id` unless you are setting it explicitly
-  to the target scope
-- for `UPDATE` and `DELETE` against registered tables, explicitly constrain affected rows to the
-  target scope; `_sync_scope_id = ...` is the safest default
-- callbacks that produce no visible registered-table effects, including unregistered-only
-  transactions, are rejected with `ScopeWriteNoCapturedChangesError`
+The durable operation receipt binds the operation hash, exact writer/source tuple, validity
+deadline, and required/forbidden table sets. An exact completed replay returns the stored result
+without callback execution or a new bundle. Reusing an identity with changed content returns
+`OperationReplayChangedError`.
 
-Safe `INSERT` example:
+Handle these outcomes explicitly:
+
+- `CommitOutcomeUnknownError`: never infer rollback. Repeat the same public operation with the
+  exact same identity, hash, deadline, writer/source tuple, and effect-table contract.
+- `OperationHistoryExpiredError`: no receipt exists and the admission deadline has passed. Do not
+  reuse the identity for different work.
+- `OperationHistoryUnavailableError`: an explicit source tuple is already committed but its receipt
+  is absent. Recover through application policy; do not rerun the callback under a new identity as
+  though rollback were proven.
+- a typed PostgreSQL retryable error after the third attempt: the transaction definitely rolled
+  back, but the bounded retry budget is exhausted.
+
+This is bounded idempotency, not an exactly-once claim. Applications remain responsible for logical
+command identity and for external-effect idempotency outside the callback.
+
+`ScopeWriteResult.Bundle` is a durable `CommittedBundleRef`, not a materialized bundle. It includes
+the sequence, source tuple, row count, bundle hash, and canonical request hash. It intentionally has
+no `Bundle.Rows`; fetch retained payloads through ordinary pull/history APIs. Receipt replay returns
+the same summary even after `sync.bundle_rows` and `sync.bundle_log` pruning.
+
+## Reserved server writer IDs
+
+Trusted server publishers may reserve exact visible-ASCII source IDs (1-256 bytes). Configure the
+same frozen set on every Sync instance and at the HTTP actor boundary:
 
 ```go
-_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-	WriterID: "admin-panel",
-}, func(tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO business.users (id, name, email)
-		VALUES ($1, $2, $3)
-	`, userID, "Ada", "ada@example.com")
-	return err
+reserved := []string{"server:billing"}
+
+serviceConfig.ReservedServerSourceIDs = reserved
+actorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
+	UserIDFromContext:       userIDFromContext,
+	ReservedServerSourceIDs: reserved,
 })
 ```
 
-Safe scope-constrained `UPDATE` example:
+Client actors and snapshot source replacement cannot use a reserved ID; trusted
+`ScopeManager.ExecWrite` can. The first committed Scope write publishes `ever_used=true` in the same
+transaction. That tombstone never returns to false and survives scope, source-state, and receipt
+cleanup. Writer rotation retains every used reservation in the configured set.
 
-```go
-_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-	WriterID: "admin-panel",
-}, func(tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `
-		UPDATE business.users
-		SET name = $3
-		WHERE _sync_scope_id = $1
-		  AND id = $2
-	`, scopeID, userID, "Ada Updated")
-	return err
-})
-```
-
-## Writer IDs
-
-`WriterID` maps directly to the existing per-scope `source_id` sequencing model.
-
-Guidance:
-
-- use one stable writer id per logical producer such as `admin-panel`, `billing-worker`, or
-  `backoffice-tool`
-- avoid collisions with client-managed `source_id` values for the same scope
-- prefixes such as `server:`, `worker:`, `tool:`, or `admin:` can help operational clarity, but
-  the runtime does not require a specific format
-
-The same `WriterID` can be reused safely across different scopes because sequencing is per
-`(scope_id, source_id)`, not global per writer id.
-
-## Business Idempotency Boundary
-
-`ScopeManager` owns sync-stream correctness, not business-command idempotency.
-
-If the host application needs exactly-once behavior for domain operations such as:
-
-- grant credit once
-- append one audit event once
-- apply one external command idempotently
-
-that idempotency must be implemented by the application, not by `oversync`.
-
-## Delivery Model
-
-Server-originated writes are not delivered through any special admin-only path.
-
-They become ordinary committed bundles, and clients receive them through the same mechanisms they
-already use for synced data:
-
-- `GET /sync/pull`
-- snapshot rebuild after `history_pruned`
-
-The transaction and durability contract is unchanged across service restarts. Existing-layout
-Bootstrap validates managed definitions and then trusts PostgreSQL's committed business and sync
-rows; it does not replay or rewrite a supported `ExecWrite(...)` or `WithinSyncBundle(...)` commit.
-Ordinary direct registered-table DML without either supported bundle context remains rejected, as
-does every registered-table `TRUNCATE`.
-
-For executable end-to-end examples, see:
-
-- [examples/nethttp_server/server/scope_manager_sync_test.go](/Users/pochkin/Projects/my/go-oversync/examples/nethttp_server/server/scope_manager_sync_test.go)
-- [examples/nethttp_server/README.md](/Users/pochkin/Projects/my/go-oversync/examples/nethttp_server/README.md)
+Adding or removing a reservation is an offline layout-configuration operation under the bootstrap
+advisory lock and the required table locks. An unused reservation can be removed only when no source
+state or Scope receipt references it. A used reservation is never client-eligible again. The managed
+reservation trigger acquires those locks, rejects additions that conflict with any client source
+history, and rejects removal of referenced or used rows; operators must still stop all participating
+processes and deploy one exact frozen set.

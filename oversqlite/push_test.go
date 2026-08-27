@@ -219,6 +219,7 @@ type mockPushSessionServer struct {
 	t                 *testing.T
 	nextPushID        int
 	nextBundleSeq     int64
+	createRequests    []oversync.PushSessionCreateRequest
 	sessions          map[string]*mockPushSession
 	committedBySource map[int64]*mockCommittedBundle
 	committedBySeq    map[int64]*mockCommittedBundle
@@ -251,6 +252,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		requireAuthenticatedSyncHeaders(s.t, r, "")
 		var req oversync.PushSessionCreateRequest
 		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
+		s.createRequests = append(s.createRequests, req)
 		if committed := s.committedBySource[req.SourceBundleID]; committed != nil {
 			return jsonResponse(oversync.PushSessionCreateResponse{
 				Status:               "already_committed",
@@ -1095,6 +1097,52 @@ func TestPushPending_RetryExhaustionReturnsTypedError(t *testing.T) {
 	require.Equal(t, "push_pending", retryErr.Operation)
 	require.Equal(t, 3, retryErr.Attempts)
 	require.Equal(t, 3, createRequests)
+}
+
+func TestPushPending_CommitOutcomeUnknownRestartsCreateWithStableSourceTuple(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	commitResponseLost := false
+	server.commitHook = func(_ string, session *mockPushSession) *http.Response {
+		committedResponse := server.defaultCommitResponse(session)
+		if !commitResponseLost {
+			commitResponseLost = true
+			return errorJSONResponse(http.StatusServiceUnavailable, oversync.ErrorResponse{
+				Error:   "commit_outcome_unknown",
+				Message: "Push transaction commit outcome is unknown; restart push session creation with the same source tuple",
+			})
+		}
+		return committedResponse
+	}
+	client.HTTP = &http.Client{Transport: server}
+
+	report := mustPushPending(t, client, ctx)
+	require.Equal(t, PushOutcomeCommitted, report.Outcome)
+	require.True(t, commitResponseLost)
+	require.Len(t, server.createRequests, 2)
+	require.Equal(t, server.createRequests[0].SourceBundleID, server.createRequests[1].SourceBundleID)
+	require.Equal(t, server.createRequests[0].CanonicalRequestHash, server.createRequests[1].CanonicalRequestHash)
+	require.Equal(t, int64(1), server.createRequests[0].SourceBundleID)
+	require.NotEmpty(t, server.createRequests[0].CanonicalRequestHash)
+	require.Len(t, server.chunkRequests, 1)
+	require.Equal(t, int64(1), client.PushTransferDiagnostics().SessionsCreated)
+	require.Equal(t, int64(1), client.PushTransferDiagnostics().ChunksUploaded)
+	require.Equal(t, int64(1), client.PushTransferDiagnostics().CommittedBundleChunksRead)
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 0, dirtyCount)
 }
 
 func TestPushPending_TextSyncKeyRoundTripsThroughPush(t *testing.T) {

@@ -50,12 +50,12 @@ func NewHTTPSyncHandlersWithConfig(service *SyncService, logger *slog.Logger, co
 	}
 }
 
-func actorFromRequest(r *http.Request) (Actor, error) {
+func (h *HTTPSyncHandlers) actorFromRequest(r *http.Request) (Actor, error) {
 	actor, ok := ActorFromContext(r.Context())
 	if !ok {
 		return Actor{}, errors.New("authenticated actor not found in request context")
 	}
-	if err := actor.validate(true); err != nil {
+	if err := h.service.validateClientActor(actor, true); err != nil {
 		return Actor{}, err
 	}
 	return actor, nil
@@ -67,7 +67,7 @@ func (h *HTTPSyncHandlers) requireActorForMethod(w http.ResponseWriter, r *http.
 		return Actor{}, false
 	}
 
-	actor, err := actorFromRequest(r)
+	actor, err := h.actorFromRequest(r)
 	if err != nil {
 		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
 		return Actor{}, false
@@ -124,6 +124,20 @@ func (h *HTTPSyncHandlers) writeServiceUnavailable(w http.ResponseWriter, err er
 	return true
 }
 
+func (h *HTTPSyncHandlers) writePushTransactionFailure(w http.ResponseWriter, err error) bool {
+	var unknownErr *CommitOutcomeUnknownError
+	if errors.As(err, &unknownErr) {
+		h.writeError(
+			w,
+			http.StatusServiceUnavailable,
+			"commit_outcome_unknown",
+			"Push transaction commit outcome is unknown; restart push session creation with the same source tuple",
+		)
+		return true
+	}
+	return h.writeServiceUnavailable(w, err)
+}
+
 func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
 	if !ok {
@@ -138,7 +152,7 @@ func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *htt
 
 	response, err := h.service.CreatePushSession(r.Context(), actor, &req)
 	if err != nil {
-		if h.writeServiceUnavailable(w, err) {
+		if h.writePushTransactionFailure(w, err) {
 			return
 		}
 		var invalidErr *PushSessionInvalidError
@@ -208,7 +222,7 @@ func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http
 
 	response, err := h.service.UploadPushChunk(r.Context(), actor, pushID, &req)
 	if err != nil {
-		if h.writeServiceUnavailable(w, err) {
+		if h.writePushTransactionFailure(w, err) {
 			return
 		}
 		var invalidErr *PushChunkInvalidError
@@ -263,7 +277,7 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 
 	response, err := h.service.CommitPushSession(r.Context(), actor, pushID)
 	if err != nil {
-		if h.writeServiceUnavailable(w, err) {
+		if h.writePushTransactionFailure(w, err) {
 			return
 		}
 		var invalidErr *PushCommitInvalidError
@@ -954,7 +968,7 @@ func (h *HTTPSyncHandlers) HandleCapabilities(w http.ResponseWriter, r *http.Req
 		return
 	}
 	response := h.service.GetCapabilities()
-	if actor, ok := ActorFromContext(r.Context()); ok && actor.validate(true) == nil &&
+	if actor, ok := ActorFromContext(r.Context()); ok && h.service.validateClientActor(actor, true) == nil &&
 		response.Features != nil && response.Features["bundle_change_watch"] &&
 		!h.isBundleChangeWatchAllowed(r.Context(), actor) {
 		response.Features["bundle_change_watch"] = false

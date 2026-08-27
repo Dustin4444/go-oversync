@@ -50,7 +50,7 @@ func TestLocalHeavy_EndToEndLargeMultiChunkRowByteSnapshotRestore(t *testing.T) 
 	insertStarted := time.Now()
 	err = server.SyncService.WithinSyncBundle(ctx, actor, oversync.BundleSource{
 		SourceID: actor.SourceID, SourceBundleID: 1,
-	}, func(tx pgx.Tx) error {
+	}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		name := strings.Repeat("n", rowBytes-160)
 		for ordinal := 1; ordinal <= rowCount; ordinal++ {
 			id := fmt.Sprintf("00000000-0000-4000-8000-%012d", ordinal)

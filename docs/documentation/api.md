@@ -127,6 +127,7 @@ Create failure contract:
 - `409 scope_initializing`
 - `409 initialization_stale`
 - `410 initialization_expired`
+- `503 commit_outcome_unknown`
 
 ## POST `/sync/push-sessions/{push_id}/chunks`
 
@@ -172,6 +173,7 @@ Failure contract:
 - `409 initialization_stale`
 - `410 push_session_expired`
 - `410 initialization_expired`
+- `503 commit_outcome_unknown`
 
 ## POST `/sync/push-sessions/{push_id}/commit`
 
@@ -201,6 +203,12 @@ Failure contract:
 - `409 initialization_stale`
 - `410 push_session_expired`
 - `410 initialization_expired`
+- `503 commit_outcome_unknown`
+
+`commit_outcome_unknown` means the server cannot prove whether the create, chunk, or commit
+transaction committed. Clients must keep the frozen source bundle ID and canonical request hash and
+restart `POST /sync/push-sessions`; they must not infer rollback from an absent or stale staging
+`push_id`.
 
 Push conflict response:
 

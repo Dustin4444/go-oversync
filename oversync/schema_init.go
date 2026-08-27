@@ -369,7 +369,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		// Current authoritative sync storage schema. These tables back the active server hot path.
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.user_state (
 			user_pk BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-			user_id TEXT NOT NULL UNIQUE,
+			user_id TEXT COLLATE "C" NOT NULL UNIQUE,
 			next_bundle_seq BIGINT NOT NULL DEFAULT 1,
 			retained_bundle_floor BIGINT NOT NULL DEFAULT 0,
 			CONSTRAINT user_state_bundle_seq_chk CHECK (next_bundle_seq >= 1),
@@ -381,11 +381,11 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.scope_state (
 			user_pk BIGINT PRIMARY KEY REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
 			state_code SMALLINT NOT NULL,
-			initializer_source_id TEXT,
+			initializer_source_id TEXT COLLATE "C",
 			initialization_id UUID,
 			lease_expires_at TIMESTAMPTZ,
 			initialized_at TIMESTAMPTZ,
-			initialized_by_source_id TEXT,
+			initialized_by_source_id TEXT COLLATE "C",
 			CONSTRAINT scope_state_fields_chk CHECK (
 				(
 					state_code = 0
@@ -414,10 +414,10 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.source_state (
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
-			source_id TEXT NOT NULL,
+			source_id TEXT COLLATE "C" NOT NULL,
 			state TEXT NOT NULL,
 			max_committed_source_bundle_id BIGINT NOT NULL DEFAULT 0,
-			replaced_by_source_id TEXT NOT NULL DEFAULT '',
+			replaced_by_source_id TEXT COLLATE "C" NOT NULL DEFAULT '',
 			retirement_reason TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (user_pk, source_id),
 			CONSTRAINT source_state_state_chk CHECK (state IN ('active', 'reserved', 'retired')),
@@ -461,12 +461,12 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.bundle_log (
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
 			bundle_seq BIGINT NOT NULL,
-			source_id TEXT NOT NULL,
+			source_id TEXT COLLATE "C" NOT NULL,
 			source_bundle_id BIGINT NOT NULL,
 			row_count BIGINT NOT NULL,
 			byte_count BIGINT NOT NULL,
 			bundle_hash BYTEA NOT NULL,
-			canonical_request_hash TEXT NOT NULL,
+			canonical_request_hash TEXT COLLATE "C" NOT NULL,
 			committed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (user_pk, bundle_seq),
 			CONSTRAINT bundle_log_source_tuple_key UNIQUE (user_pk, source_id, source_bundle_id)
@@ -492,10 +492,10 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.push_sessions (
 			push_id UUID PRIMARY KEY,
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
-			source_id TEXT NOT NULL,
+			source_id TEXT COLLATE "C" NOT NULL,
 			source_bundle_id BIGINT NOT NULL,
 			planned_row_count BIGINT NOT NULL,
-			canonical_request_hash TEXT NOT NULL,
+			canonical_request_hash TEXT COLLATE "C" NOT NULL,
 			next_expected_row_ordinal BIGINT NOT NULL DEFAULT 0,
 			initialization_id UUID,
 			expires_at TIMESTAMPTZ NOT NULL,
@@ -542,6 +542,75 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 			PRIMARY KEY (snapshot_id, row_ordinal),
 			CONSTRAINT snapshot_session_rows_logical_row_key UNIQUE (snapshot_id, table_id, key_bytes)
 		)`,
+		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.scope_write_receipts (
+			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
+			operation_id UUID NOT NULL,
+			operation_hash BYTEA NOT NULL,
+			required_effect_tables_hash BYTEA NOT NULL,
+			forbidden_effect_tables_hash BYTEA NOT NULL,
+			writer_id TEXT COLLATE "C" NOT NULL,
+			explicit_source_bundle_id BIGINT,
+			operation_valid_until TIMESTAMPTZ NOT NULL,
+			receipt_state TEXT COLLATE "C" NOT NULL,
+			committed_source_bundle_id BIGINT,
+			committed_bundle_seq BIGINT,
+			committed_row_count BIGINT,
+			committed_bundle_hash BYTEA,
+			committed_canonical_request_hash TEXT COLLATE "C",
+			auto_initialized BOOLEAN,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+			completed_at TIMESTAMPTZ,
+			receipt_expires_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (user_pk, operation_id),
+			CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+			CHECK (writer_id <> ''),
+			CHECK (writer_id ~ '^[!-~]+$'),
+			CHECK (octet_length(operation_hash) = 32),
+			CHECK (octet_length(required_effect_tables_hash) = 32),
+			CHECK (octet_length(forbidden_effect_tables_hash) = 32),
+			CHECK (explicit_source_bundle_id IS NULL OR explicit_source_bundle_id > 0),
+			CHECK (isfinite(operation_valid_until) AND isfinite(receipt_expires_at)),
+			CHECK (operation_valid_until >= '0001-01-01 00:00:00+00'::timestamptz
+			       AND receipt_expires_at < '10000-01-01 00:00:00+00'::timestamptz),
+			CHECK (receipt_state IN ('in_progress','completed')),
+			CHECK (
+				(receipt_state = 'in_progress'
+				 AND committed_source_bundle_id IS NULL
+				 AND committed_bundle_seq IS NULL
+				 AND committed_row_count IS NULL
+				 AND committed_bundle_hash IS NULL
+				 AND committed_canonical_request_hash IS NULL
+				 AND auto_initialized IS NULL
+				 AND completed_at IS NULL
+				 AND receipt_expires_at = operation_valid_until + interval '24 hours')
+				OR
+				(receipt_state = 'completed'
+				 AND committed_source_bundle_id IS NOT NULL
+				 AND committed_source_bundle_id > 0
+				 AND committed_bundle_seq IS NOT NULL
+				 AND committed_bundle_seq > 0
+				 AND committed_row_count IS NOT NULL
+				 AND committed_row_count > 0
+				 AND committed_bundle_hash IS NOT NULL
+				 AND octet_length(committed_bundle_hash) = 32
+				 AND committed_canonical_request_hash IS NOT NULL
+				 AND auto_initialized IS NOT NULL
+				 AND completed_at IS NOT NULL
+				 AND receipt_expires_at = GREATEST(operation_valid_until, completed_at) + interval '24 hours')
+			),
+			CHECK (receipt_state <> 'completed'
+			       OR explicit_source_bundle_id IS NULL
+			       OR committed_source_bundle_id = explicit_source_bundle_id),
+			CHECK (committed_canonical_request_hash IS NULL
+			       OR committed_canonical_request_hash = ''
+			       OR committed_canonical_request_hash ~ '^[0-9a-f]{64}$')
+		)`,
+		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.server_source_reservations (
+			source_id TEXT COLLATE "C" PRIMARY KEY,
+			ever_used BOOLEAN NOT NULL DEFAULT FALSE,
+			CHECK (octet_length(source_id) BETWEEN 1 AND 256),
+			CHECK (source_id ~ '^[!-~]+$')
+		)`,
 		`CREATE SEQUENCE IF NOT EXISTS sync.accepted_push_replay_seq`,
 		`CREATE SEQUENCE IF NOT EXISTS sync.rejected_registered_write_seq`,
 		`CREATE SEQUENCE IF NOT EXISTS sync.history_pruned_error_seq`,
@@ -565,6 +634,76 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 				DETAIL = 'Oversync cannot capture TRUNCATE as row-level bundle events.',
 				HINT = 'Stop all server and client processes and recreate PostgreSQL and every client database for an administrative reset.';
 			RETURN NULL;
+		END;
+		$$`,
+		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.finalize_scope_write_receipt()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		DECLARE
+			current_state TEXT;
+		BEGIN
+			SELECT receipt_state
+			INTO current_state
+			FROM sync.scope_write_receipts
+			WHERE user_pk = NEW.user_pk
+			  AND operation_id = NEW.operation_id;
+
+			IF current_state IS DISTINCT FROM 'completed' THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '55000',
+					MESSAGE = 'scope write receipt cannot commit before completion';
+			END IF;
+			RETURN NULL;
+		END;
+		$$`,
+		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.guard_server_source_reservation()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF TG_OP = 'INSERT' THEN
+				PERFORM pg_advisory_xact_lock(8031718527699873379);
+				LOCK TABLE sync.source_state IN SHARE ROW EXCLUSIVE MODE;
+				IF NEW.ever_used THEN
+					RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'new server source reservation must start unused';
+				END IF;
+				IF EXISTS (
+					SELECT 1
+					FROM sync.source_state
+					WHERE source_id COLLATE "C" = NEW.source_id COLLATE "C"
+					   OR replaced_by_source_id COLLATE "C" = NEW.source_id COLLATE "C"
+				) THEN
+					RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'client source history prevents server source reservation';
+				END IF;
+				RETURN NEW;
+			END IF;
+
+			IF TG_OP = 'UPDATE' THEN
+				IF NEW.source_id IS DISTINCT FROM OLD.source_id THEN
+					RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'server source reservation identity is immutable';
+				END IF;
+				IF OLD.ever_used OR NOT NEW.ever_used THEN
+					RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'server source reservation permits only first-use publication';
+				END IF;
+				RETURN NEW;
+			END IF;
+
+			PERFORM pg_advisory_xact_lock(8031718527699873379);
+			LOCK TABLE sync.source_state, sync.scope_write_receipts IN SHARE ROW EXCLUSIVE MODE;
+			IF OLD.ever_used THEN
+				RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'used server source reservation cannot be removed';
+			END IF;
+			IF EXISTS (
+				SELECT 1
+				FROM sync.source_state
+				WHERE source_id COLLATE "C" = OLD.source_id COLLATE "C"
+				   OR replaced_by_source_id COLLATE "C" = OLD.source_id COLLATE "C"
+			)
+			   OR EXISTS (SELECT 1 FROM sync.scope_write_receipts WHERE writer_id COLLATE "C" = OLD.source_id COLLATE "C") THEN
+				RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'referenced server source reservation cannot be removed';
+			END IF;
+			RETURN OLD;
 		END;
 		$$`,
 	}
@@ -591,7 +730,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 			IF TG_OP = 'INSERT' THEN
 				IF NEW._sync_scope_id IS NULL OR NEW._sync_scope_id = '' THEN
 					NEW._sync_scope_id := bundle_user_id;
-				ELSIF NEW._sync_scope_id <> bundle_user_id THEN
+				ELSIF NEW._sync_scope_id COLLATE "C" <> bundle_user_id COLLATE "C" THEN
 					RAISE EXCEPTION USING
 						ERRCODE = 'P0001',
 						MESSAGE = format(
@@ -612,7 +751,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 				IF NEW._sync_scope_id IS NULL THEN
 					RAISE EXCEPTION 'nullable new scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 				END IF;
-				IF OLD._sync_scope_id <> bundle_user_id THEN
+				IF OLD._sync_scope_id COLLATE "C" <> bundle_user_id COLLATE "C" THEN
 					RAISE EXCEPTION USING
 						ERRCODE = 'P0001',
 						MESSAGE = format(
@@ -638,7 +777,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 			IF OLD._sync_scope_id IS NULL THEN
 				RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 			END IF;
-			IF OLD._sync_scope_id <> bundle_user_id THEN
+			IF OLD._sync_scope_id COLLATE "C" <> bundle_user_id COLLATE "C" THEN
 				RAISE EXCEPTION USING
 					ERRCODE = 'P0001',
 					MESSAGE = format(
@@ -704,7 +843,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 					IF OLD._sync_scope_id IS NULL THEN
 						RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 					END IF;
-					IF OLD._sync_scope_id <> bundle_user_id THEN
+					IF OLD._sync_scope_id COLLATE "C" <> bundle_user_id COLLATE "C" THEN
 						RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 					END IF;
 					old_key_text := to_jsonb(OLD)->>key_column;
@@ -733,7 +872,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 				IF NEW._sync_scope_id IS NULL THEN
 					RAISE EXCEPTION 'nullable new scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 				END IF;
-				IF NEW._sync_scope_id <> bundle_user_id THEN
+				IF NEW._sync_scope_id COLLATE "C" <> bundle_user_id COLLATE "C" THEN
 					RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 				END IF;
 				new_key_text := to_jsonb(NEW)->>key_column;
@@ -749,7 +888,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 					IF OLD._sync_scope_id IS NULL THEN
 						RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 					END IF;
-					IF OLD._sync_scope_id <> bundle_user_id THEN
+					IF OLD._sync_scope_id COLLATE "C" <> bundle_user_id COLLATE "C" THEN
 						RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
 					END IF;
 					old_key_text := to_jsonb(OLD)->>key_column;
@@ -820,10 +959,20 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		`CREATE INDEX IF NOT EXISTS ps_expires_at_idx ON sync.push_sessions(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS ss_expires_at_idx ON sync.snapshot_sessions(expires_at, snapshot_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ssr_snapshot_table_key_idx ON sync.snapshot_session_rows(snapshot_id, table_id, key_bytes)`,
+		`CREATE INDEX IF NOT EXISTS scope_write_receipts_cleanup_idx ON sync.scope_write_receipts(receipt_expires_at, user_pk, operation_id) WHERE receipt_state = 'completed'`,
 	}
 	for _, stmt := range bootstrapIndexes {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("bundle bootstrap index creation failed: %w", err)
+		}
+	}
+	managedTriggers := []string{
+		`CREATE CONSTRAINT TRIGGER scope_write_receipts_finalizer AFTER INSERT OR UPDATE ON sync.scope_write_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync.finalize_scope_write_receipt()`,
+		`CREATE TRIGGER server_source_reservations_guard BEFORE INSERT OR UPDATE OR DELETE ON sync.server_source_reservations FOR EACH ROW EXECUTE FUNCTION sync.guard_server_source_reservation()`,
+	}
+	for _, stmt := range managedTriggers {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("scope write managed trigger creation failed: %w", err)
 		}
 	}
 	s.logger.Info("Sync schema initialized successfully", "migrations", len(migrations))

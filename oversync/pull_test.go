@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -362,4 +363,32 @@ func TestProcessPull_RepeatableReadSnapshotDoesNotMixWithConcurrentPrune(t *test
 	var prunedErr *HistoryPrunedError
 	require.ErrorAs(t, err, &prunedErr)
 	require.Equal(t, int64(2), prunedErr.RetainedFloor)
+}
+
+func TestRecordHistoryPrunedError_OverridesReadOnlySerializableSessionDefaults(t *testing.T) {
+	ctx := context.Background()
+	basePool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "history_pruned_modes_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, basePool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), basePool, schemaName) })
+	_ = newBootstrappedIntegrationService(t, ctx, basePool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "history-pruned-mutation-mode-bootstrap",
+		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+	}, integrationTestLogger(slog.LevelWarn))
+	config, err := pgxpool.ParseConfig(basePool.Config().ConnString())
+	require.NoError(t, err)
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE`)
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	require.NoError(t, pool.Ping(ctx))
+
+	service, err := NewRuntimeService(pool, &ServiceConfig{AppName: "history-pruned-mutation-mode-test"}, integrationTestLogger(slog.LevelWarn))
+	require.NoError(t, err)
+	require.NoError(t, service.recordHistoryPrunedError(ctx))
 }

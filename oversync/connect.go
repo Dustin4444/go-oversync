@@ -12,12 +12,15 @@ import (
 )
 
 func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequest) (_ *ConnectResponse, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "Connect"); err != nil {
+		return nil, err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := s.validateClientActor(actor, true); err != nil {
 		return nil, err
 	}
 	if req == nil {
@@ -31,7 +34,7 @@ func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequ
 	defer releaseConn()
 
 	var resp *ConnectResponse
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, conn, syncMutationTxOptions(), func(tx pgx.Tx) error {
 		if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
 			return err
 		}

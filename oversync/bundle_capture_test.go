@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mobiletoly/go-oversync/internal/sourceid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -112,8 +113,8 @@ func TestRegisteredTableGuard_RejectsNullIdentityDrift(t *testing.T) {
 		fmt.Sprintf(`UPDATE %s.users SET name = 'changed' WHERE email = 'key@example.com'`, f.schemaIdent),
 		fmt.Sprintf(`DELETE FROM %s.users WHERE email = 'key@example.com'`, f.schemaIdent),
 	} {
-		err := f.svc.WithinSyncBundle(f.ctx, actor, source, func(tx pgx.Tx) error {
-			_, execErr := tx.Exec(f.ctx, statement)
+		err := f.svc.WithinSyncBundle(f.ctx, actor, source, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+			_, execErr := tx.Exec(ctx, statement)
 			return execErr
 		})
 		require.Error(t, err)
@@ -126,8 +127,8 @@ func TestRegisteredTableGuard_RejectsNullIdentityDrift(t *testing.T) {
 	require.NoError(t, f.pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM sync.bundle_capture_stage`).Scan(&captureRows))
 	require.Zero(t, captureRows)
 
-	err = f.svc.WithinSyncBundle(f.ctx, actor, f.source(1), func(tx pgx.Tx) error {
-		_, execErr := tx.Exec(f.ctx, fmt.Sprintf(`INSERT INTO %s.users(id, name, email) VALUES ('22222222-2222-2222-2222-222222222222', 'Valid', 'valid@example.com')`, f.schemaIdent))
+	err = f.svc.WithinSyncBundle(f.ctx, actor, f.source(1), retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.users(id, name, email) VALUES ('22222222-2222-2222-2222-222222222222', 'Valid', 'valid@example.com')`, f.schemaIdent))
 		return execErr
 	})
 	require.NoError(t, err)
@@ -222,17 +223,16 @@ func TestBootstrap_ExistingLayoutPreservesDirectWriteAndTruncateGuards(t *testin
 
 	manager := NewScopeManager(service, ScopeManagerConfig{Logger: integrationTestLogger(slog.LevelWarn)})
 	managedID := uuid.New()
-	managedResult, err := manager.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel"}, func(tx pgx.Tx) error {
+	managedResult, err := manager.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: "admin-panel", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, 'managed', 'managed@example.com')`, tableIdent), managedID)
 		return execErr
 	})
 	require.NoError(t, err)
-	require.NotNil(t, managedResult.Bundle)
 	require.Equal(t, int64(1), managedResult.Bundle.BundleSeq)
-	require.Len(t, managedResult.Bundle.Rows, 1)
+	require.Equal(t, int64(1), managedResult.Bundle.RowCount)
 
 	bundleID := uuid.New()
-	require.NoError(t, service.WithinSyncBundle(ctx, Actor{UserID: scopeID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, service.WithinSyncBundle(ctx, Actor{UserID: scopeID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, 'bundle', 'bundle@example.com')`, tableIdent), bundleID)
 		return execErr
 	}))
@@ -313,6 +313,14 @@ func requireRegisteredTruncateError(t *testing.T, err error, schemaName, tableNa
 	require.Contains(t, pgErr.Hint, "recreate PostgreSQL and every client database")
 }
 
+func requireRetryableCallbackStatementClassError(t *testing.T, err error, statementClass string) {
+	t.Helper()
+	require.Error(t, err)
+	var violation *RetryableCallbackViolationError
+	require.ErrorAs(t, err, &violation)
+	require.Contains(t, violation.Error(), "statement class is not allowed: "+statementClass)
+}
+
 func TestRegisteredTableGuard_RejectsDirectAndWithinSyncBundleTruncate(t *testing.T) {
 	ctx := context.Background()
 	pool := newIntegrationTestPool(t, ctx)
@@ -332,7 +340,7 @@ func TestRegisteredTableGuard_RejectsDirectAndWithinSyncBundleTruncate(t *testin
 	sourceID := "server-app"
 	mustInitializeEmptyScope(t, ctx, svc, userID, sourceID)
 	tableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, $2, $3)`, tableIdent), uuid.New(), "Before Truncate", "before@example.com")
 		return err
 	}))
@@ -349,21 +357,21 @@ func TestRegisteredTableGuard_RejectsDirectAndWithinSyncBundleTruncate(t *testin
 	require.NoError(t, tx.Rollback(ctx), "an explicitly aborted transaction must remain rollbackable")
 	require.Equal(t, want, loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID))
 
-	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 2}, func(tx pgx.Tx) error {
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 2}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
 		return err
 	})
-	requireRegisteredTruncateError(t, err, schemaName, "users")
+	requireRetryableCallbackStatementClassError(t, err, "truncate")
 	require.Equal(t, want, loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID))
 
-	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 2}, func(tx pgx.Tx) error {
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 2}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET name = 'Changed' WHERE _sync_scope_id = $1`, tableIdent), userID); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
 		return err
 	})
-	requireRegisteredTruncateError(t, err, schemaName, "users")
+	requireRetryableCallbackStatementClassError(t, err, "truncate")
 	require.Equal(t, want, loadTruncateGuardState(t, ctx, pool, schemaName, userID, sourceID))
 }
 
@@ -388,7 +396,7 @@ func TestRegisteredTableGuard_RejectsCascadeAndMultiTableTruncate(t *testing.T) 
 	}, integrationTestLogger(slog.LevelWarn))
 	userID := "truncate-cascade-user-" + suffix
 	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, 'User', 'user@example.com')`, userTableIdent), uuid.New())
 		return err
 	}))
@@ -484,7 +492,7 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 	source := BundleSource{SourceID: "server-app", SourceBundleID: 1}
 	mustInitializeEmptyScope(t, ctx, svc, userID, source.SourceID)
 
-	err := svc.WithinSyncBundle(ctx, actor, source, func(tx pgx.Tx) error {
+	err := svc.WithinSyncBundle(ctx, actor, source, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -545,6 +553,42 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 	require.Equal(t, int64(1), maxCommittedSourceBundleID)
 }
 
+func TestWithinSyncBundle_RejectsReservedActorAndBundleSource(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "bundle_reserved_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "bundle-reserved-test",
+		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+		ReservedServerSourceIDs:   []string{"server-reserved"},
+	}, integrationTestLogger(slog.LevelWarn))
+
+	callbackCalled := false
+	callback := func(context.Context, DatabaseWriteTx) error {
+		callbackCalled = true
+		return nil
+	}
+	for _, tc := range []struct {
+		name   string
+		actor  Actor
+		source BundleSource
+	}{
+		{name: "actor", actor: Actor{UserID: "reserved-user", SourceID: "server-reserved"}, source: BundleSource{SourceID: "client-source", SourceBundleID: 1}},
+		{name: "bundle source", actor: Actor{UserID: "reserved-user", SourceID: "client-source"}, source: BundleSource{SourceID: "server-reserved", SourceBundleID: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			callbackCalled = false
+			err := service.WithinSyncBundle(ctx, tc.actor, tc.source, retryableBundleWriteOptionsForTest(), callback)
+			require.ErrorIs(t, err, sourceid.ErrInvalid)
+			require.False(t, callbackCalled)
+		})
+	}
+}
+
 func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
@@ -567,7 +611,7 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 	rowID := uuid.New()
 	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
-	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -603,7 +647,7 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 	require.Zero(t, stagedCount)
 }
 
-func TestWithinSyncBundle_DoesNotRetryCallbackOnRetryableTransactionError(t *testing.T) {
+func TestWithinSyncBundle_RetriesDatabaseOnlyCallbackAndCommitsExactlyOneTransaction(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -623,18 +667,23 @@ func TestWithinSyncBundle_DoesNotRetryCallbackOnRetryableTransactionError(t *tes
 
 	userID := "bundle-single-attempt-user-" + suffix
 	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	rowID := uuid.New()
 
 	attempts := 0
-	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		attempts++
-		return &pgconn.PgError{Code: "40001", Message: "synthetic serialization failure"}
+		if attempts == 1 {
+			return &pgconn.PgError{Code: "40001", Message: "synthetic serialization failure"}
+		}
+		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.users (id, name, email) VALUES ($1, $2, $3)`, pgx.Identifier{schemaName}.Sanitize()), rowID, "Retry", "retry@example.com")
+		return err
 	})
-	require.Error(t, err)
-	require.Equal(t, 1, attempts)
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts)
 
 	var bundleCount int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
-	require.Zero(t, bundleCount)
+	require.Equal(t, 1, bundleCount)
 
 	var sourceStateCount int
 	require.NoError(t, pool.QueryRow(ctx, `
@@ -642,7 +691,11 @@ func TestWithinSyncBundle_DoesNotRetryCallbackOnRetryableTransactionError(t *tes
 		FROM sync.source_state
 		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 	`, userID).Scan(&sourceStateCount))
-	require.Zero(t, sourceStateCount)
+	require.Equal(t, 1, sourceStateCount)
+
+	var businessRowCount int
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.users WHERE id = $1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&businessRowCount))
+	require.Equal(t, 1, businessRowCount)
 }
 
 func TestWithinSyncBundle_RetiredSourceFailsClosed(t *testing.T) {
@@ -677,7 +730,7 @@ func TestWithinSyncBundle_RetiredSourceFailsClosed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: oldSourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: oldSourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -714,7 +767,7 @@ func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 	postRowID := uuid.New()
 	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -728,7 +781,7 @@ func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 		return err
 	}))
 
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, func(tx pgx.Tx) error {
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			DELETE FROM %s.users
 			WHERE id = $1
@@ -812,7 +865,7 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 	childID := uuid.New()
 	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.parents (id, name)
 			VALUES ($1, $2)
@@ -826,7 +879,7 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 		return err
 	}))
 
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, func(tx pgx.Tx) error {
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.parents
 			SET id = $2
@@ -949,7 +1002,7 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 	rowID := uuid.New()
 	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -1031,8 +1084,8 @@ func (f *bundleOwnerGuardFixture) seedOwnerUser(t *testing.T, ownerID string, bu
 	t.Helper()
 
 	f.initializeOwner(t, ownerID)
-	require.NoError(t, f.svc.WithinSyncBundle(f.ctx, Actor{UserID: ownerID}, f.source(bundleID), func(tx pgx.Tx) error {
-		_, err := tx.Exec(f.ctx, fmt.Sprintf(`
+	require.NoError(t, f.svc.WithinSyncBundle(f.ctx, Actor{UserID: ownerID}, f.source(bundleID), retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
 		`, f.schemaIdent), f.rowID, "Owner A", "owner-a@example.com")
@@ -1043,8 +1096,8 @@ func (f *bundleOwnerGuardFixture) seedOwnerUser(t *testing.T, ownerID string, bu
 func (f *bundleOwnerGuardFixture) requireRejectedUserWrite(t *testing.T, ownerID string, bundleID int64, expectedMessage, query string, args ...any) {
 	t.Helper()
 
-	err := f.svc.WithinSyncBundle(f.ctx, Actor{UserID: ownerID}, f.source(bundleID), func(tx pgx.Tx) error {
-		_, err := tx.Exec(f.ctx, fmt.Sprintf(query, f.schemaIdent), args...)
+	err := f.svc.WithinSyncBundle(f.ctx, Actor{UserID: ownerID}, f.source(bundleID), retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(query, f.schemaIdent), args...)
 		return err
 	})
 	require.Error(t, err)

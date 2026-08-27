@@ -208,6 +208,9 @@ func (s *SyncService) emitBundleChangeNotify(ctx context.Context, tx pgx.Tx, use
 
 // RunBundleChangeListener listens for committed bundle notifications and fans them out locally.
 func (s *SyncService) RunBundleChangeListener(ctx context.Context) error {
+	if err := rejectRetryableCallbackContext(ctx, "RunBundleChangeListener"); err != nil {
+		return err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -351,13 +354,16 @@ func (s *SyncService) SubscribeBundleChanges(
 	actor Actor,
 	afterBundleSeq int64,
 ) (<-chan BundleChangeEvent, error) {
+	if err := rejectRetryableCallbackContext(ctx, "SubscribeBundleChanges"); err != nil {
+		return nil, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if !s.bundleChangeWatchEnabled() {
 		return nil, errBundleChangeWatchDisabled
 	}
-	if err := actor.validate(false); err != nil {
+	if err := s.validateClientActor(actor, false); err != nil {
 		return nil, err
 	}
 	if afterBundleSeq < 0 {
@@ -371,7 +377,7 @@ func (s *SyncService) SubscribeBundleChanges(
 	defer done()
 
 	var userPK int64
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
 		if err := requireScopeInitializedQuerier(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
@@ -426,10 +432,12 @@ func (s *SyncService) bundleChangeSubscriberCount(userPK int64) int {
 // BundleChangeSubscriberCountForTest returns the current process-local subscriber count for a
 // scope. It is intended for example/test diagnostics; production correctness must not depend on it.
 func (s *SyncService) BundleChangeSubscriberCountForTest(ctx context.Context, userID string) (int, error) {
+	if err := rejectRetryableCallbackContext(ctx, "BundleChangeSubscriberCountForTest"); err != nil {
+		return 0, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return 0, fmt.Errorf("user_id is required")
 	}

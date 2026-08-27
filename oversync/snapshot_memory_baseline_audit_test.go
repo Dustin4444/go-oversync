@@ -423,8 +423,8 @@ func BenchmarkAuditDatabaseSnapshotBoundedCleanup(b *testing.B) {
 	probeRowID := auditBenchmarkUUID(77, 0)
 	if syncProbeErr == nil {
 		tableIdent := pgx.Identifier{fixture.schemaName, "users"}.Sanitize()
-		syncProbeErr = fixture.svc.WithinSyncBundle(fixture.ctx, fixture.writer, BundleSource{SourceID: fixture.writer.SourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
-			_, execErr := tx.Exec(fixture.ctx, fmt.Sprintf(`INSERT INTO %s(_sync_scope_id,id,name,email) VALUES($1,$2,'Cleanup probe','cleanup-probe@example.com')`, tableIdent), fixture.writer.UserID, probeRowID)
+		syncProbeErr = fixture.svc.WithinSyncBundle(fixture.ctx, fixture.writer, BundleSource{SourceID: fixture.writer.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+			_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s(_sync_scope_id,id,name,email) VALUES($1,$2,'Cleanup probe','cleanup-probe@example.com')`, tableIdent), fixture.writer.UserID, probeRowID)
 			return execErr
 		})
 	}

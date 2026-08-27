@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
@@ -100,7 +99,7 @@ func TestWatchRoute_WakesAfterServerOriginatedWrite(t *testing.T) {
 
 	rowID := uuid.New()
 	scopeMgr := oversync.NewScopeManager(ts.SyncService, oversync.ScopeManagerConfig{Logger: watchRouteTestLogger()})
-	result, err := scopeMgr.ExecWrite(ctx, userID, oversync.ScopeWriteOptions{WriterID: "watch-route-admin"}, func(tx pgx.Tx) error {
+	result, err := scopeMgr.ExecWrite(ctx, userID, oversync.ScopeWriteOptions{WriterID: "watch-route-admin", RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO business.users (id, name, email)
 			VALUES ($1, $2, $3)

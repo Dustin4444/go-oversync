@@ -16,6 +16,7 @@ go-oversync handles the sync machinery that is easy to underestimate:
 - trigger-based dirty-row capture on SQLite clients
 - staged push sessions for durable, retryable uploads
 - authoritative PostgreSQL commits and replay back to clients
+- retry-safe server-originated writes recorded in normal sync history
 - complete committed-bundle pulls with stable checkpoints
 - conflict reporting and client-side resolution hooks
 - frozen snapshot rebuilds for fresh installs and retained-history recovery
@@ -292,6 +293,7 @@ HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable sta
 - docs site: <https://mobiletoly.github.io/go-oversync/>
 - getting started: `docs/getting-started.md`
 - server reference: `docs/documentation/server.md`
+- server-originated writes: `docs/documentation/server-originated-writes.md`
 - client reference: `docs/documentation/client.md`
 - HTTP API reference: `docs/documentation/api.md`
 

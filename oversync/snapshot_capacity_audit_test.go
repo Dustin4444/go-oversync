@@ -177,7 +177,13 @@ func benchmarkAuditSnapshotAdmissionSyncProbe(b *testing.B, fixture *auditDataba
 	if err := fixture.svc.WithinSyncBundle(ctx, fixture.writer, BundleSource{
 		SourceID:       fixture.writer.SourceID,
 		SourceBundleID: 1,
-	}, func(pgx.Tx) error { return nil }); err != nil {
+	}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s.users (id, name, email)
+			VALUES ($1, 'snapshot-admission-probe', 'snapshot-admission-probe@example.com')
+		`, pgx.Identifier{fixture.schemaName}.Sanitize()), uuid.NewSHA1(uuid.NameSpaceOID, []byte("snapshot-admission-probe\x00"+fixture.writer.UserID)))
+		return err
+	}); err != nil {
 		b.Fatalf("ordinary push probe while snapshot requests are admitted: %v", err)
 	}
 	if _, err := fixture.svc.ProcessPull(ctx, fixture.reader, 0, 10, 0); err != nil {

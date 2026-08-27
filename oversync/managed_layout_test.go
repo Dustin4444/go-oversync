@@ -169,6 +169,54 @@ func TestBootstrap_ValidatesManagedLayoutManifest(t *testing.T) {
 	require.Equal(t, captureTriggerOID, captureTriggerOIDAfter)
 }
 
+func TestManagedLayout_RevisedAndLegacyManifestsRejectEachOther(t *testing.T) {
+	fixture := newManagedLayoutTestFixture(t, "managed_retryable_reject_")
+	revised, err := fixture.service.expectedManagedLayoutFacts(fixture.ctx, fixture.harness.pool)
+	require.NoError(t, err)
+
+	retryableWriteKeys := make(map[managedLayoutFactKey]struct{}, len(retryableWriteManagedLayoutFacts))
+	for _, fact := range retryableWriteManagedLayoutFacts {
+		retryableWriteKeys[managedLayoutFactKey{Kind: fact.Kind, Identity: fact.Identity, Attribute: fact.Attribute}] = struct{}{}
+	}
+	legacyValues := map[managedLayoutFactKey]string{
+		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "collation"}:     "pg_catalog.default",
+		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "collation"}:                  "pg_catalog.default",
+		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "collation"}:  "pg_catalog.default",
+		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "collation"}:               "pg_catalog.default",
+		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "collation"}:  "pg_catalog.default",
+		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "collation"}:     "pg_catalog.default",
+		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "collation"}:    "pg_catalog.default",
+		{Kind: "column", Identity: "sync.source_state.source_id", Attribute: "collation"}:                "pg_catalog.default",
+		{Kind: "column", Identity: "sync.user_state.user_id", Attribute: "collation"}:                    "pg_catalog.default",
+		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "source.sha256"}: "3304a5f48a65f815c501e633c7b8645acbd992ac54d6256d0b90c458f1df0049",
+		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "source.sha256"}:  "ea9676345ff44e0978f2621bfe215c2265dc3ed7d34cf88e9b55ebc850e67cd4",
+		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.2"}:          `{"role": "key", "column": "source_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
+		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.2"}:       `{"role": "key", "column": "source_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
+		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.2"}:                    `{"role": "key", "column": "source_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
+		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute.1"}:               `{"role": "key", "column": "user_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
+	}
+	legacy := make([]managedLayoutFact, 0, len(revised)-len(retryableWriteManagedLayoutFacts))
+	for _, fact := range revised {
+		key := managedLayoutFactKey{Kind: fact.Kind, Identity: fact.Identity, Attribute: fact.Attribute}
+		if _, added := retryableWriteKeys[key]; added {
+			continue
+		}
+		if value, changed := legacyValues[key]; changed {
+			fact.Value = value
+		}
+		legacy = append(legacy, fact)
+	}
+	legacy, err = normalizeManagedLayoutFacts(legacy)
+	require.NoError(t, err)
+
+	err = validateManagedLayoutFacts(syncSchemaLayoutName, revised, legacy)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "managed sync layout mismatch")
+	err = validateManagedLayoutFacts(syncSchemaLayoutName, legacy, revised)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "managed sync layout mismatch")
+}
+
 func TestBootstrap_ExistingLayoutRejectsManagedDriftWithoutMutation(t *testing.T) {
 	tests := []struct {
 		name string
@@ -186,7 +234,7 @@ func TestBootstrap_ExistingLayoutRejectsManagedDriftWithoutMutation(t *testing.T
 		{name: "column nullability", sql: `ALTER TABLE sync.snapshot_sessions ALTER COLUMN row_count DROP NOT NULL`},
 		{name: "column default", sql: `ALTER TABLE sync.snapshot_sessions ALTER COLUMN row_count SET DEFAULT 9`},
 		{name: "column identity", sql: `ALTER TABLE sync.user_state ALTER COLUMN user_pk DROP IDENTITY`},
-		{name: "column collation", sql: `ALTER TABLE sync.bundle_log ALTER COLUMN canonical_request_hash TYPE text COLLATE "C"`},
+		{name: "column collation", sql: `ALTER TABLE sync.bundle_log ALTER COLUMN canonical_request_hash TYPE text COLLATE "default"`},
 		{name: "table persistence", sql: `ALTER TABLE sync.snapshot_session_rows SET UNLOGGED`},
 		{name: "table row security", sql: `ALTER TABLE sync.snapshot_sessions ENABLE ROW LEVEL SECURITY`},
 		{name: "table replica identity", sql: `ALTER TABLE sync.snapshot_sessions REPLICA IDENTITY FULL`},
@@ -409,7 +457,7 @@ func TestBootstrap_ManagedLayoutSupportedPostgresVersions(t *testing.T) {
 					&indexAttribute,
 				),
 			)
-			require.Equal(t, "pg_catalog.default", indexAttribute["collation"])
+			require.Equal(t, "pg_catalog.C", indexAttribute["collation"])
 
 			second, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 			require.NoError(t, err)

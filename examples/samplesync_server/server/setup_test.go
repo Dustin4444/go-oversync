@@ -2,9 +2,15 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/mobiletoly/go-oversync/examples/internal/exampleauth"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,4 +56,30 @@ func TestResponseCapture_BoundsBufferedBody(t *testing.T) {
 	require.Equal(t, body, recorder.Body.Bytes())
 	require.Len(t, capture.buf, maxLoggedBodyBytes)
 	require.True(t, capture.truncated)
+}
+
+func TestDummySigninHandlerPreservesExactUserIdentity(t *testing.T) {
+	auth := exampleauth.New("exact-identity-test-secret")
+	handler := sampleSyncDummySigninHandler(auth, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for _, userID := range []string{"test-user", " test-user "} {
+		body, err := json.Marshal(map[string]string{"user": userID, "password": "any"})
+		require.NoError(t, err)
+		request := httptest.NewRequest(http.MethodPost, "/dummy-signin", bytes.NewReader(body))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		require.Equal(t, http.StatusOK, response.Code)
+
+		var result struct {
+			Token string `json:"token"`
+			User  string `json:"user"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
+		require.Equal(t, userID, result.User)
+		claims, err := auth.ValidateToken(result.Token)
+		require.NoError(t, err)
+		require.Equal(t, userID, claims.Subject)
+		require.NotNil(t, claims.ExpiresAt)
+		require.Greater(t, time.Until(claims.ExpiresAt.Time), time.Duration(0))
+	}
 }

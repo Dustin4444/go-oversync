@@ -139,12 +139,15 @@ type pushSessionState struct {
 }
 
 func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *PushSessionCreateRequest) (_ *PushSessionCreateResponse, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "CreatePushSession"); err != nil {
+		return nil, err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := s.validateClientActor(actor, true); err != nil {
 		return nil, err
 	}
 	if req == nil {
@@ -170,121 +173,119 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 	defer releaseConn()
 
 	var resp *PushSessionCreateResponse
-	err = runRetryableTx(ctx, 3, 25*time.Millisecond, func() error {
+	err = runRetryableOwnedTransaction(ctx, conn, func(tx pgx.Tx) error {
 		resp = nil
-		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			if err := s.configureUploadTx(ctx, tx); err != nil {
-				return err
+		if err := s.configureUploadTx(ctx, tx); err != nil {
+			return err
+		}
+		if err := cleanupExpiredPushSessionsQuerier(ctx, tx); err != nil {
+			return err
+		}
+		if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
+			return err
+		}
+		scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
+		if err != nil {
+			return err
+		}
+		scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
+		if err != nil {
+			return err
+		}
+
+		initializationID := ""
+		switch scopeState.State {
+		case scopeStateUninitialized:
+			if req.InitializationID != "" {
+				return &InitializationExpiredError{Message: "initialization lease is no longer active"}
 			}
-			if err := cleanupExpiredPushSessionsQuerier(ctx, tx); err != nil {
-				return err
+			return &ScopeUninitializedError{UserID: actor.UserID}
+		case scopeStateInitializing:
+			if req.InitializationID == "" {
+				return &PushSessionInvalidError{Message: "initialization_id is required while the scope is initializing"}
 			}
-			if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
-				return err
-			}
-			scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
+			refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
+			leasedState, err := requireActiveInitializationLease(ctx, tx, actor.UserID, actor.SourceID, req.InitializationID, refreshUntil)
 			if err != nil {
 				return err
 			}
-			scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
-			if err != nil {
-				return err
+			initializationID = leasedState.InitializationID
+		case scopeStateInitialized:
+			if req.InitializationID != "" {
+				return &PushSessionInvalidError{Message: "initialization_id must be absent once the scope is initialized"}
 			}
+		default:
+			return fmt.Errorf("unexpected scope state %q", scopeState.State)
+		}
 
-			initializationID := ""
-			switch scopeState.State {
-			case scopeStateUninitialized:
-				if req.InitializationID != "" {
-					return &InitializationExpiredError{Message: "initialization lease is no longer active"}
-				}
-				return &ScopeUninitializedError{UserID: actor.UserID}
-			case scopeStateInitializing:
-				if req.InitializationID == "" {
-					return &PushSessionInvalidError{Message: "initialization_id is required while the scope is initializing"}
-				}
-				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
-				leasedState, err := requireActiveInitializationLease(ctx, tx, actor.UserID, actor.SourceID, req.InitializationID, refreshUntil)
-				if err != nil {
-					return err
-				}
-				initializationID = leasedState.InitializationID
-			case scopeStateInitialized:
-				if req.InitializationID != "" {
-					return &PushSessionInvalidError{Message: "initialization_id must be absent once the scope is initialized"}
-				}
-			default:
-				return fmt.Errorf("unexpected scope state %q", scopeState.State)
+		meta, err := loadCommittedPushMetadataBySourceTuple(ctx, tx, scopeState.UserPK, actor.SourceID, req.SourceBundleID)
+		if err != nil {
+			return err
+		}
+		if meta != nil {
+			if meta.CanonicalRequestHash != req.CanonicalRequestHash {
+				return &PushSessionInvalidError{Message: "canonical_request_hash does not match the committed source tuple"}
 			}
+			resp = &PushSessionCreateResponse{
+				Status:               "already_committed",
+				BundleSeq:            meta.BundleSeq,
+				SourceID:             meta.SourceID,
+				SourceBundleID:       meta.SourceBundleID,
+				RowCount:             meta.RowCount,
+				BundleHash:           meta.BundleHash,
+				CanonicalRequestHash: meta.CanonicalRequestHash,
+			}
+			return nil
+		}
 
-			meta, err := loadCommittedPushMetadataBySourceTuple(ctx, tx, scopeState.UserPK, actor.SourceID, req.SourceBundleID)
-			if err != nil {
-				return err
+		expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleID(ctx, tx, scopeState.UserPK, actor.UserID, actor.SourceID)
+		if err != nil {
+			return err
+		}
+		switch {
+		case req.SourceBundleID < expectedSourceBundleID:
+			return &SourceTupleHistoryPrunedError{
+				UserID:                         actor.UserID,
+				SourceID:                       actor.SourceID,
+				SourceBundleID:                 req.SourceBundleID,
+				MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
 			}
-			if meta != nil {
-				if meta.CanonicalRequestHash != req.CanonicalRequestHash {
-					return &PushSessionInvalidError{Message: "canonical_request_hash does not match the committed source tuple"}
-				}
-				resp = &PushSessionCreateResponse{
-					Status:               "already_committed",
-					BundleSeq:            meta.BundleSeq,
-					SourceID:             meta.SourceID,
-					SourceBundleID:       meta.SourceBundleID,
-					RowCount:             meta.RowCount,
-					BundleHash:           meta.BundleHash,
-					CanonicalRequestHash: meta.CanonicalRequestHash,
-				}
-				return nil
+		case req.SourceBundleID > expectedSourceBundleID:
+			return &SourceSequenceOutOfOrderError{
+				UserID:   actor.UserID,
+				SourceID: actor.SourceID,
+				Expected: expectedSourceBundleID,
+				Actual:   req.SourceBundleID,
 			}
+		}
 
-			expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleID(ctx, tx, scopeState.UserPK, actor.UserID, actor.SourceID)
-			if err != nil {
-				return err
-			}
-			switch {
-			case req.SourceBundleID < expectedSourceBundleID:
-				return &SourceTupleHistoryPrunedError{
-					UserID:                         actor.UserID,
-					SourceID:                       actor.SourceID,
-					SourceBundleID:                 req.SourceBundleID,
-					MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
-				}
-			case req.SourceBundleID > expectedSourceBundleID:
-				return &SourceSequenceOutOfOrderError{
-					UserID:   actor.UserID,
-					SourceID: actor.SourceID,
-					Expected: expectedSourceBundleID,
-					Actual:   req.SourceBundleID,
-				}
-			}
-
-			if _, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 				DELETE FROM sync.push_sessions
 				WHERE user_pk = $1
 				  AND source_id = $2
 				  AND source_bundle_id = $3
 			`, scopeState.UserPK, actor.SourceID, req.SourceBundleID); err != nil {
-				return fmt.Errorf("delete existing staging push session: %w", err)
-			}
+			return fmt.Errorf("delete existing staging push session: %w", err)
+		}
 
-			pushID := uuid.NewString()
-			expiresAt := time.Now().UTC().Add(s.pushSessionTTL())
-			if _, err := tx.Exec(ctx, `
+		pushID := uuid.NewString()
+		expiresAt := time.Now().UTC().Add(s.pushSessionTTL())
+		if _, err := tx.Exec(ctx, `
 				INSERT INTO sync.push_sessions (
 					push_id, user_pk, source_id, source_bundle_id, planned_row_count, canonical_request_hash, next_expected_row_ordinal, initialization_id, expires_at
 				) VALUES ($1::uuid, $2, $3, $4, $5, $6, 0, $7::uuid, $8)
 			`, pushID, scopeState.UserPK, actor.SourceID, req.SourceBundleID, req.PlannedRowCount, req.CanonicalRequestHash, nullableUUIDString(initializationID), expiresAt); err != nil {
-				return fmt.Errorf("insert push session: %w", err)
-			}
+			return fmt.Errorf("insert push session: %w", err)
+		}
 
-			resp = &PushSessionCreateResponse{
-				PushID:                 pushID,
-				Status:                 "staging",
-				PlannedRowCount:        req.PlannedRowCount,
-				NextExpectedRowOrdinal: 0,
-				CanonicalRequestHash:   req.CanonicalRequestHash,
-			}
-			return nil
-		})
+		resp = &PushSessionCreateResponse{
+			PushID:                 pushID,
+			Status:                 "staging",
+			PlannedRowCount:        req.PlannedRowCount,
+			NextExpectedRowOrdinal: 0,
+			CanonicalRequestHash:   req.CanonicalRequestHash,
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -293,12 +294,15 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 }
 
 func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID string, req *PushSessionChunkRequest) (_ *PushSessionChunkResponse, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "UploadPushChunk"); err != nil {
+		return nil, err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := s.validateClientActor(actor, true); err != nil {
 		return nil, err
 	}
 	if err := validatePushSessionLookupID(pushID); err != nil {
@@ -333,87 +337,85 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 	defer releaseConn()
 
 	var resp *PushSessionChunkResponse
-	err = runRetryableTx(ctx, 3, 25*time.Millisecond, func() error {
+	err = runRetryableOwnedTransaction(ctx, conn, func(tx pgx.Tx) error {
 		resp = nil
-		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			if err := s.configureUploadTx(ctx, tx); err != nil {
+		if err := s.configureUploadTx(ctx, tx); err != nil {
+			return err
+		}
+		session, err := loadPushSessionForUpdate(ctx, tx, pushID)
+		if err != nil {
+			return err
+		}
+		if session.UserID != actor.UserID {
+			return &PushSessionForbiddenError{}
+		}
+		if time.Now().UTC().After(session.ExpiresAt) {
+			return &PushSessionExpiredError{}
+		}
+		if session.InitializationID != "" {
+			refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
+			if _, err := requireActiveInitializationLease(ctx, tx, actor.UserID, session.SourceID, session.InitializationID, refreshUntil); err != nil {
 				return err
 			}
-			session, err := loadPushSessionForUpdate(ctx, tx, pushID)
+		}
+
+		if req.StartRowOrdinal != session.NextExpectedRowOrdinal {
+			return &PushChunkOutOfOrderError{Expected: session.NextExpectedRowOrdinal, Actual: req.StartRowOrdinal}
+		}
+		if req.StartRowOrdinal+int64(len(preparedRows)) > session.PlannedRowCount {
+			return &PushChunkInvalidError{Message: "chunk exceeds planned_row_count"}
+		}
+		if err := preflightPushPayloadDestinations(ctx, tx, preparedRows); err != nil {
+			return err
+		}
+
+		rowsData := make([][]any, 0, len(preparedRows))
+		for idx, row := range preparedRows {
+			opCode, err := opCodeFromString(row.op)
 			if err != nil {
 				return err
 			}
-			if session.UserID != actor.UserID {
-				return &PushSessionForbiddenError{}
+			rowOrdinal := req.StartRowOrdinal + int64(idx)
+			var payload any
+			if opCode != opCodeDelete {
+				payload = string(row.payload)
 			}
-			if time.Now().UTC().After(session.ExpiresAt) {
-				return &PushSessionExpiredError{}
-			}
-			if session.InitializationID != "" {
-				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
-				if _, err := requireActiveInitializationLease(ctx, tx, actor.UserID, session.SourceID, session.InitializationID, refreshUntil); err != nil {
-					return err
-				}
-			}
-
-			if req.StartRowOrdinal != session.NextExpectedRowOrdinal {
-				return &PushChunkOutOfOrderError{Expected: session.NextExpectedRowOrdinal, Actual: req.StartRowOrdinal}
-			}
-			if req.StartRowOrdinal+int64(len(preparedRows)) > session.PlannedRowCount {
-				return &PushChunkInvalidError{Message: "chunk exceeds planned_row_count"}
-			}
-			if err := preflightPushPayloadDestinations(ctx, tx, preparedRows); err != nil {
-				return err
-			}
-
-			rowsData := make([][]any, 0, len(preparedRows))
-			for idx, row := range preparedRows {
-				opCode, err := opCodeFromString(row.op)
-				if err != nil {
-					return err
-				}
-				rowOrdinal := req.StartRowOrdinal + int64(idx)
-				var payload any
-				if opCode != opCodeDelete {
-					payload = string(row.payload)
-				}
-				rowsData = append(rowsData, []any{
-					pushID,
-					rowOrdinal,
-					row.tableID,
-					row.keyBytes,
-					opCode,
-					row.baseRowVersion,
-					payload,
-					func() any {
-						if opCode == opCodeDelete {
-							return nil
-						}
-						return string(row.requestPayload)
-					}(),
-				})
-			}
-			if _, err := tx.CopyFrom(ctx,
-				pgx.Identifier{"sync", "push_session_rows"},
-				[]string{"push_id", "row_ordinal", "table_id", "key_bytes", "op_code", "base_bundle_seq", "payload_apply", "payload_request"},
-				pgx.CopyFromRows(rowsData),
-			); err != nil {
-				return fmt.Errorf("insert push session rows: %w", err)
-			}
-			if _, err := tx.Exec(ctx, `
+			rowsData = append(rowsData, []any{
+				pushID,
+				rowOrdinal,
+				row.tableID,
+				row.keyBytes,
+				opCode,
+				row.baseRowVersion,
+				payload,
+				func() any {
+					if opCode == opCodeDelete {
+						return nil
+					}
+					return string(row.requestPayload)
+				}(),
+			})
+		}
+		if _, err := tx.CopyFrom(ctx,
+			pgx.Identifier{"sync", "push_session_rows"},
+			[]string{"push_id", "row_ordinal", "table_id", "key_bytes", "op_code", "base_bundle_seq", "payload_apply", "payload_request"},
+			pgx.CopyFromRows(rowsData),
+		); err != nil {
+			return fmt.Errorf("insert push session rows: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
 			UPDATE sync.push_sessions
 			SET next_expected_row_ordinal = $2,
 				expires_at = $3
 			WHERE push_id = $1::uuid
 		`, pushID, req.StartRowOrdinal+int64(len(preparedRows)), time.Now().UTC().Add(s.pushSessionTTL())); err != nil {
-				return fmt.Errorf("refresh push session expiry: %w", err)
-			}
-			resp = &PushSessionChunkResponse{
-				PushID:                 pushID,
-				NextExpectedRowOrdinal: req.StartRowOrdinal + int64(len(preparedRows)),
-			}
-			return nil
-		})
+			return fmt.Errorf("refresh push session expiry: %w", err)
+		}
+		resp = &PushSessionChunkResponse{
+			PushID:                 pushID,
+			NextExpectedRowOrdinal: req.StartRowOrdinal + int64(len(preparedRows)),
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -460,12 +462,15 @@ func preflightPushPayloadDestinations(ctx context.Context, tx pgx.Tx, rows []pus
 }
 
 func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID string) (_ *PushSessionCommitResponse, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "CommitPushSession"); err != nil {
+		return nil, err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := s.validateClientActor(actor, true); err != nil {
 		return nil, err
 	}
 
@@ -476,149 +481,147 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 	defer releaseConn()
 
 	var resp *PushSessionCommitResponse
-	err = runRetryableTx(ctx, 3, 25*time.Millisecond, func() error {
+	err = runRetryableOwnedTransaction(ctx, conn, func(tx pgx.Tx) error {
 		resp = nil
-		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			if err := s.configureUploadTx(ctx, tx); err != nil {
-				return err
-			}
-			session, err := loadPushSessionForUpdate(ctx, tx, pushID)
-			if err != nil {
-				return err
-			}
-			if session.UserID != actor.UserID {
-				return &PushSessionForbiddenError{}
-			}
-			if time.Now().UTC().After(session.ExpiresAt) {
-				return &PushSessionExpiredError{}
-			}
+		if err := s.configureUploadTx(ctx, tx); err != nil {
+			return err
+		}
+		session, err := loadPushSessionForUpdate(ctx, tx, pushID)
+		if err != nil {
+			return err
+		}
+		if session.UserID != actor.UserID {
+			return &PushSessionForbiddenError{}
+		}
+		if time.Now().UTC().After(session.ExpiresAt) {
+			return &PushSessionExpiredError{}
+		}
 
-			rows, err := s.loadPushSessionPreparedRows(ctx, tx, pushID)
-			if err != nil {
-				return err
+		rows, err := s.loadPushSessionPreparedRows(ctx, tx, pushID)
+		if err != nil {
+			return err
+		}
+		if session.NextExpectedRowOrdinal != session.PlannedRowCount || int64(len(rows)) != session.PlannedRowCount {
+			return &PushCommitInvalidError{Message: fmt.Sprintf("staged row count %d does not match planned_row_count %d", len(rows), session.PlannedRowCount)}
+		}
+		seenTargets := make(map[string]struct{}, len(rows))
+		for idx, row := range rows {
+			if row.inputOrder != idx {
+				return &PushCommitInvalidError{Message: fmt.Sprintf("staged rows are not contiguous at row_ordinal %d", idx)}
 			}
-			if session.NextExpectedRowOrdinal != session.PlannedRowCount || int64(len(rows)) != session.PlannedRowCount {
-				return &PushCommitInvalidError{Message: fmt.Sprintf("staged row count %d does not match planned_row_count %d", len(rows), session.PlannedRowCount)}
+			targetKey := string(appendInt32BigEndian(append([]byte(nil), row.keyBytes...), row.tableID))
+			if _, exists := seenTargets[targetKey]; exists {
+				return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyString)}
 			}
-			seenTargets := make(map[string]struct{}, len(rows))
-			for idx, row := range rows {
-				if row.inputOrder != idx {
-					return &PushCommitInvalidError{Message: fmt.Sprintf("staged rows are not contiguous at row_ordinal %d", idx)}
-				}
-				targetKey := string(appendInt32BigEndian(append([]byte(nil), row.keyBytes...), row.tableID))
-				if _, exists := seenTargets[targetKey]; exists {
-					return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyString)}
-				}
-				seenTargets[targetKey] = struct{}{}
-			}
-			recomputedRequestHash, err := computePreparedPushRequestHash(rows)
-			if err != nil {
-				return err
-			}
-			if recomputedRequestHash != session.CanonicalRequestHash {
-				return &PushCommitInvalidError{Message: "canonical_request_hash does not match staged push rows"}
-			}
+			seenTargets[targetKey] = struct{}{}
+		}
+		recomputedRequestHash, err := computePreparedPushRequestHash(rows)
+		if err != nil {
+			return err
+		}
+		if recomputedRequestHash != session.CanonicalRequestHash {
+			return &PushCommitInvalidError{Message: "canonical_request_hash does not match staged push rows"}
+		}
 
-			if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
-				return fmt.Errorf("defer push constraints: %w", err)
-			}
-			if session.InitializationID != "" {
-				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
-				if _, err := requireActiveInitializationLease(ctx, tx, actor.UserID, session.SourceID, session.InitializationID, refreshUntil); err != nil {
-					return err
-				}
-				if err := ensureUserStateBaselineWithExec(ctx, tx, actor.UserID); err != nil {
-					return err
-				}
-			} else {
-				if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
-					return err
-				}
-			}
-
-			expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, session.UserPK, session.UserID, session.SourceID)
-			if err != nil {
+		if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
+			return fmt.Errorf("defer push constraints: %w", err)
+		}
+		if session.InitializationID != "" {
+			refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
+			if _, err := requireActiveInitializationLease(ctx, tx, actor.UserID, session.SourceID, session.InitializationID, refreshUntil); err != nil {
 				return err
 			}
-			if session.SourceBundleID != expectedSourceBundleID {
-				return &SourceSequenceChangedError{
-					UserID:   actor.UserID,
-					SourceID: session.SourceID,
-					Expected: expectedSourceBundleID,
-					Actual:   session.SourceBundleID,
-				}
-			}
-			if err := setBundleTxContext(ctx, tx, bundleTxContext{
-				UserID:           actor.UserID,
-				UserPK:           session.UserPK,
-				SourceID:         session.SourceID,
-				SourceBundleID:   session.SourceBundleID,
-				InitializationID: session.InitializationID,
-			}); err != nil {
+			if err := ensureUserStateBaselineWithExec(ctx, tx, actor.UserID); err != nil {
 				return err
 			}
-
-			rowStates, err := loadRowStateSnapshots(ctx, tx, session.UserPK, rows)
-			if err != nil {
+		} else {
+			if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
 				return err
 			}
-			for i, row := range rows {
-				var state *rowStateSnapshot
-				if rowStates[i].found {
-					state = &rowStates[i].rowStateSnapshot
-				}
-				if err := s.validatePushRowConflict(ctx, tx, actor.UserID, row, state); err != nil {
-					return err
-				}
-			}
+		}
 
-			for _, group := range batchPreparedPushRows(rows) {
-				if err := applyPreparedPushRowBatch(ctx, tx, actor.UserID, group); err != nil {
-					return err
-				}
+		expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, session.UserPK, session.UserID, session.SourceID)
+		if err != nil {
+			return err
+		}
+		if session.SourceBundleID != expectedSourceBundleID {
+			return &SourceSequenceChangedError{
+				UserID:   actor.UserID,
+				SourceID: session.SourceID,
+				Expected: expectedSourceBundleID,
+				Actual:   session.SourceBundleID,
 			}
+		}
+		if err := setBundleTxContext(ctx, tx, bundleTxContext{
+			UserID:           actor.UserID,
+			UserPK:           session.UserPK,
+			SourceID:         session.SourceID,
+			SourceBundleID:   session.SourceBundleID,
+			InitializationID: session.InitializationID,
+		}); err != nil {
+			return err
+		}
 
-			bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, session.UserPK, BundleSource{
-				SourceID:             session.SourceID,
-				SourceBundleID:       session.SourceBundleID,
-				CanonicalRequestHash: session.CanonicalRequestHash,
-			})
-			if err != nil {
+		rowStates, err := loadRowStateSnapshots(ctx, tx, session.UserPK, rows)
+		if err != nil {
+			return err
+		}
+		for i, row := range rows {
+			var state *rowStateSnapshot
+			if rowStates[i].found {
+				state = &rowStates[i].rowStateSnapshot
+			}
+			if err := s.validatePushRowConflict(ctx, tx, actor.UserID, row, state); err != nil {
 				return err
 			}
-			if bundle == nil {
-				return &PushCommitInvalidError{Message: "push session produced no captured business-table effects"}
-			}
+		}
 
-			if err := activateSourceState(ctx, tx, session.UserPK, session.UserID, session.SourceID, session.SourceBundleID); err != nil {
+		for _, group := range batchPreparedPushRows(rows) {
+			if err := applyPreparedPushRowBatch(ctx, tx, actor.UserID, group); err != nil {
 				return err
 			}
-			if err := s.applyRetentionPolicyForUser(ctx, tx, session.UserPK); err != nil {
-				return err
-			}
+		}
 
-			if _, err := tx.Exec(ctx, `
+		bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, session.UserPK, BundleSource{
+			SourceID:             session.SourceID,
+			SourceBundleID:       session.SourceBundleID,
+			CanonicalRequestHash: session.CanonicalRequestHash,
+		})
+		if err != nil {
+			return err
+		}
+		if bundle == nil {
+			return &PushCommitInvalidError{Message: "push session produced no captured business-table effects"}
+		}
+
+		if err := activateSourceState(ctx, tx, session.UserPK, session.UserID, session.SourceID, session.SourceBundleID); err != nil {
+			return err
+		}
+		if err := s.applyRetentionPolicyForUser(ctx, tx, session.UserPK); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(ctx, `
 			DELETE FROM sync.push_sessions
 			WHERE push_id = $1::uuid
 		`, pushID); err != nil {
-				return fmt.Errorf("delete committed push session: %w", err)
+			return fmt.Errorf("delete committed push session: %w", err)
+		}
+		if session.InitializationID != "" {
+			if err := transitionScopeToInitialized(ctx, tx, actor.UserID, session.SourceID); err != nil {
+				return err
 			}
-			if session.InitializationID != "" {
-				if err := transitionScopeToInitialized(ctx, tx, actor.UserID, session.SourceID); err != nil {
-					return err
-				}
-			}
+		}
 
-			resp = &PushSessionCommitResponse{
-				BundleSeq:            bundle.BundleSeq,
-				SourceID:             bundle.SourceID,
-				SourceBundleID:       bundle.SourceBundleID,
-				RowCount:             bundle.RowCount,
-				BundleHash:           bundle.BundleHash,
-				CanonicalRequestHash: bundle.CanonicalRequestHash,
-			}
-			return nil
-		})
+		resp = &PushSessionCommitResponse{
+			BundleSeq:            bundle.BundleSeq,
+			SourceID:             bundle.SourceID,
+			SourceBundleID:       bundle.SourceBundleID,
+			RowCount:             bundle.RowCount,
+			BundleHash:           bundle.BundleHash,
+			CanonicalRequestHash: bundle.CanonicalRequestHash,
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -627,12 +630,15 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 }
 
 func (s *SyncService) GetCommittedBundleRows(ctx context.Context, actor Actor, bundleSeq int64, afterRowOrdinal *int64, maxRows int) (_ *CommittedBundleRowsResponse, err error) {
+	if err := rejectRetryableCallbackContext(ctx, "GetCommittedBundleRows"); err != nil {
+		return nil, err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := s.validateClientActor(actor, true); err != nil {
 		return nil, err
 	}
 	if bundleSeq <= 0 {
@@ -650,7 +656,7 @@ func (s *SyncService) GetCommittedBundleRows(ctx context.Context, actor Actor, b
 	}
 
 	var resp *CommittedBundleRowsResponse
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
 		meta, err := loadCommittedBundleMeta(ctx, tx, actor.UserID, bundleSeq)
 		if err != nil {
 			return err
@@ -748,16 +754,19 @@ func (s *SyncService) GetCommittedBundleRows(ctx context.Context, actor Actor, b
 }
 
 func (s *SyncService) DeletePushSession(ctx context.Context, actor Actor, pushID string) error {
+	if err := rejectRetryableCallbackContext(ctx, "DeletePushSession"); err != nil {
+		return err
+	}
 	done, err := s.beginOperation()
 	if err != nil {
 		return err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := s.validateClientActor(actor, true); err != nil {
 		return err
 	}
 
-	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+	return pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
 		session, err := loadPushSessionForUpdate(ctx, tx, pushID)
 		if err != nil {
 			return err

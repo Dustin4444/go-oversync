@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -37,11 +36,14 @@ func NewScopeManager(service *SyncService, cfg ScopeManagerConfig) *ScopeManager
 
 type ScopeWriteOptions struct {
 	WriterID string
+	RetryableWriteOptions
+	RequiredEffectTables  []RegisteredEffectTable
+	ForbiddenEffectTables []RegisteredEffectTable
 }
 
 type ScopeWriteResult struct {
 	AutoInitialized bool
-	Bundle          *Bundle
+	Bundle          CommittedBundleRef
 }
 
 type ScopeWriteInvalidError struct {
@@ -59,8 +61,8 @@ func (e *ScopeWriteNoCapturedChangesError) Error() string {
 	if e == nil {
 		return "scope write produced no visible registered-table effects"
 	}
-	scopeID := strings.TrimSpace(e.ScopeID)
-	writerID := strings.TrimSpace(e.WriterID)
+	scopeID := e.ScopeID
+	writerID := e.WriterID
 	switch {
 	case scopeID != "" && writerID != "":
 		return fmt.Sprintf("scope write for %s via %s produced no visible registered-table effects", scopeID, writerID)
@@ -75,23 +77,36 @@ func (m *ScopeManager) ExecWrite(
 	ctx context.Context,
 	scopeID string,
 	opts ScopeWriteOptions,
-	fn func(tx pgx.Tx) error,
+	fn RetryableDatabaseWrite,
 ) (_ *ScopeWriteResult, err error) {
 	if m == nil || m.service == nil {
 		return nil, &ScopeWriteInvalidError{Message: "scope manager requires a sync service"}
 	}
-
-	scopeID = strings.TrimSpace(scopeID)
+	if err := rejectRetryableCallbackContext(ctx, "ScopeManager.ExecWrite"); err != nil {
+		return nil, err
+	}
 	if scopeID == "" {
 		return nil, &ScopeWriteInvalidError{Message: "scope_id is required"}
 	}
-
-	opts.WriterID = strings.TrimSpace(opts.WriterID)
-	if opts.WriterID == "" {
-		return nil, &ScopeWriteInvalidError{Message: "writer_id is required"}
+	if err := validateWriterID(opts.WriterID); err != nil {
+		return nil, &ScopeWriteInvalidError{Message: err.Error()}
+	}
+	if err := validateRetryableWriteOptions(opts.RetryableWriteOptions); err != nil {
+		return nil, &ScopeWriteInvalidError{Message: err.Error()}
 	}
 	if fn == nil {
 		return nil, &ScopeWriteInvalidError{Message: "scope write callback is required"}
+	}
+	requiredEffects, err := m.service.canonicalizeEffectSet(opts.RequiredEffectTables)
+	if err != nil {
+		return nil, &ScopeWriteInvalidError{Message: err.Error()}
+	}
+	forbiddenEffects, err := m.service.canonicalizeEffectSet(opts.ForbiddenEffectTables)
+	if err != nil {
+		return nil, &ScopeWriteInvalidError{Message: err.Error()}
+	}
+	if err := validateDisjointEffectSets(requiredEffects, forbiddenEffects); err != nil {
+		return nil, &ScopeWriteInvalidError{Message: err.Error()}
 	}
 
 	done, err := m.service.beginOperation()
@@ -106,60 +121,196 @@ func (m *ScopeManager) ExecWrite(
 	}
 	defer releaseConn()
 
-	var result *ScopeWriteResult
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+	result, err := runRetryableWriteTransaction(ctx, conn, func(tx pgx.Tx) (*ScopeWriteResult, error) {
+		if err := markReservedServerSourceUsed(ctx, tx, opts.WriterID, m.service.isReservedServerSourceID(opts.WriterID)); err != nil {
+			return nil, err
+		}
 		if err := ensureScopeStateExistsWithExec(ctx, tx, scopeID); err != nil {
-			return err
+			return nil, err
+		}
+		userPK, err := lookupUserPK(ctx, tx, scopeID)
+		if err != nil {
+			return nil, err
+		}
+		decision, err := acquireScopeWriteReceipt(ctx, tx, scopeWriteReceiptSpec{
+			userPK:               userPK,
+			operationID:          opts.OperationID,
+			operationHash:        opts.OperationHash,
+			requiredEffectsHash:  requiredEffects.hash,
+			forbiddenEffectsHash: forbiddenEffects.hash,
+			writerID:             opts.WriterID,
+			operationValidUntil:  opts.OperationValidUntil,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if decision.replay != nil {
+			return decision.replay, nil
 		}
 
 		scopeState, err := loadScopeStateForUpdate(ctx, tx, scopeID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		autoInitialized := false
 		switch scopeState.State {
 		case scopeStateInitialized:
 		case scopeStateInitializing:
-			return &ScopeInitializingError{UserID: scopeID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
+			return nil, &ScopeInitializingError{UserID: scopeID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
 		case scopeStateUninitialized:
 			if err := transitionScopeToInitialized(ctx, tx, scopeID, opts.WriterID); err != nil {
-				return err
+				return nil, err
 			}
 			autoInitialized = true
 		default:
-			return fmt.Errorf("unexpected scope state %q for scope %s", scopeState.State, scopeID)
+			return nil, fmt.Errorf("unexpected scope state %q for scope %s", scopeState.State, scopeID)
 		}
 
 		expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, scopeID, opts.WriterID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		bundle, err := m.service.withinSyncBundleTx(ctx, tx, Actor{UserID: scopeID}, BundleSource{
+		if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
+			return nil, fmt.Errorf("defer bundle constraints: %w", err)
+		}
+		source := BundleSource{
 			SourceID:       opts.WriterID,
 			SourceBundleID: expectedSourceBundleID,
-		}, fn)
+		}
+		if err := setBundleTxContext(ctx, tx, bundleTxContext{
+			UserID:         scopeID,
+			UserPK:         scopeState.UserPK,
+			SourceID:       opts.WriterID,
+			SourceBundleID: expectedSourceBundleID,
+		}); err != nil {
+			return nil, err
+		}
+		callbackCtx, capability, err := newRestrictedDatabaseWriteTx(ctx, tx, scopeID)
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if err := fn(callbackCtx, capability); err != nil {
+			return nil, err
+		}
+		if err := m.service.rejectForbiddenRawEffects(ctx, tx, scopeState.UserPK, forbiddenEffects); err != nil {
+			return nil, err
+		}
+		bundle, err := m.service.finalizeCapturedBundle(ctx, tx, Actor{UserID: scopeID}, scopeState.UserPK, source)
+		if err != nil {
+			return nil, err
 		}
 		if bundle == nil {
-			return &ScopeWriteNoCapturedChangesError{ScopeID: scopeID, WriterID: opts.WriterID}
+			if len(requiredEffects.keys) != 0 {
+				return nil, &RetryableCallbackViolationError{Message: "retryable database-write callback produced no required normalized registered-table effect"}
+			}
+			return nil, &ScopeWriteNoCapturedChangesError{ScopeID: scopeID, WriterID: opts.WriterID}
+		}
+		if err := requireNormalizedEffects(bundle, requiredEffects); err != nil {
+			return nil, err
+		}
+		if err := activateSourceState(ctx, tx, scopeState.UserPK, scopeID, opts.WriterID, expectedSourceBundleID); err != nil {
+			return nil, err
+		}
+		if err := m.service.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
+			return nil, err
 		}
 
-		result = &ScopeWriteResult{
+		result := &ScopeWriteResult{
 			AutoInitialized: autoInitialized,
-			Bundle:          bundle,
+			Bundle:          committedBundleRef(bundle),
 		}
-		return nil
+		if err := completeScopeWriteReceipt(ctx, tx, scopeState.UserPK, opts.OperationID, result); err != nil {
+			return nil, err
+		}
+		return result, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return result, nil
+}
+
+func markReservedServerSourceUsed(ctx context.Context, tx pgx.Tx, writerID string, required bool) error {
+	var everUsed bool
+	err := tx.QueryRow(ctx, `
+		SELECT ever_used
+		FROM sync.server_source_reservations
+		WHERE source_id = $1
+		FOR UPDATE
+	`, writerID).Scan(&everUsed)
+	if err == pgx.ErrNoRows {
+		if required {
+			return fmt.Errorf("configured server source reservation %q is unavailable", writerID)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock server source reservation: %w", err)
+	}
+	if everUsed {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sync.server_source_reservations
+		SET ever_used = TRUE
+		WHERE source_id = $1 AND ever_used = FALSE
+	`, writerID); err != nil {
+		return fmt.Errorf("publish server source reservation use: %w", err)
+	}
+	return nil
+}
+
+func (s *SyncService) rejectForbiddenRawEffects(ctx context.Context, tx pgx.Tx, userPK int64, forbidden canonicalEffectSet) error {
+	if len(forbidden.keys) == 0 {
+		return nil
+	}
+	var txid int64
+	if err := tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&txid); err != nil {
+		return fmt.Errorf("read current txid for forbidden effect validation: %w", err)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT table_id
+		FROM sync.bundle_capture_stage
+		WHERE txid = $1 AND user_pk = $2
+	`, txid, userPK)
+	if err != nil {
+		return fmt.Errorf("load raw captured effects: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tableID int32
+		if err := rows.Scan(&tableID); err != nil {
+			return fmt.Errorf("scan raw captured effect: %w", err)
+		}
+		info, err := s.tableInfoForID(tableID)
+		if err != nil {
+			return err
+		}
+		if _, rejected := forbidden.keys[Key(info.schemaName, info.tableName)]; rejected {
+			return &RetryableCallbackViolationError{Message: "retryable database-write callback produced a forbidden registered-table effect"}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate raw captured effects: %w", err)
+	}
+	return nil
+}
+
+func requireNormalizedEffects(bundle *Bundle, required canonicalEffectSet) error {
+	if len(required.keys) == 0 {
+		return nil
+	}
+	for _, row := range bundle.Rows {
+		if _, matched := required.keys[Key(row.Schema, row.Table)]; matched {
+			return nil
+		}
+	}
+	return &RetryableCallbackViolationError{Message: "retryable database-write callback produced no required normalized registered-table effect"}
 }

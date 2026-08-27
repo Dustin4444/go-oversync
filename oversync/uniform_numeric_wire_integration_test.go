@@ -126,7 +126,7 @@ func TestUniformNumericWire_PostgresRoundTripAcrossServerSurfaces(t *testing.T) 
 	t.Run("direct capture", func(t *testing.T) {
 		directID := uuid.New()
 		directActor := Actor{UserID: userID, SourceID: "server-app"}
-		require.NoError(t, service.WithinSyncBundle(ctx, directActor, BundleSource{SourceID: directActor.SourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+		require.NoError(t, service.WithinSyncBundle(ctx, directActor, BundleSource{SourceID: directActor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 			_, err := tx.Exec(ctx, fmt.Sprintf(`
 				INSERT INTO %s (id, small_count, count, large_count, amount, ratio, score, enabled)
 				VALUES ($1, -32768, 2147483647, 9007199254740993, 1234567890.123456789, 1.2345678901234567, 5e-324, FALSE)
@@ -172,7 +172,7 @@ func TestUniformNumericWire_NonFiniteManagedWriteRollsBack(t *testing.T) {
 		{name: "float8 NaN", amount: `1`, ratio: `1`, score: `'NaN'::float8`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := service.WithinSyncBundle(ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+			err := service.WithinSyncBundle(ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 				_, err := tx.Exec(ctx, fmt.Sprintf(`
 					INSERT INTO %s (id, small_count, count, large_count, amount, ratio, score, enabled)
 					VALUES ($1, 1, 1, 1, %s, %s, %s, TRUE)

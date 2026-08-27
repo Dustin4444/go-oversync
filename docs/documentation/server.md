@@ -263,6 +263,7 @@ side, and excluded from client-visible payloads, conflicts, pulls, and snapshots
 ## Related Guides
 
 - [Core Concepts]({{ site.baseurl }}/documentation/core-concepts/)
+- [Server Deployment and Operations]({{ site.baseurl }}/documentation/server-deployment-and-operations/)
 - [Server-Originated Writes]({{ site.baseurl }}/documentation/server-originated-writes/)
 - [HTTP API]({{ site.baseurl }}/documentation/api/)
 - [Performance]({{ site.baseurl }}/documentation/performance/)

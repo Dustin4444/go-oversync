@@ -46,4 +46,6 @@ The runtime is intentionally fail-closed.
 
 - Read [Core Concepts](documentation/core-concepts/) for the vocabulary and end-to-end model.
 - Use [Getting Started](getting-started.html) to stand up a server and client.
+- Use [Server Deployment and Operations](documentation/server-deployment-and-operations/) to
+  configure capacity, monitoring, shutdown, upgrades, and recovery.
 - Use [HTTP API](documentation/api/) for the wire contract.

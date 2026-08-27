@@ -293,6 +293,7 @@ HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable sta
 - docs site: <https://mobiletoly.github.io/go-oversync/>
 - getting started: `docs/getting-started.md`
 - server reference: `docs/documentation/server.md`
+- server deployment and operations: `docs/documentation/server-deployment-and-operations.md`
 - server-originated writes: `docs/documentation/server-originated-writes.md`
 - client reference: `docs/documentation/client.md`
 - HTTP API reference: `docs/documentation/api.md`

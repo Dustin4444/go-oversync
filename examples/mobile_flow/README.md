@@ -67,6 +67,7 @@ go run . --scenario=watch-idle-cleanup
 go run . --scenario=watch-many-clients-converge
 go run . --scenario=bundle-fk-atomicity
 go run . --scenario=complex-multi-batch --verbose
+go run . --scenario=complex-multi-batch --parallel=500 --concurrency=30
 go run . --scenario=all
 ```
 
@@ -74,7 +75,8 @@ Useful flags:
 
 - `--server=http://127.0.0.1:8080`
 - `--db=postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable`
-- `--parallel=10`
+- `--parallel=500` sets the total number of simulated users
+- `--concurrency=30` limits simultaneously active user scenarios (`0` or omitted uses `--parallel`)
 - `--verbose`
 
 ## Implemented Scenarios

@@ -97,6 +97,7 @@ func (c *stageMetricsCollector) snapshot() []stageMetricSummary {
 
 func TestPerfComplexMultiBatchParallel(t *testing.T) {
 	parallelUsers := envInt("OVERSYNC_PERF_PARALLEL", 30)
+	concurrency := envInt("OVERSYNC_PERF_CONCURRENCY", parallelUsers)
 	verify := envBool("OVERSYNC_PERF_VERIFY", false)
 	timeout := envDuration("OVERSYNC_PERF_TIMEOUT", 20*time.Minute)
 	databaseURL := strings.TrimSpace(os.Getenv("OVERSYNC_PERF_DATABASE_URL"))
@@ -139,12 +140,12 @@ func TestPerfComplexMultiBatchParallel(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := runParallelSimulation(ctx, baseCfg, "complex-multi-batch", parallelUsers); err != nil {
+	if err := runParallelSimulation(ctx, baseCfg, "complex-multi-batch", parallelUsers, concurrency); err != nil {
 		t.Fatalf("run parallel simulation: %v", err)
 	}
 	duration := time.Since(start)
 
-	t.Logf("scenario=complex-multi-batch parallel=%d verify=%t duration=%s", parallelUsers, verify, duration)
+	t.Logf("scenario=complex-multi-batch parallel=%d concurrency=%d verify=%t duration=%s", parallelUsers, concurrency, verify, duration)
 
 	for idx, summary := range stageMetrics.snapshot() {
 		if idx >= 12 {

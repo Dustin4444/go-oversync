@@ -20,15 +20,16 @@ import (
 func main() {
 	// Parse command line flags
 	var (
-		scenarioFlag   = flag.String("scenario", "", "Scenario to run (fresh-install, normal-usage, reinstall, device-replacement, offline-online, conflicts, user-switch, bundle-fk-atomicity, complex-multi-batch, multi-device-sync, multi-device-complex, files-sync, typed-rows, watch-peer-push, watch-server-originated, watch-reconnect-catch-up, watch-default-off, watch-server-unsupported-fallback, watch-idle-cleanup, watch-many-clients-converge, watch-all, all)")
-		verifyFlag     = flag.Bool("verify", true, "Enable database verification")
-		outputFlag     = flag.String("output", "", "Output report file (JSON)")
-		verboseFlag    = flag.Bool("verbose", false, "Enable verbose logging")
-		serverFlag     = flag.String("server", "http://127.0.0.1:8080", "Server URL")
-		dbFlag         = flag.String("db", "postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable", "Database URL for verification")
-		jwtSecretFlag  = flag.String("jwt-secret", "", "JWT secret for local token generation (defaults to env JWT_SECRET, else server default)")
-		parallelFlag   = flag.Int("parallel", 1, "Number of parallel users to simulate (1-100)")
-		preserveDBFlag = flag.Bool("preserve-db", false, "Preserve SQLite database files for manual inspection")
+		scenarioFlag    = flag.String("scenario", "", "Scenario to run (fresh-install, normal-usage, reinstall, device-replacement, offline-online, conflicts, user-switch, bundle-fk-atomicity, complex-multi-batch, multi-device-sync, multi-device-complex, files-sync, typed-rows, watch-peer-push, watch-server-originated, watch-reconnect-catch-up, watch-default-off, watch-server-unsupported-fallback, watch-idle-cleanup, watch-many-clients-converge, watch-all, all)")
+		verifyFlag      = flag.Bool("verify", true, "Enable database verification")
+		outputFlag      = flag.String("output", "", "Output report file (JSON)")
+		verboseFlag     = flag.Bool("verbose", false, "Enable verbose logging")
+		serverFlag      = flag.String("server", "http://127.0.0.1:8080", "Server URL")
+		dbFlag          = flag.String("db", "postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable", "Database URL for verification")
+		jwtSecretFlag   = flag.String("jwt-secret", "", "JWT secret for local token generation (defaults to env JWT_SECRET, else server default)")
+		parallelFlag    = flag.Int("parallel", 1, "Total users to simulate (1-500)")
+		concurrencyFlag = flag.Int("concurrency", 0, "Maximum concurrently active users (0 = --parallel)")
+		preserveDBFlag  = flag.Bool("preserve-db", false, "Preserve SQLite database files for manual inspection")
 	)
 	flag.Parse()
 
@@ -44,6 +45,10 @@ func main() {
 
 	if *parallelFlag < 1 || *parallelFlag > 500 {
 		log.Fatalf("Parallel users must be between 1 and 500, got: %d", *parallelFlag)
+	}
+	concurrency, err := normalizeSimulationConcurrency(*parallelFlag, *concurrencyFlag)
+	if err != nil {
+		log.Fatalf("Invalid concurrency: %v", err)
 	}
 
 	jwtSecret := *jwtSecretFlag
@@ -68,8 +73,8 @@ func main() {
 
 	// Check if parallel execution is requested
 	if *parallelFlag > 1 {
-		logger.Info("🚀 Starting parallel multi-user simulation", "users", *parallelFlag, "scenario", *scenarioFlag)
-		err := runParallelSimulation(ctx, cfg, *scenarioFlag, *parallelFlag)
+		logger.Info("🚀 Starting parallel multi-user simulation", "users", *parallelFlag, "concurrency", concurrency, "scenario", *scenarioFlag)
+		err := runParallelSimulation(ctx, cfg, *scenarioFlag, *parallelFlag, concurrency)
 		if err != nil {
 			log.Fatalf("Parallel simulation failed: %v", err)
 		}
@@ -230,12 +235,52 @@ func runScenario(ctx context.Context, sim *simulator.Simulator, scenarioName str
 	return sim.RunScenario(ctx, scenarioName)
 }
 
-// runParallelSimulation runs scenarios for multiple users in parallel
-func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenarioName string, numUsers int) error {
+func normalizeSimulationConcurrency(numUsers, requested int) (int, error) {
+	if numUsers < 1 {
+		return 0, fmt.Errorf("total users must be positive")
+	}
+	if requested < 0 {
+		return 0, fmt.Errorf("must be non-negative")
+	}
+	if requested == 0 {
+		return numUsers, nil
+	}
+	if requested > numUsers {
+		return 0, fmt.Errorf("must not exceed total users (%d)", numUsers)
+	}
+	return requested, nil
+}
+
+func runBoundedUserWorkers(numUsers, concurrency int, run func(int)) {
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for userIndex := range jobs {
+				run(userIndex)
+			}
+		}()
+	}
+	for userIndex := 1; userIndex <= numUsers; userIndex++ {
+		jobs <- userIndex
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+// runParallelSimulation runs scenarios for multiple users with bounded active-user concurrency.
+func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenarioName string, numUsers, requestedConcurrency int) error {
+	concurrency, err := normalizeSimulationConcurrency(numUsers, requestedConcurrency)
+	if err != nil {
+		return fmt.Errorf("invalid simulation concurrency: %w", err)
+	}
 	startTime := time.Now()
 	runID := fmt.Sprintf("%d-%d", os.Getpid(), startTime.UnixNano())
 	baseCfg.Logger.Info("🚀 Starting parallel multi-user simulation",
 		"users", numUsers,
+		"concurrency", concurrency,
 		"scenario", scenarioName,
 		"run_id", runID,
 		"server", baseCfg.ServerURL)
@@ -260,13 +305,8 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 	}
 
 	results := make(chan userResult, numUsers)
-	var wg sync.WaitGroup
-
-	for i := 1; i <= numUsers; i++ {
-		wg.Add(1)
-		go func(userIndex int) {
-			defer wg.Done()
-
+	go func() {
+		runBoundedUserWorkers(numUsers, concurrency, func(userIndex int) {
 			userID := fmt.Sprintf("parallel-%s-user-%03d", runID, userIndex)
 			userStartTime := time.Now()
 
@@ -288,30 +328,29 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 				results <- userResult{userID: userID, duration: 0, err: fmt.Errorf("failed to create simulator: %w", err)}
 				return
 			}
-			defer sim.Close()
 
 			// Run the scenario
 			baseCfg.Logger.Info("⏱️ Starting scenario for user", "user_id", userID, "scenario", scenarioName, "start_time", userStartTime.Format(time.RFC3339))
-			err = runScenarioForUser(ctx, sim, scenarioName, userID)
+			err, sqliteDBPath := func() (resultErr error, databasePath string) {
+				defer func() {
+					if closeErr := sim.Close(); resultErr == nil && closeErr != nil {
+						resultErr = fmt.Errorf("failed to close simulator: %w", closeErr)
+					}
+				}()
+				resultErr = runScenarioForUser(ctx, sim, scenarioName, userID)
+				if app := sim.GetCurrentApp(); app != nil {
+					databasePath = app.GetDatabasePath()
+				}
+				return resultErr, databasePath
+			}()
 			duration := time.Since(userStartTime)
-
-			// Get SQLite database path for reporting
-			sqliteDBPath := ""
-			if app := sim.GetCurrentApp(); app != nil {
-				sqliteDBPath = app.GetDatabasePath()
-			}
 
 			if err != nil {
 				baseCfg.Logger.Error("⏱️ Scenario failed for user", "user_id", userID, "duration", duration, "error", err)
 			}
 
 			results <- userResult{userID: userID, duration: duration, err: err, sqliteDBPath: sqliteDBPath}
-		}(i)
-	}
-
-	// Wait for all simulations to complete
-	go func() {
-		wg.Wait()
+		})
 		close(results)
 	}()
 
@@ -372,6 +411,7 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 
 	baseCfg.Logger.Info("🎉 Parallel simulation completed",
 		"total_users", numUsers,
+		"concurrency", concurrency,
 		"successful", successCount,
 		"failed", failureCount,
 		"total_time", totalTime,
